@@ -33,3 +33,13 @@ Multiple mounts are supported:
 - Docker
 - `ANTHROPIC_API_KEY` set in the environment
 - `GIT_NAME` and `GIT_EMAIL` set in the environment
+
+## SSH Commit Signing
+
+Set `GIT_SIGNING_KEY` to your public key literal and ensure `SSH_AUTH_SOCK` is
+set. The run script forwards the agent socket into the container automatically.
+
+```sh
+export GIT_SIGNING_KEY="key::ssh-ed25519 AAAA..."
+./run -v /path/to/project:/workspace
+```

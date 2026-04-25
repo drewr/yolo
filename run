@@ -7,7 +7,7 @@
 # Mount additional directories with -v flags before --:
 #   docker/run -v /path/to/other:/workspace/other -- -p "do the thing"
 #
-# ANTHROPIC_API_KEY is passed through from the environment.
+# ANTHROPIC_API_KEY, SSH_AUTH_SOCK, and GIT_SIGNING_KEY are passed through from the environment.
 
 set -euo pipefail
 
@@ -30,10 +30,17 @@ for arg in "$@"; do
   fi
 done
 
+ssh_flags=()
+if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+  ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+fi
+
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -e GIT_EMAIL="${GIT_EMAIL:-}" \
   -e GIT_NAME="${GIT_NAME:-}" \
+  -e GIT_SIGNING_KEY="${GIT_SIGNING_KEY:-}" \
+  "${ssh_flags[@]}" \
   -w /workspace \
   "${docker_flags[@]}" \
   "$IMAGE" \
