@@ -32,3 +32,4 @@ Multiple mounts are supported:
 
 - Docker
 - `ANTHROPIC_API_KEY` set in the environment
+- `GIT_NAME` and `GIT_EMAIL` set in the environment
