@@ -4,7 +4,8 @@ RUN nix-env -iA \
     nixpkgs.openssh \
     nixpkgs.nodejs_22 \
     nixpkgs.gnused \
-    nixpkgs.cacert
+    nixpkgs.cacert \
+    nixpkgs.google-cloud-sdk
 
 ENV PATH="/usr/local/bin:/root/.nix-profile/bin:${PATH}"
 ENV SSL_CERT_FILE=/root/.nix-profile/etc/ssl/certs/ca-bundle.crt
