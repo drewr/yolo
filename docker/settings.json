@@ -1,7 +1,12 @@
 {
   "theme": "auto",
   "dangerouslySkipPermissions": true,
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "IS_SANDBOX": "1"
+  },
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(export ANTHROPIC_API_KEY=*)"
     ]
