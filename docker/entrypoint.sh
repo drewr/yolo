@@ -1,6 +1,7 @@
 #!/bin/sh
 git config --global user.name "${GIT_NAME:-agent}"
 git config --global user.email "${GIT_EMAIL:-agent@localhost}"
+git config --global --add safe.directory /workspace
 
 if [ -n "$GIT_SIGNING_KEY" ]; then
   git config --global gpg.format ssh
