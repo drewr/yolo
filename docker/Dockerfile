@@ -18,6 +18,9 @@ RUN mkdir -p /lib64 && \
     ln -sf "$(find /nix/store -maxdepth 3 -name 'ld-linux-x86-64.so.2' | grep -v debug | head -1)" \
            /lib64/ld-linux-x86-64.so.2
 
+# plugin scripts use #!/bin/bash; symlink nix bash to the standard FHS path
+RUN mkdir -p /bin && ln -sf /root/.nix-profile/bin/bash /bin/bash
+
 RUN npm install -g @anthropic-ai/claude-code
 
 RUN mkdir -p /root/.claude
