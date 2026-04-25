@@ -1,0 +1,14 @@
+services:
+  agent:
+    build:
+      context: ./docker
+    image: agent-runtime:local
+    volumes:
+      - ${WORKSPACE:?set WORKSPACE=/path/to/project}:/workspace
+    environment:
+      - ANTHROPIC_API_KEY
+      - GIT_EMAIL
+      - GIT_NAME
+    working_dir: /workspace
+    stdin_open: true
+    tty: true

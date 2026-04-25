@@ -1,0 +1,24 @@
+{
+  "customApiKeyResponses": {
+    "approved": ["nprAQ7pdIsA-uP078AAA"],
+    "rejected": []
+  },
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "CLAUDE_VERSION",
+  "migrationVersion": 12,
+  "opusProMigrationComplete": true,
+  "sonnet1m45MigrationComplete": true,
+  "projects": {
+    "/workspace": {
+      "allowedTools": [],
+      "mcpContextUris": [],
+      "mcpServers": {},
+      "enabledMcpjsonServers": [],
+      "disabledMcpjsonServers": [],
+      "hasTrustDialogAccepted": true,
+      "projectOnboardingSeenCount": 1,
+      "hasClaudeMdExternalIncludesApproved": false,
+      "hasClaudeMdExternalIncludesWarningShown": false
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "theme": "auto",
+  "dangerouslySkipPermissions": true,
+  "permissions": {
+    "allow": [
+      "Bash(export ANTHROPIC_API_KEY=*)"
+    ]
+  },
+  "enabledPlugins": {
+    "datum-gtm@datum-claude-code-plugins": true,
+    "datum-platform@datum-claude-code-plugins": true,
+    "milo-activity@datum-claude-code-plugins": true
+  },
+  "extraKnownMarketplaces": {
+    "datum-claude-code-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "datum-cloud/claude-code-plugins"
+      }
+    }
+  }
+}

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Run an agent in the sandboxed Docker environment.
+#
+# Usage:
+#   docker/run [DOCKER_FLAGS] -- [CLAUDE_ARGS...]
+#
+# Mount additional directories with -v flags before --:
+#   docker/run -v /path/to/other:/workspace/other -- -p "do the thing"
+#
+# ANTHROPIC_API_KEY is passed through from the environment.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+IMAGE="agent-runtime:local"
+
+docker build --progress=plain -t "$IMAGE" "$SCRIPT_DIR/docker"
+
+# Split args at -- into docker flags and container command
+docker_flags=()
+cmd=()
+found_sep=false
+for arg in "$@"; do
+  if [[ "$arg" == "--" ]]; then
+    found_sep=true
+  elif $found_sep; then
+    cmd+=("$arg")
+  else
+    docker_flags+=("$arg")
+  fi
+done
+
+docker run --rm -it \
+  -e ANTHROPIC_API_KEY \
+  -e GIT_EMAIL="${GIT_EMAIL:-}" \
+  -e GIT_NAME="${GIT_NAME:-}" \
+  -w /workspace \
+  "${docker_flags[@]}" \
+  "$IMAGE" \
+  "${cmd[@]}"

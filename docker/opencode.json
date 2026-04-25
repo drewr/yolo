@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "tetrate": {
+      "options": {
+        "baseURL": "https://api.router.tetrate.ai/v1",
+        "apiKey": "{env:ROUTER_TOKEN}"
+      }
+    }
+  }
+}
