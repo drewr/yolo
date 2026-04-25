@@ -6,7 +6,8 @@ RUN nix-env -iA \
     nixpkgs.gnused \
     nixpkgs.cacert \
     nixpkgs.google-cloud-sdk \
-    nixpkgs.gh
+    nixpkgs.gh \
+    nixpkgs.jq
 
 ENV PATH="/usr/local/bin:/root/.nix-profile/bin:${PATH}"
 ENV SSL_CERT_FILE=/root/.nix-profile/etc/ssl/certs/ca-bundle.crt
