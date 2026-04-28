@@ -9,4 +9,8 @@ if [ -n "$GIT_SIGNING_KEY" ]; then
   git config --global commit.gpgsign true
 fi
 
-exec claude --verbose "$@"
+if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
+  trap 'chown -R "$HOST_UID:$HOST_GID" /workspace /root/.claude/projects' EXIT
+fi
+
+claude --verbose "$@"

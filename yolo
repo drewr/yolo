@@ -2,17 +2,18 @@
 # Run an agent in the sandboxed Docker environment.
 #
 # Usage:
-#   docker/run [DOCKER_FLAGS] -- [CLAUDE_ARGS...]
+#   yolo [DOCKER_FLAGS] -- [CLAUDE_ARGS...]
 #
 # Mount additional directories with -v flags before --:
-#   docker/run -v /path/to/other:/workspace/other -- -p "do the thing"
+#   yolo -v /path/to/other:/workspace/other -- -p "do the thing"
 #
 # ANTHROPIC_API_KEY, SSH_AUTH_SOCK, and GIT_SIGNING_KEY are passed through from the environment.
+# CLAUDE_SESSIONS defaults to the OS-appropriate data dir; override to store sessions elsewhere.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-IMAGE="agent-runtime:local"
+IMAGE="yolo:local"
 
 docker build --progress=plain -t "$IMAGE" "$SCRIPT_DIR/docker"
 
@@ -35,12 +36,25 @@ if [ -n "${SSH_AUTH_SOCK:-}" ]; then
   ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
 fi
 
+if [ -z "${CLAUDE_SESSIONS:-}" ]; then
+  case "${OSTYPE:-}" in
+    darwin*)  CLAUDE_SESSIONS="$HOME/Library/Application Support/yolo/sessions" ;;
+    msys*|cygwin*|win32*) CLAUDE_SESSIONS="${APPDATA:-$HOME/AppData/Roaming}/yolo/sessions" ;;
+    *)        CLAUDE_SESSIONS="${XDG_DATA_HOME:-$HOME/.local/share}/yolo/sessions" ;;
+  esac
+fi
+mkdir -p "$CLAUDE_SESSIONS"
+sessions_flags=(-v "$CLAUDE_SESSIONS:/root/.claude/projects")
+
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -e GIT_EMAIL="${GIT_EMAIL:-}" \
   -e GIT_NAME="${GIT_NAME:-}" \
   -e GIT_SIGNING_KEY="${GIT_SIGNING_KEY:-}" \
+  -e HOST_UID="$(id -u)" \
+  -e HOST_GID="$(id -g)" \
   "${ssh_flags[@]}" \
+  "${sessions_flags[@]}" \
   -w /workspace \
   "${docker_flags[@]}" \
   "$IMAGE" \
