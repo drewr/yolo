@@ -1,0 +1,2 @@
+[gpg "ssh"]
+	allowedSignersFile = /root/.ssh/allowed_signers

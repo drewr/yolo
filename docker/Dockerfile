@@ -24,6 +24,8 @@ RUN mkdir -p /bin && ln -sf /root/.nix-profile/bin/bash /bin/bash
 
 RUN npm install -g @anthropic-ai/claude-code
 
+COPY .gitconfig /root/.gitconfig
+
 RUN mkdir -p /root/.claude
 COPY settings.json /root/.claude/settings.json
 COPY claude-state.json /root/.claude.json
