@@ -7,6 +7,7 @@ services:
       - ${WORKSPACE:?set WORKSPACE=/path/to/project}:/workspace
     environment:
       - ANTHROPIC_API_KEY
+      - GITHUB_TOKEN=${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
       - GIT_EMAIL
       - GIT_NAME
     working_dir: /workspace

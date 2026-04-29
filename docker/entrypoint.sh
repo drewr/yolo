@@ -1,4 +1,7 @@
 #!/bin/sh
+mkdir -p /root/.ssh
+ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null
+
 git config --global user.name "${GIT_NAME:-agent}"
 git config --global user.email "${GIT_EMAIL:-agent@localhost}"
 git config --global --add safe.directory /workspace

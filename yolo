@@ -31,9 +31,18 @@ for arg in "$@"; do
   fi
 done
 
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "error: GITHUB_TOKEN is not set" >&2
+  exit 1
+fi
+
 ssh_flags=()
 if [ -n "${SSH_AUTH_SOCK:-}" ]; then
   ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+fi
+
+if [ -f "${HOME}/.ssh/allowed_signers" ]; then
+  ssh_flags+=(-v "${HOME}/.ssh/allowed_signers:/root/.ssh/allowed_signers:ro")
 fi
 
 if [ -z "${CLAUDE_SESSIONS:-}" ]; then
@@ -48,6 +57,7 @@ sessions_flags=(-v "$CLAUDE_SESSIONS:/root/.claude/projects")
 
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
+  -e GITHUB_TOKEN \
   -e GIT_EMAIL="${GIT_EMAIL:-}" \
   -e GIT_NAME="${GIT_NAME:-}" \
   -e GIT_SIGNING_KEY="${GIT_SIGNING_KEY:-}" \
