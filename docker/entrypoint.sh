@@ -17,6 +17,7 @@ if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
 fi
 
 npm install -g @anthropic-ai/claude-code@latest --silent 2>/dev/null
+rtk init -g --auto-patch
 
 CLAUDE_VERSION=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 sed -i "s/\"lastOnboardingVersion\": \"[^\"]*\"/\"lastOnboardingVersion\": \"$CLAUDE_VERSION\"/" /root/.claude.json
