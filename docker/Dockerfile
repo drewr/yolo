@@ -25,7 +25,7 @@ RUN mkdir -p /bin && ln -sf /root/.nix-profile/bin/bash /bin/bash
 
 RUN npm install -g @anthropic-ai/claude-code
 
-RUN RTK_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | RTK_INSTALL_DIR=/usr/local/bin sh
 
 COPY .gitconfig /root/.gitconfig
 
