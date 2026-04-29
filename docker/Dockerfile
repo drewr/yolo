@@ -5,6 +5,7 @@ RUN nix-env -iA \
     nixpkgs.nodejs_22 \
     nixpkgs.gnused \
     nixpkgs.cacert \
+    nixpkgs.curl \
     nixpkgs.google-cloud-sdk \
     nixpkgs.gh \
     nixpkgs.jq
@@ -23,6 +24,8 @@ RUN mkdir -p /lib64 && \
 RUN mkdir -p /bin && ln -sf /root/.nix-profile/bin/bash /bin/bash
 
 RUN npm install -g @anthropic-ai/claude-code
+
+RUN RTK_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
 
 COPY .gitconfig /root/.gitconfig
 
