@@ -5,6 +5,16 @@
   "env": {
     "IS_SANDBOX": "1"
   },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "rtk hook claude" }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "defaultMode": "bypassPermissions",
     "allow": [
