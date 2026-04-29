@@ -4,7 +4,7 @@
     "rejected": []
   },
   "hasCompletedOnboarding": true,
-  "lastOnboardingVersion": "CLAUDE_VERSION",
+  "lastOnboardingVersion": "",
   "migrationVersion": 12,
   "opusProMigrationComplete": true,
   "sonnet1m45MigrationComplete": true,

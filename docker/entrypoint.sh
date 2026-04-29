@@ -13,4 +13,9 @@ if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
   trap 'chown -R "$HOST_UID:$HOST_GID" /workspace /root/.claude/projects' EXIT
 fi
 
+npm install -g @anthropic-ai/claude-code@latest --silent 2>/dev/null
+
+CLAUDE_VERSION=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+sed -i "s/\"lastOnboardingVersion\": \"[^\"]*\"/\"lastOnboardingVersion\": \"$CLAUDE_VERSION\"/" /root/.claude.json
+
 claude --verbose "$@"

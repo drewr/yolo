@@ -28,8 +28,6 @@ RUN mkdir -p /root/.claude
 COPY settings.json /root/.claude/settings.json
 COPY claude-state.json /root/.claude.json
 
-RUN CLAUDE_VERSION=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) && \
-    sed -i "s/CLAUDE_VERSION/$CLAUDE_VERSION/" /root/.claude.json
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
