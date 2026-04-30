@@ -30,9 +30,12 @@ Multiple mounts are supported:
 
 ## Requirements
 
-- Docker
-- `ANTHROPIC_API_KEY` set in the environment
-- `GIT_NAME` and `GIT_EMAIL` set in the environment
+- Docker or Podman
+- Standard environment:
+    - `ANTHROPIC_API_KEY`
+    - `GITHUB_TOKEN`
+    - `GIT_NAME`
+    - `GIT_EMAIL`
 
 ## SSH Commit Signing
 
