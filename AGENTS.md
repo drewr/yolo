@@ -1,7 +1,7 @@
 # Agent Instructions
 
-This repository contains a Docker-based runtime for running Claude Code agents
-in an isolated environment with dangerous mode enabled.
+This repository contains a container-based runtime (Docker or Podman) for running
+Claude Code agents in an isolated environment with dangerous mode enabled.
 
 ## Commit Conventions
 
@@ -23,8 +23,8 @@ Common types: `feat`, `fix`, `chore`, `docs`, `refactor`, `ci`
 ./run -v /path/to/project:/workspace
 ```
 
-Arguments before `--` are Docker flags; arguments after are passed to `claude`.
-The image is always rebuilt on each invocation (Docker layer cache keeps it fast).
+Arguments before `--` are container flags; arguments after are passed to `claude`.
+The image is always rebuilt on each invocation (layer cache keeps it fast).
 
 ## Key Files
 
@@ -46,6 +46,8 @@ If the API key is rotated, run the container once, answer the approval prompt, t
 
 ```sh
 docker exec $(docker ps -lq) cat /root/.claude.json
+# or with podman:
+podman exec $(podman ps -lq) cat /root/.claude.json
 ```
 
 Copy the new `customApiKeyResponses.approved` value into `docker/claude-state.json`.
