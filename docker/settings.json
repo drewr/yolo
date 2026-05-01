@@ -26,6 +26,10 @@
     "datum-platform@datum-claude-code-plugins": true,
     "milo-activity@datum-claude-code-plugins": true
   },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
   "extraKnownMarketplaces": {
     "datum-claude-code-plugins": {
       "source": {
