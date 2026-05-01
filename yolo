@@ -48,10 +48,11 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
   exit 1
 fi
 
-ssh_flags=()
-if [ -n "${SSH_AUTH_SOCK:-}" ]; then
-  ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+  echo "error: SSH_AUTH_SOCK is not set (is ssh-agent running?)" >&2
+  exit 1
 fi
+ssh_flags=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
 
 if [ -f "${HOME}/.ssh/allowed_signers" ]; then
   ssh_flags+=(-v "${HOME}/.ssh/allowed_signers:/root/.ssh/allowed_signers:ro")
