@@ -16,9 +16,19 @@ ENV NIX_SSL_CERT_FILE=/root/.nix-profile/etc/ssl/certs/ca-bundle.crt
 ENV NPM_CONFIG_PREFIX=/usr/local
 
 # claude is a compiled FHS binary; symlink nix's glibc linker to the standard path
-RUN mkdir -p /lib64 && \
-    ln -sf "$(find /nix/store -maxdepth 3 -name 'ld-linux-x86-64.so.2' | grep -v debug | head -1)" \
-           /lib64/ld-linux-x86-64.so.2
+# Both the linker name and its expected directory differ by architecture:
+#   x86_64  -> /lib64/ld-linux-x86-64.so.2
+#   aarch64 -> /lib/ld-linux-aarch64.so.1
+RUN case "$(uname -m)" in \
+        x86_64)  linker_name="ld-linux-x86-64.so.2"; linker_dir="/lib64" ;; \
+        aarch64) linker_name="ld-linux-aarch64.so.1"; linker_dir="/lib"  ;; \
+        *) echo "Unsupported arch: $(uname -m)" && exit 1 ;; \
+    esac && \
+    mkdir -p "${linker_dir}" && \
+    if [ ! -e "${linker_dir}/${linker_name}" ]; then \
+        linker="$(find /nix/store -name "${linker_name}" | grep -v debug | head -1)"; \
+        [ -n "$linker" ] && ln -sf "$linker" "${linker_dir}/${linker_name}"; \
+    fi
 
 # plugin scripts use #!/bin/bash; symlink nix bash to the standard FHS path
 RUN mkdir -p /bin && ln -sf /root/.nix-profile/bin/bash /bin/bash

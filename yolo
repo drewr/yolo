@@ -48,14 +48,25 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
   exit 1
 fi
 
-if [ -z "${SSH_AUTH_SOCK:-}" ]; then
-  echo "error: SSH_AUTH_SOCK is not set (is ssh-agent running?)" >&2
-  exit 1
-fi
-ssh_flags=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
-
-if [ -f "${HOME}/.ssh/allowed_signers" ]; then
-  ssh_flags+=(-v "${HOME}/.ssh/allowed_signers:/root/.ssh/allowed_signers:ro")
+ssh_flags=()
+# Podman machine on macOS uses VirtioFS which cannot forward Unix domain sockets.
+# Instead, encode the private key as base64 and start an in-container ssh-agent.
+# Set SSH_PRIVATE_KEY_FILE to a key path, or SSH_PRIVATE_KEY to pre-encoded content.
+if [ "$CONTAINER_RUNTIME" = "podman" ] && [[ "${OSTYPE:-}" == darwin* ]]; then
+  if [ -n "${SSH_PRIVATE_KEY_FILE:-}" ] && [ -z "${SSH_PRIVATE_KEY:-}" ]; then
+    SSH_PRIVATE_KEY=$(base64 < "$SSH_PRIVATE_KEY_FILE")
+  elif [ -z "${SSH_PRIVATE_KEY:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
+    echo "warning: SSH agent socket cannot be forwarded with podman on macOS; set SSH_PRIVATE_KEY_FILE or SSH_PRIVATE_KEY to enable SSH in the container" >&2
+  fi
+else
+  if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+    echo "error: SSH_AUTH_SOCK is not set (is ssh-agent running?)" >&2
+    exit 1
+  fi
+  ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+  if [ -f "${HOME}/.ssh/allowed_signers" ]; then
+    ssh_flags+=(-v "${HOME}/.ssh/allowed_signers:/root/.ssh/allowed_signers:ro")
+  fi
 fi
 
 if [ -z "${CLAUDE_SESSIONS:-}" ]; then
@@ -74,6 +85,7 @@ sessions_flags=(-v "$CLAUDE_SESSIONS:/root/.claude/projects")
   -e GIT_EMAIL="${GIT_EMAIL:-}" \
   -e GIT_NAME="${GIT_NAME:-}" \
   -e GIT_SIGNING_KEY="${GIT_SIGNING_KEY:-}" \
+  -e SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-}" \
   -e HOST_UID="$(id -u)" \
   -e HOST_GID="$(id -g)" \
   "${ssh_flags[@]}" \
