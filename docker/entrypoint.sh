@@ -21,13 +21,24 @@ if [ -n "$GIT_SIGNING_KEY" ]; then
 fi
 
 if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then
-  trap 'chown -R "$HOST_UID:$HOST_GID" /workspace /root/.claude/projects' EXIT
+  trap 'chown -R "$HOST_UID:$HOST_GID" /workspace /root/.claude/projects /root/.qwen/projects' EXIT
 fi
 
-npm install -g @anthropic-ai/claude-code@latest --silent 2>/dev/null
-printf 'n\n' | rtk init -g --auto-patch
+# Determine runtime (default: claude)
+RUNTIME="${RUNTIME:-claude}"
 
-CLAUDE_VERSION=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-sed -i "s/\"lastOnboardingVersion\": \"[^\"]*\"/\"lastOnboardingVersion\": \"$CLAUDE_VERSION\"/" /root/.claude.json
+if [ "$RUNTIME" = "claude" ]; then
+  # Update Claude Code to latest
+  npm install -g @anthropic-ai/claude-code@latest --silent 2>/dev/null
+  printf 'n\n' | rtk init -g --auto-patch 2>/dev/null || true
 
-claude --verbose "$@"
+  CLAUDE_VERSION=$(claude --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  sed -i "s/\"lastOnboardingVersion\": \"[^\"]*\"/\"lastOnboardingVersion\": \"$CLAUDE_VERSION\"/" /root/.claude.json
+
+  exec claude --verbose "$@"
+elif [ "$RUNTIME" = "qwen" ]; then
+  exec qwen --verbose "$@"
+else
+  echo "error: unknown runtime '$RUNTIME'" >&2
+  exit 1
+fi

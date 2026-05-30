@@ -1,0 +1,11 @@
+{
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "",
+  "projects": {
+    "/workspace": {
+      "allowedTools": [],
+      "hasTrustDialogAccepted": true,
+      "projectOnboardingSeenCount": 1
+    }
+  }
+}
