@@ -2,16 +2,16 @@ services:
   agent:
     build:
       context: ./docker
-      dockerfile: Dockerfile.claude
+      dockerfile: Dockerfile.qwen
     image: yolo:local
     volumes:
       - ${WORKSPACE:?set WORKSPACE=/path/to/project}:/workspace
     environment:
-      - ANTHROPIC_API_KEY
+      - QWEN_API_KEY=${QWEN_API_KEY:?QWEN_API_KEY must be set}
       - GITHUB_TOKEN=${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
       - GIT_EMAIL
       - GIT_NAME
-      - RUNTIME=claude
+      - RUNTIME=qwen
     working_dir: /workspace
     stdin_open: true
     tty: true
