@@ -61,7 +61,8 @@ fi
 /bin/nix-daemon > /tmp/nix-daemon.log 2>&1 &
 
 # Unprivileged ICMP, so iputils ping works for the login user.
-echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range
+# (Read-only under docker, which already allows it in containers.)
+(echo "0 2147483647" > /proc/sys/net/ipv4/ping_group_range) 2>/dev/null
 
 if [ "$MODE" = datum ]; then
   # lo is down with no addresses at boot (docs/datum.md).
