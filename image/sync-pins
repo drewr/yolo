@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Pin agent/flake.lock's llm-agents and nixpkgs to the revisions the dotfiles
-# use (d/.config/home-manager/flake.lock), so the images carry the same
-# harness versions and nixpkgs as a laptop with these dotfiles. Run by
-# agent/build-image; prints what changed.
+# Pin image/flake.lock's llm-agents and nixpkgs to the revisions the dotfiles
+# use (d/.config/home-manager/flake.lock in the locked `dotfiles` input), so
+# the images carry the same harness versions and nixpkgs as a laptop with
+# these dotfiles. Run by image/build-image; prints what changed. To follow
+# newer dotfiles: nix flake update dotfiles --flake image, then build.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-DOT="$HERE/../d/.config/home-manager/flake.lock"
+DOT="$(nix --extra-experimental-features 'nix-command flakes' eval --raw "$HERE#lib.dotfiles")/d/.config/home-manager/flake.lock"
 LOCK="$HERE/flake.lock"
 
 rev() {  # rev LOCKFILE INPUT: locked rev of a root input

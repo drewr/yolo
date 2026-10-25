@@ -4,7 +4,7 @@
   # each with the same login environment, reachable only by SSH over iroh.
   # Providers beyond each harness's native ones come from ./providers via
   # agent-providers. llm-agents and nixpkgs follow the dotfiles' pins
-  # (agent/sync-pins, run by agent/build-image). Combines
+  # (image/sync-pins, run by image/build-image). Combines
   # what Spikes 4 and 5 proved: dropbear on loopback exposed by dumbpipe, and
   # Bun executables shipped with their wrapBuddy store paths.
   #
@@ -21,12 +21,20 @@
     # rather than following ours as the dotfiles do: the harness versions are
     # the same, and only these builds are in cache.numtide.com.
     llm-agents.url = "github:numtide/llm-agents.nix";
+    # The dotfiles: their zsh config goes into every image, and sync-pins reads
+    # their flake.lock so llm-agents and nixpkgs match a laptop with them.
+    dotfiles = { url = "github:drewr/dotfiles"; flake = false; };
   };
 
-  outputs = { self, nixpkgs, llm-agents }:
+  outputs = { self, nixpkgs, llm-agents, dotfiles }:
   let
     system = "x86_64-linux";
-    pkgs = nixpkgs.legacyPackages.${system};
+    pkgs = import nixpkgs {
+      inherit system;
+      # rtk (the token-saving command proxy yolo's claude hook runs) is
+      # dual-licensed Apache-2.0 / BUSL-1.1; allow it, and nothing else unfree.
+      config.allowUnfreePredicate = p: builtins.elem (nixpkgs.lib.getName p) [ "rtk" ];
+    };
     agents = llm-agents.packages.${system};
     # The same harnesses the dotfiles install (d/.config/home-manager/flake.nix),
     # from the same pinned llm-agents rev; opencode2 is also exposed as opencode.
@@ -44,15 +52,18 @@
       pi = agents.pi;
     };
     busybox = pkgs.pkgsStatic.busybox;
-    base = with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync ];
+    base = with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq rtk nix dropbear dumbpipe juicefs rsync ];
 
     # The login user (SSH lands here, not root), whose HOME is the shared home.
     user = { name = "drewr"; uid = 1000; };
     # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).
     locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" ]; };
-    # The dotfiles' zsh config (zshrc, zshenv, zprofile, zsh.d), copied into the
-    # build context by agent/build-image; absent when evaluating from the repo.
-    dotfilesZsh = if builtins.pathExists ./zsh then ./zsh else null;
+    # The dotfiles' zsh config (zshrc, zshenv, zprofile, zsh.d).
+    dotfilesZsh = pkgs.runCommand "dotfiles-zsh" { } ''
+      mkdir -p $out
+      cp ${dotfiles}/zshrc ${dotfiles}/zshenv ${dotfiles}/zprofile $out/
+      cp -r ${dotfiles}/zsh.d $out/zsh.d
+    '';
 
     # nix in the sandbox: a root nix-daemon (started by init) that the login user
     # talks to, builds as root (the image has no build users), no build sandbox, flakes on, and nixpkgs pinned to the rev the images are
@@ -112,7 +123,9 @@
       cp ${nixRegistry} $R/etc/nix/registry.json
       # Static parts of the login environment; init adds the session's.
       echo 'export LOCALE_ARCHIVE=${locales}/lib/locale/locale-archive' > $R/etc/agent/env.static
-      ${pkgs.lib.optionalString (dotfilesZsh != null) "cp -r ${dotfilesZsh} $R/etc/agent/zsh"}
+      cp -r ${dotfilesZsh} $R/etc/agent/zsh
+      # Claude settings that seed a local (docker backend) home; see init.sh.
+      cp -r ${./claude} $R/etc/agent/claude
       # zsh and bash login shells load the session environment (/etc/agent/env).
       echo '[ -r /etc/agent/env ] && . /etc/agent/env' > $R/etc/zshenv
       cp $R/etc/zshenv $R/etc/profile
@@ -131,5 +144,7 @@
     '';
   in {
     packages.${system} = builtins.mapAttrs mkRootfs harnesses;
+    # For sync-pins: the locked dotfiles source.
+    lib.dotfiles = "${dotfiles}";
   };
 }

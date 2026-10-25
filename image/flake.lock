@@ -34,6 +34,22 @@
         "type": "github"
       }
     },
+    "dotfiles": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792844812,
+        "narHash": "sha256-5qSXsd9Phsy82bb9zifIA9npGNncE7tuE8yWpVG45+0=",
+        "owner": "drewr",
+        "repo": "dotfiles",
+        "rev": "0ec9e22b79c2eeb956eeb156d2106eb4c22191be",
+        "type": "github"
+      },
+      "original": {
+        "owner": "drewr",
+        "repo": "dotfiles",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": [
@@ -111,6 +127,7 @@
     },
     "root": {
       "inputs": {
+        "dotfiles": "dotfiles",
         "llm-agents": "llm-agents",
         "nixpkgs": "nixpkgs_2"
       }
