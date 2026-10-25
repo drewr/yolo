@@ -81,7 +81,8 @@ backend_new() {
       realpath "${key%.pub}" > "$dir/identity"
     fi
   )
-  grep -q '^endpoint' "$dir/ticket" || die "could not derive the iroh ticket"
+  grep -q '^endpoint' "$dir/ticket" || { rm -rf "$dir"; die "could not derive the iroh ticket"; }
+  [ -s "$dir/authorized_keys" ] || { rm -rf "$dir"; die "no authorized keys; session not created"; }
 
   {
     printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: agent-%s\ntype: Opaque\nstringData:\n' "$name"

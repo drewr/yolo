@@ -38,12 +38,22 @@ endpoint_ticket() {
     | base32 -w0 | tr '[:upper:]' '[:lower:]' | tr -d '=' | sed 's/^/endpoint/'
 }
 
-# Public keys to authorize: FILE if given, else the SSH agent's, else ~/.ssh/id_*.pub.
+# Public keys to authorize: FILE if given, else the SSH agent's, else
+# ~/.ssh/id_*.pub. Never empty: a session nobody can log in to is useless.
+# The agent query has a timeout because forwarded agents can stall.
 authorized_keys() {
-  if [ -n "${1:-}" ]; then cat "$1"; return; fi
-  if ssh-add -L 2>/dev/null | grep -q '^ssh-'; then ssh-add -L; return; fi
-  for f in "$HOME"/.ssh/id_ed25519.pub "$HOME"/.ssh/id_ecdsa.pub "$HOME"/.ssh/id_rsa.pub; do
-    [ -f "$f" ] && { cat "$f"; return; }
-  done
-  die "no public key: load one into ssh-agent or pass --key FILE"
+  local keys=''
+  if [ -n "${1:-}" ]; then
+    keys=$(cat "$1")
+  else
+    keys=$(timeout 10 ssh-add -L 2>/dev/null | grep '^ssh-' || true)
+    if [ -z "$keys" ]; then
+      for f in "$HOME"/.ssh/id_ed25519.pub "$HOME"/.ssh/id_ecdsa.pub "$HOME"/.ssh/id_rsa.pub; do
+        [ -f "$f" ] && { keys=$(cat "$f"); break; }
+      done
+    fi
+  fi
+  printf '%s\n' "$keys" | grep -q '^ssh-' \
+    || die "no public key to authorize: load one into ssh-agent (is it responding?) or pass --key FILE"
+  printf '%s\n' "$keys"
 }
