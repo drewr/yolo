@@ -1,27 +1,27 @@
-# Agent sandboxes on Datum Compute
+# The datum backend
 
-`agent-sandbox` spawns an agent session on Datum Compute's `unikernel` class and
+`yolo new NAME --backend datum` spawns an agent session on Datum Compute's `unikernel` class and
 connects to it by SSH over iroh. Each session runs **one** harness from the
 dotfiles, in its own image: `claude` (default), `gemini`, `codex`, `opencode`
 or `pi`. There is no inbound port, no Connect
 gateway, and no login or project on the iroh side.
 
 ```sh
-agent-sandbox new work            # about 10 s to a working SSH session (claude)
-agent-sandbox new oc --agent opencode
-agent-sandbox ssh work            # interactive shell; then run `claude`
-agent-sandbox ssh work -- claude  # or straight into a harness
-agent-sandbox ls
-agent-sandbox rm work
+yolo new work            # about 10 s to a working SSH session (claude)
+yolo new oc --agent opencode
+yolo attach work            # interactive shell; then run `claude`
+yolo attach work -- claude  # or straight into a harness
+yolo ls
+yolo rm work
 ```
 
 - **Keys:** `new` authorizes the keys in your ssh-agent, or `~/.ssh/id_*.pub`, or
   `--key FILE.pub`. If the private key sits next to `FILE.pub`, it is also used
   as the identity.
 - **Providers:** see "Model providers" below.
-- **Images:** one per harness, pinned by digest in `images`. Rebuild with
-  `agent/build-image HARNESS...` (the EC2 build box must be running); it
-  updates `images`.
+- **Images:** one per harness, pinned by digest in `image/images`. Rebuild with
+  `yolo build --backend datum HARNESS...` (the EC2 build box must be running); it
+  updates `image/images`.
 - **Needs locally:** `datumctl` (logged in), `ssh` with a working
   `SSH_AUTH_SOCK` (on this host: `export SSH_AUTH_SOCK=~/.ssh/ssh_auth_sock`),
   `ssh-keygen`, `openssl`, `jq`, `xxd`, `base32`, and `dumbpipe` (falls back to
@@ -32,10 +32,10 @@ agent-sandbox rm work
 - **You log in as `drewr`** (uid 1000) with zsh and the dotfiles' zsh config
   (prompt included), linked from the image into the home
   (`~/.zshrc -> /etc/agent/zsh/zshrc`, and so on) unless the home already has
-  its own. `AGENT_SANDBOX_USER=root agent-sandbox ssh NAME` gets root.
+  its own. `YOLO_USER=root yolo attach NAME` gets root.
 - **`HOME` is the shared home** (`/home/agent`), owned by `drewr`.
-- **git over SSH uses your keys:** `agent-sandbox ssh` forwards your SSH agent
-  (`AGENT_SANDBOX_FORWARD_AGENT=0` turns it off), and the images ship the
+- **git over SSH uses your keys:** `yolo attach` forwards your SSH agent
+  (`YOLO_FORWARD_AGENT=0` turns it off), and the images ship the
   OpenSSH client and GitHub's host keys (`/etc/ssh/ssh_known_hosts`). While
   you're connected, any process in the sandbox, an agent included, can use
   the forwarded keys; nothing is stored there.
@@ -51,7 +51,7 @@ agent-sandbox rm work
 ## Model providers
 
 Keys live in **one** Datum Secret, `agent-providers`, which every session
-reads. `agent-sandbox new` lists its key names and wires each one in as a
+reads. `yolo new` lists its key names and wires each one in as a
 variable of the same name (the unikernel class has no `envFrom`). Values never
 pass through the client. Add any keys you use:
 
@@ -66,8 +66,8 @@ stringData:
   OPENAI_API_KEY: "..."        # codex, opencode, pi
   GEMINI_API_KEY: "..."        # gemini
   OPENROUTER_API_KEY: "..."    # opencode, pi
-  TOKENROUTER_API_KEY: "..."   # via agent/providers
-  SUBCONSCIOUS_API_KEY: "..."  # via agent/providers
+  TOKENROUTER_API_KEY: "..."   # via image/providers
+  SUBCONSCIOUS_API_KEY: "..."  # via image/providers
 EOF
 ```
 
@@ -76,7 +76,7 @@ New sessions pick up the current set of keys. OAuth logins (`claude /login`,
 their tokens live in the shared home and carry over to every session.
 
 Routers and other OpenAI- or Anthropic-compatible providers are listed in
-`agent/providers` (name, key variable, base URLs); add a line to add one. Each
+`image/providers` (name, key variable, base URLs); add a line to add one. Each
 harness takes custom endpoints differently, so the wiring differs:
 
 | Harness | How a registry provider reaches it | Verified (dummy key, provider's own 401) |
@@ -105,7 +105,7 @@ for a minute or more.
 `~` is the shared home (JuiceFS), live across all sessions: `~/.claude`
 (conversations, `claude --resume`), dotfiles, settings. Repos don't run there,
 because git over JuiceFS is about 100x slower than RAM (see
-`docs/spikes/sp6-shared-home.md`). Each repo is instead a **workspace**: it
+`docs/shared-home-benchmarks.md`). Each repo is instead a **workspace**: it
 lives in RAM at `/work/NAME` while a session holds it, and persists to
 `~/work/NAME`.
 
@@ -124,7 +124,7 @@ ws ls                                      # workspaces and who holds them
 - **Same path everywhere** (`/work/NAME`), so Claude Code's per-project history
   lines up across sessions.
 - **When work is saved:** `ws save`, autosave every 2 minutes, `ws close`, and
-  `agent-sandbox rm`, which runs `ws close --all` over SSH before deleting.
+  `yolo rm`, which runs `ws close --all` over SSH before deleting.
   Deleting a workload by other means stops it **without** SIGTERM (tested), so
   that loses up to the last 2 minutes of changes.
 
@@ -134,7 +134,7 @@ save 0.8 s. First `ws open` of the repo 7.7 s; first `ws clone` plus save 15 s.
 
 ## How a session is wired
 
-`new` generates three things locally, under `~/.local/state/agent-sandbox/NAME/`:
+`new` generates three things locally, under `~/.local/state/yolo/sessions/NAME/`:
 
 1. **iroh secret key:** the client derives the endpoint id and builds the ticket
    itself.
@@ -152,13 +152,13 @@ publish to iroh's DNS discovery (`dns.iroh.link`): their TXT record never
 appears, so a bare endpoint-id ticket gets "No addressing information
 available". The boot diagnostics show `dns.iroh.link` reachable over IPv6 and
 unreachable over IPv4 from the IPv6-only (ULA) network. The publish hangs
-without logging an error. `agent-sandbox` therefore writes a ticket containing
-the relay URL (`AGENT_SANDBOX_RELAY`, default `use1-1.relay.n0.iroh.link`, the
+without logging an error. yolo therefore writes a ticket containing
+the relay URL (`YOLO_RELAY`, default `use1-1.relay.n0.iroh.link`, the
 home relay us-central-1 instances have chosen in every run), so the client
 dials the relay directly. If an instance ever picks a different home relay,
-set `AGENT_SANDBOX_RELAY` to match.
+set `YOLO_RELAY` to match.
 
-## Image contents (`flake.nix`)
+## Image contents (`image/flake.nix`)
 
 `packages.<harness>`: one harness from llm-agents.nix at the dotfiles' pinned
 rev (claude-code, gemini-cli, codex, opencode or pi), plus the

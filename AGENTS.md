@@ -1,7 +1,7 @@
 # Agent Instructions
 
-This repository contains a container-based runtime (Docker or Podman) for running
-Claude Code agents in an isolated environment with dangerous mode enabled.
+yolo runs coding agents in named, isolated sessions on two backends: local
+containers (docker or podman) and Datum Compute. See README.md for usage.
 
 ## Commit Conventions
 
@@ -17,37 +17,38 @@ Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0-beta.2/
 
 Common types: `feat`, `fix`, `chore`, `docs`, `refactor`, `ci`
 
-## Running an Agent
+## Structure
+
+- `yolo` sources `lib/session.sh` and `lib/keys.sh`, then one backend.
+- Each backend implements `backend_new NAME HARNESS [opts]`,
+  `backend_attach NAME [args]`, `backend_ls`, `backend_logs NAME [args]` and
+  `backend_rm NAME`. A new backend is a new `backends/NAME.sh` plus its name in
+  `load_backend`.
+- `image/init.sh` is PID 1 in every image. `YOLO_MODE=datum` (the default)
+  serves SSH over iroh and mounts the shared home; `YOLO_MODE=local` sets up
+  the same user and environment and idles for `docker exec`.
+- Paths in init are inside the sandbox. The one host path it touches is the
+  top of the docker backend's bind-mounted home, and only to hand it back to
+  the host user.
+
+## Checks
+
+There are no tests. Before committing, run shellcheck on every script:
 
 ```sh
-./run -v /path/to/project:/workspace
+nix run nixpkgs#shellcheck -- -x yolo lib/*.sh backends/*.sh \
+  image/init.sh image/ws image/agent-providers image/build-image image/sync-pins \
+  image/nix-zsh-env infra/*/ec2/*.sh
 ```
 
-Arguments before `--` are container flags; arguments after are passed to `claude`.
-The image is always rebuilt on each invocation (layer cache keeps it fast).
+Image changes must evaluate (`nix eval --raw ./image#claude.drvPath`). Datum
+images are built on the EC2 build box, never locally. Rebuild every harness
+image after changing anything in `image/`, and commit the new digests in
+`image/images` together with the change.
 
-## Key Files
+## Claude settings (docker backend)
 
-| File | Purpose |
-|------|---------|
-| `run` | Builds image and starts container |
-| `compose.yml` | Single-workspace shortcut via Docker Compose |
-| `docker/Dockerfile` | Image definition (`node:22-slim` + `git` + `claude-code`) |
-| `docker/settings.json` | Claude Code user settings baked into the image |
-| `docker/claude-state.json` | Pre-seeded onboarding state; contains API key approval ID |
-| `docker/entrypoint.sh` | Container entrypoint |
-
-## Updating Settings
-
-Edit `docker/settings.json` for Claude Code config (plugins, permissions, theme).
-Edit `docker/claude-state.json` to update the onboarding state or API key approval.
-
-If the API key is rotated, run the container once, answer the approval prompt, then:
-
-```sh
-docker exec $(docker ps -lq) cat /root/.claude.json
-# or with podman:
-podman exec $(podman ps -lq) cat /root/.claude.json
-```
-
-Copy the new `customApiKeyResponses.approved` value into `docker/claude-state.json`.
+`image/claude/settings.json` and `claude-state.json` seed a docker session's
+home when it has none. If the API key is rotated, attach to a session, answer
+the approval prompt, then copy the new `customApiKeyResponses.approved` value
+from `~/.claude.json` into `image/claude/claude-state.json`.

@@ -2,24 +2,24 @@
 # Backticks in --query strings are JMESPath literals, not shell.
 # shellcheck disable=SC2016
 # Provision a NixOS EC2 box whose config lives in this repo: the build box by
-# default, or the JuiceFS metadata host (meta/ec2/provision.sh sets the
+# default, or the JuiceFS metadata host (infra/meta/ec2/provision.sh sets the
 # variables below). Idempotent for the security group and IAM role; launches a
 # new instance each run, so check `status` first.
 #
-#   buildbox/ec2/provision.sh launch [REV]   # REV defaults to origin's HEAD of this branch
-#   buildbox/ec2/provision.sh ticket         # print the dumbpipe ticket (via SSM)
-#   buildbox/ec2/provision.sh ipv6           # IPv6 for the VPC and the running instance
-#   buildbox/ec2/provision.sh start|stop|status|terminate
+#   infra/buildbox/ec2/provision.sh launch [REV]   # REV defaults to HEAD (must be pushed)
+#   infra/buildbox/ec2/provision.sh ticket         # print the dumbpipe ticket (via SSM)
+#   infra/buildbox/ec2/provision.sh ipv6           # IPv6 for the VPC and the running instance
+#   infra/buildbox/ec2/provision.sh start|stop|status|terminate
 #
 # REV must be pushed: the box fetches its config from
-# github:drewr/dotfiles/REV?dir=$CONFIG#$ATTR.
+# github:drewr/yolo/REV?dir=$CONFIG#$ATTR.
 set -euo pipefail
 export AWS_PROFILE=${AWS_PROFILE:-datum-sandbox-admin}
 export AWS_REGION=${AWS_REGION:-us-east-2}
 NAME=${NAME:-datum-buildbox}
 TYPE=${TYPE:-t3a.large}   # 8 GB: the bigger harness images wedged a 4 GB box
 DISK_GB=${DISK_GB:-64}   # the agent image (six harnesses) is ~4 GB, staged 3-4 times
-CONFIG=${CONFIG:-buildbox/ec2}
+CONFIG=${CONFIG:-infra/buildbox/ec2}
 ATTR=${ATTR:-buildbox}
 TICKET_FILE=${TICKET_FILE:-/var/lib/dumbpipe/ticket}
 IPV6=${IPV6:-0}   # 1: give the instance public IPv6 (sets up the VPC once)
@@ -104,7 +104,9 @@ latest_ami() {
 }
 
 launch() {
-  local rev=${1:-$(git rev-parse origin/datum-unikraft-sessions)}
+  local rev=${1:-$(git rev-parse HEAD)}
+  git branch -r --contains "$rev" 2>/dev/null | grep -q . \
+    || { echo "rev $rev is not on any pushed branch; the box fetches its config from GitHub" >&2; exit 1; }
   if [ -n "$(instance_id)" ]; then echo "already exists: $(instance_id)" >&2; exit 1; fi
   local sg ami name rootdev userdata
   sg=$(ensure_sg)
@@ -119,7 +121,7 @@ launch() {
 #!/bin/sh
 # Apply the $ATTR config pinned to $rev. Re-runs on every boot as a no-op.
 nixos-rebuild switch --option experimental-features 'nix-command flakes' \\
-  --flake 'github:drewr/dotfiles/$rev?dir=$CONFIG#$ATTR'
+  --flake 'github:drewr/yolo/$rev?dir=$CONFIG#$ATTR'
 EOF
   aws ec2 run-instances --image-id "$ami" --instance-type "$TYPE" \
     --security-group-ids "$sg" --iam-instance-profile "Name=$NAME" \
