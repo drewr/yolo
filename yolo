@@ -1,96 +1,122 @@
 #!/usr/bin/env bash
-# Run an agent in the sandboxed Docker/Podman environment.
+# yolo: run coding agents in named, isolated sessions, locally (docker or
+# podman) or on Datum Compute. Each session runs one harness's image: claude
+# (default), gemini, codex, opencode or pi.
 #
-# Usage:
-#   yolo [DOCKER_FLAGS] -- [CLAUDE_ARGS...]
+#   yolo new NAME [--backend docker|datum] [--agent HARNESS] [backend options]
+#                                     create a session and wait until it's ready
+#   yolo attach NAME [args...]        shell as drewr, or run a command (alias: ssh)
+#   yolo ls                           list sessions
+#   yolo logs NAME [args...]          session logs
+#   yolo rm NAME                      save workspaces, then delete the session
+#   yolo build HARNESS... [--backend docker|datum]
+#                                     build images (datum: on the EC2 build box)
 #
-# Mount additional directories with -v flags before --:
-#   yolo -v /path/to/other:/workspace/other -- -p "do the thing"
-#
-# ANTHROPIC_API_KEY, SSH_AUTH_SOCK, and GIT_SIGNING_KEY are passed through from the environment.
-# CLAUDE_SESSIONS defaults to the OS-appropriate data dir; override to store sessions elsewhere.
-# CONTAINER_RUNTIME can be set to "docker" or "podman" to override auto-detection.
-
+# The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
+# remembers its own. Backend options: see backends/docker.sh and
+# backends/datum.sh. Session state lives in $YOLO_STATE
+# (~/.local/state/yolo/sessions).
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-IMAGE="yolo:local"
+YOLO_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lib/session.sh
+. "$YOLO_ROOT/lib/session.sh"
+# shellcheck source=lib/keys.sh
+. "$YOLO_ROOT/lib/keys.sh"
 
-if [ -z "${CONTAINER_RUNTIME:-}" ]; then
-  if command -v docker &>/dev/null; then
-    CONTAINER_RUNTIME=docker
-  elif command -v podman &>/dev/null; then
-    CONTAINER_RUNTIME=podman
-  else
-    echo "error: neither docker nor podman found in PATH" >&2
-    exit 1
-  fi
-fi
+# The header comment through the command list (up to the second "#" line).
+usage() {
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); if ($0 == "" && ++blank == 2) exit; print; next } { exit }' \
+    "${BASH_SOURCE[0]}"
+  exit "${1:-2}"
+}
 
-"$CONTAINER_RUNTIME" build --progress=plain -t "$IMAGE" "$SCRIPT_DIR/docker"
-
-# Split args at -- into docker flags and container command
-docker_flags=()
-cmd=()
-found_sep=false
-for arg in "$@"; do
-  if [[ "$arg" == "--" ]]; then
-    found_sep=true
-  elif $found_sep; then
-    cmd+=("$arg")
-  else
-    docker_flags+=("$arg")
-  fi
-done
-
-if [ -z "${GITHUB_TOKEN:-}" ]; then
-  echo "error: GITHUB_TOKEN is not set" >&2
-  exit 1
-fi
-
-ssh_flags=()
-# Podman machine on macOS uses VirtioFS which cannot forward Unix domain sockets.
-# Instead, encode the private key as base64 and start an in-container ssh-agent.
-# Set SSH_PRIVATE_KEY_FILE to a key path, or SSH_PRIVATE_KEY to pre-encoded content.
-if [ "$CONTAINER_RUNTIME" = "podman" ] && [[ "${OSTYPE:-}" == darwin* ]]; then
-  if [ -n "${SSH_PRIVATE_KEY_FILE:-}" ] && [ -z "${SSH_PRIVATE_KEY:-}" ]; then
-    SSH_PRIVATE_KEY=$(base64 < "$SSH_PRIVATE_KEY_FILE")
-  elif [ -z "${SSH_PRIVATE_KEY:-}" ] && [ -n "${SSH_AUTH_SOCK:-}" ]; then
-    echo "warning: SSH agent socket cannot be forwarded with podman on macOS; set SSH_PRIVATE_KEY_FILE or SSH_PRIVATE_KEY to enable SSH in the container" >&2
-  fi
-else
-  if [ -z "${SSH_AUTH_SOCK:-}" ]; then
-    echo "error: SSH_AUTH_SOCK is not set (is ssh-agent running?)" >&2
-    exit 1
-  fi
-  ssh_flags+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
-  if [ -f "${HOME}/.ssh/allowed_signers" ]; then
-    ssh_flags+=(-v "${HOME}/.ssh/allowed_signers:/root/.ssh/allowed_signers:ro")
-  fi
-fi
-
-if [ -z "${CLAUDE_SESSIONS:-}" ]; then
-  case "${OSTYPE:-}" in
-    darwin*)  CLAUDE_SESSIONS="$HOME/Library/Application Support/yolo/sessions" ;;
-    msys*|cygwin*|win32*) CLAUDE_SESSIONS="${APPDATA:-$HOME/AppData/Roaming}/yolo/sessions" ;;
-    *)        CLAUDE_SESSIONS="${XDG_DATA_HOME:-$HOME/.local/share}/yolo/sessions" ;;
+load_backend() {
+  case $1 in
+    docker|datum) ;;
+    *) die "unknown backend '$1' (docker or datum)" ;;
   esac
-fi
-mkdir -p "$CLAUDE_SESSIONS"
-sessions_flags=(-v "$CLAUDE_SESSIONS:/root/.claude/projects")
+  # shellcheck source=/dev/null
+  . "$YOLO_ROOT/backends/$1.sh"
+}
 
-"$CONTAINER_RUNTIME" run --rm -it \
-  -e ANTHROPIC_API_KEY \
-  -e GITHUB_TOKEN \
-  -e GIT_EMAIL="${GIT_EMAIL:-}" \
-  -e GIT_NAME="${GIT_NAME:-}" \
-  -e GIT_SIGNING_KEY="${GIT_SIGNING_KEY:-}" \
-  -e SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-}" \
-  -e HOST_UID="$(id -u)" \
-  -e HOST_GID="$(id -g)" \
-  "${ssh_flags[@]}" \
-  "${sessions_flags[@]}" \
-  -w /workspace \
-  "${docker_flags[@]}" \
-  "$IMAGE" \
-  "${cmd[@]}"
+cmd_new() {
+  local name=${1:?usage: yolo new NAME [--backend docker|datum] [--agent HARNESS] [options]}; shift
+  local backend; backend=$(opt BACKEND docker)
+  local harness; harness=$(opt AGENT claude)
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --backend) backend=$2; shift 2 ;;
+      --agent) harness=$2; shift 2 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  check_harness "$harness"
+  session_dir "$name" >/dev/null
+  load_backend "$backend"
+  backend_new "$name" "$harness" "${rest[@]}"
+}
+
+cmd_attach() {
+  local name=${1:?usage: yolo attach NAME [args...]}; shift
+  load_backend "$(session_backend "$name")"
+  backend_attach "$name" "$@"
+}
+
+cmd_logs() {
+  local name=${1:?usage: yolo logs NAME [args...]}; shift
+  load_backend "$(session_backend "$name")"
+  backend_logs "$name" "$@"
+}
+
+cmd_rm() {
+  local name=${1:?usage: yolo rm NAME}
+  load_backend "$(session_backend "$name")"
+  backend_rm "$name"
+}
+
+cmd_ls() {
+  local d n b used=''
+  printf '%-20s %-8s %s\n' SESSION BACKEND HARNESS
+  for d in "$YOLO_STATE"/*/; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d"); b=$(cat "$d/backend" 2>/dev/null || echo '?')
+    printf '%-20s %-8s %s\n' "$n" "$b" "$(cat "$d/harness" 2>/dev/null || echo '?')"
+    case " $used " in *" $b "*) ;; *) used+=" $b" ;; esac
+  done
+  for b in $used; do
+    [ "$b" = '?' ] && continue
+    echo; echo "== $b"
+    ( load_backend "$b"; backend_ls )
+  done
+}
+
+cmd_build() {
+  local backend; backend=$(opt BACKEND docker)
+  local harnesses=() h
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --backend) backend=$2; shift 2 ;;
+      *) check_harness "$1"; harnesses+=("$1"); shift ;;
+    esac
+  done
+  [ ${#harnesses[@]} -gt 0 ] || die "usage: yolo build HARNESS... [--backend docker|datum]"
+  case $backend in
+    datum) exec "$YOLO_ROOT/image/build-image" "${harnesses[@]}" ;;
+    docker) load_backend docker; for h in "${harnesses[@]}"; do docker_build "$h"; done ;;
+    *) die "unknown backend '$backend'" ;;
+  esac
+}
+
+case ${1:-} in
+  help|-h|--help|'') ;;
+  *) migrate_agent_sandbox_state ;;
+esac
+
+case ${1:-} in
+  new|attach|ls|logs|rm|build) c=$1; shift; "cmd_$c" "$@" ;;
+  ssh) shift; cmd_attach "$@" ;;
+  help|-h|--help) usage 0 ;;
+  *) usage ;;
+esac
