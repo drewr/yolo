@@ -1,8 +1,9 @@
-# One pinned image per harness, used by agent-sandbox new --agent HARNESS.
-# Rebuild: buildbox/ec2/build.sh agent ghcr.io/drewr/agent-HARNESS:dev --build-arg HARNESS=HARNESS
-# then replace that harness's line with the printed digest.
-claude    ghcr.io/drewr/agent-claude@sha256:f800a3c9752f5b7532bbb066d1e29a3c6d4bbdfdd26fe96af375dc45172a0a40
-pi        ghcr.io/drewr/agent-pi@sha256:8b3194ee8c33a9f54e67f65d5b4cc72a49a01a1eab35967f1199fa2b7146d5c8
-opencode  ghcr.io/drewr/agent-opencode@sha256:c131efbe56465a455bbd00022b683c2be1405c0609e6d52127e576d5357789bb
-codex     ghcr.io/drewr/agent-codex@sha256:c27abf5ddf185bc7f1ffffaca93f3f9eb5a62e2665e97603529ac9af5964ec34
-gemini    ghcr.io/drewr/agent-gemini@sha256:7e607c2b4cbee1cd85f16a4d9e49c882ff1c6fbc6f3a669d0069d1e893d599d8
+# One pinned image per harness (x86_64-linux), used by the datum backend:
+# yolo new NAME --backend datum --agent HARNESS.
+# Rebuild on the EC2 build box with: yolo build HARNESS --backend datum
+# (rewrites that harness's line).
+claude    ghcr.io/drewr/agent-claude@sha256:a415dd44231b6732d318b000d2215e7774368aaddb114111f6451f69d0f64876
+pi        ghcr.io/drewr/agent-pi@sha256:60a1ebf5a15ca91ddf85184a5df2c59d958e14951625d8f98fab717acebadead
+opencode  ghcr.io/drewr/agent-opencode@sha256:6cd674346b745201f81e4f4e7f812ec7befee7e90af3858596219cd52e34109b
+codex     ghcr.io/drewr/agent-codex@sha256:dd8ad2fa966ce69c38f05f651114b1309bbbda5368e190199ad967c2d09f200c
+gemini    ghcr.io/drewr/agent-gemini@sha256:7e26ee82c4f1d99fddcdf6a6d2e7877a991fcf7f639ac23b8c6e52f92b3bac35

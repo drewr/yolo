@@ -9,7 +9,8 @@
 #     at /home/agent, and the user takes the host's uid (HOST_UID/HOST_GID) so
 #     files there keep the host user's ownership. GIT_NAME, GIT_EMAIL and
 #     GIT_SIGNING_KEY set git identity and signing, and the claude settings in
-#     /etc/agent/claude seed a home that has none.
+#     /etc/agent/claude seed a home that has none. A private key mounted at
+#     /run/yolo-key/id is loaded into an agent at /run/yolo-ssh/agent.sock.
 #
 # Environment (datum), from the per-session Secret written by yolo:
 #   IROH_SECRET          iroh endpoint secret key; the client derives the ticket
@@ -211,7 +212,21 @@ if [ "$MODE" = local ]; then
       git config --global user.signingkey '$GIT_SIGNING_KEY'
       git config --global commit.gpgsign true
     fi
+    # The host's ~/.ssh/allowed_signers, for verifying signatures.
+    [ -r /etc/ssh/allowed_signers ] && git config --global gpg.ssh.allowedSignersFile /etc/ssh/allowed_signers
     true"
+  # An injected private key (/run/yolo-key/id; for runtimes that can't relay
+  # the host agent's socket, such as podman on macOS) goes into an agent here
+  # at a fixed socket, which attach points SSH_AUTH_SOCK at.
+  if [ -r /run/yolo-key/id ]; then
+    mkdir -p /run/yolo-ssh && chown "$UID_:$GID_" /run/yolo-ssh && chmod 700 /run/yolo-ssh
+    if as_user 'ssh-agent -a /run/yolo-ssh/agent.sock >/dev/null' \
+       && as_user 'SSH_AUTH_SOCK=/run/yolo-ssh/agent.sock ssh-add - 2>/dev/null' < /run/yolo-key/id; then
+      log "ssh key loaded into the session agent"
+    else
+      log "ssh key NOT loaded (passphrase-protected keys are unsupported)"
+    fi
+  fi
 fi
 
 # opencode and pi provider config for the registry providers whose key is set

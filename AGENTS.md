@@ -41,7 +41,7 @@ nix run nixpkgs#shellcheck -- -x yolo lib/*.sh backends/*.sh \
   image/nix-zsh-env infra/*/ec2/*.sh
 ```
 
-Image changes must evaluate (`nix eval --raw ./image#claude.drvPath`). Datum
+Image changes must evaluate for both systems (`nix eval --raw ./image#packages.x86_64-linux.claude.drvPath`, and `aarch64-linux`). Datum
 images are built on the EC2 build box, never locally. Rebuild every harness
 image after changing anything in `image/`, and commit the new digests in
 `image/images` together with the change.

@@ -1,5 +1,5 @@
 # Build one harness's rootfs with nix inside BuildKit, pinned by flake.lock, then
-# ship only the rootfs. HARNESS picks packages.<harness> from flake.nix (claude,
+# ship only the rootfs. HARNESS picks packages.<system>.<harness> from flake.nix (claude,
 # gemini, codex, opencode, pi). sandbox=false because a BuildKit RUN step
 # cannot create the namespaces the nix sandbox needs; inputs stay pinned by the
 # lock.

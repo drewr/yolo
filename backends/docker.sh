@@ -15,7 +15,12 @@
 # - Git: GIT_NAME, GIT_EMAIL, GIT_SIGNING_KEY and GITHUB_TOKEN are passed in.
 # - SSH agent: while you're attached, a socat relay in the session directory
 #   connects the container to your current $SSH_AUTH_SOCK
-#   (YOLO_FORWARD_AGENT=0 turns it off).
+#   (YOLO_FORWARD_AGENT=0 turns it off). Podman on macOS can't share sockets
+#   with the VM (VirtioFS), so there, or whenever SSH_PRIVATE_KEY_FILE (a key
+#   path) or SSH_PRIVATE_KEY (base64 key) is set, the key is mounted read-only
+#   instead and loaded into an agent inside the session. It must have no
+#   passphrase.
+# - ~/.ssh/allowed_signers, if present, is mounted for git signature checks.
 
 DOCKER_RUNTIME=${YOLO_RUNTIME:-${CONTAINER_RUNTIME:-}}
 if [ -z "$DOCKER_RUNTIME" ]; then
@@ -33,6 +38,12 @@ DOCKER_FORWARD_AGENT=$(opt FORWARD_AGENT 1)
 DOCKER_USER=$(opt USER drewr)
 
 docker_image() { echo "yolo/$1:local"; }
+
+# Podman machine on macOS shares host files over VirtioFS, which can't carry
+# Unix sockets, so the agent relay can't reach the container.
+docker_no_socket_relay() {
+  [ "$DOCKER_RUNTIME" = podman ] && [[ ${OSTYPE:-} == darwin* ]]
+}
 
 # Build yolo/HARNESS:local from image/ with the same Dockerfile Datum uses.
 docker_build() {
@@ -59,6 +70,22 @@ backend_new() {
   local dir; dir=$(session_create "$name" docker "$harness")
   mkdir -p "$dir/agent"
 
+  # SSH: relay the host agent at attach, or inject a key (see the header).
+  local keymount=()
+  if [ -n "${SSH_PRIVATE_KEY:-}" ]; then
+    (umask 077; printf '%s' "$SSH_PRIVATE_KEY" | base64 -d > "$dir/ssh_key") \
+      || { rm -rf "$dir"; die "docker: SSH_PRIVATE_KEY is not valid base64"; }
+    keymount=(-v "$dir/ssh_key:/run/yolo-key/id:ro")
+  elif [ -n "${SSH_PRIVATE_KEY_FILE:-}" ]; then
+    [ -r "$SSH_PRIVATE_KEY_FILE" ] || { rm -rf "$dir"; die "docker: cannot read $SSH_PRIVATE_KEY_FILE"; }
+    keymount=(-v "$(realpath "$SSH_PRIVATE_KEY_FILE"):/run/yolo-key/id:ro")
+  elif docker_no_socket_relay; then
+    echo "yolo: $DOCKER_RUNTIME on macOS can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session" >&2
+  fi
+  [ ${#keymount[@]} -gt 0 ] && touch "$dir/ssh_key_mode"
+  [ -f "$HOME/.ssh/allowed_signers" ] \
+    && keymount+=(-v "$HOME/.ssh/allowed_signers:/etc/ssh/allowed_signers:ro")
+
   local env=(-e YOLO_MODE=local -e SESSION_NAME="$name"
              -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
   local v
@@ -72,7 +99,7 @@ backend_new() {
 
   "$DOCKER_RUNTIME" run -d --name "yolo-$name" --hostname "$name" \
     "${env[@]}" -v "$DOCKER_HOME:/home/agent" -v "$dir/agent:/run/yolo-agent" \
-    "${mounts[@]}" "$image" >/dev/null \
+    "${keymount[@]}" "${mounts[@]}" "$image" >/dev/null \
     || { rm -rf "$dir"; die "docker: could not start yolo-$name"; }
   echo "started yolo-$name ($harness: $image); waiting for init..." >&2
   local t0=$SECONDS
@@ -88,8 +115,11 @@ backend_attach() {
   local dir; dir=$(session_dir "$name")
   local tty=(-i) relay='' env=(-e SHELL=/bin/zsh -e TERM="${TERM:-xterm-256color}")
   [ -t 0 ] && [ -t 1 ] && tty=(-it)
-  # The current SSH agent, relayed only while attached.
-  if [ "$DOCKER_FORWARD_AGENT" = 1 ] && [ -S "${SSH_AUTH_SOCK:-}" ]; then
+  # The session's own agent holding an injected key, or else the current SSH
+  # agent, relayed only while attached.
+  if [ -f "$dir/ssh_key_mode" ]; then
+    env+=(-e SSH_AUTH_SOCK=/run/yolo-ssh/agent.sock)
+  elif [ "$DOCKER_FORWARD_AGENT" = 1 ] && [ -S "${SSH_AUTH_SOCK:-}" ] && ! docker_no_socket_relay; then
     local socat; socat=$(command -v socat || echo "$(nix build --no-link --print-out-paths nixpkgs#socat)/bin/socat")
     rm -f "$dir/agent/agent.sock"
     "$socat" "UNIX-LISTEN:$dir/agent/agent.sock,fork,mode=600" "UNIX-CONNECT:$SSH_AUTH_SOCK" 2>/dev/null &

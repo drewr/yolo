@@ -24,7 +24,7 @@ backend, so the other commands just take the name.
 | HOME | `~/.local/share/yolo/home` on the host, shared by docker sessions | a JuiceFS home shared by all Datum sessions |
 | Workspaces | `-v HOST:CONTAINER` at `new` | `ws clone/open/save/close` (repos in RAM, saved to the shared home) |
 | Provider keys | `~/.config/yolo/providers.env` (KEY=value, 0600) | the Datum Secret `agent-providers` |
-| SSH agent | relayed while attached | forwarded while attached |
+| SSH agent | relayed while attached; or an injected key (`SSH_PRIVATE_KEY_FILE`, needed for podman on macOS) | forwarded while attached |
 | Images | `yolo/HARNESS:local`, built locally on first use | built on the EC2 build box, pinned in `image/images` |
 
 Choose the default backend with `YOLO_BACKEND=datum` (otherwise `docker`).
@@ -73,7 +73,7 @@ nix flake update dotfiles --flake image   # follow newer dotfiles, then build
 
 ## Requirements
 
-- **docker backend:** Docker or Podman.
+- **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).
 - **datum backend:** `datumctl` signed in to Datum (production), plus `ssh`,
   `ssh-keygen`, `openssl`, `jq`, `xxd` and `base32`. `dumbpipe` comes from
   nixpkgs if missing. Building Datum images needs the EC2 build box
