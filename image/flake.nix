@@ -29,11 +29,19 @@
   outputs = { self, nixpkgs, llm-agents, dotfiles }:
   let
     system = "x86_64-linux";
-    pkgs = import nixpkgs {
-      inherit system;
-      # rtk (the token-saving command proxy yolo's claude hook runs) is
-      # dual-licensed Apache-2.0 / BUSL-1.1; allow it, and nothing else unfree.
-      config.allowUnfreePredicate = p: builtins.elem (nixpkgs.lib.getName p) [ "rtk" ];
+    pkgs = nixpkgs.legacyPackages.${system};
+    # rtk, the token-saving command proxy yolo's claude hook runs: the upstream
+    # static release binary. nixpkgs' rtk is unfree (Apache-2.0 / BUSL-1.1), so
+    # it isn't in cache.nixos.org and compiled from source in every image build.
+    rtk = pkgs.stdenvNoCC.mkDerivation {
+      pname = "rtk";
+      version = "1.0.1";
+      src = pkgs.fetchurl {
+        url = "https://github.com/rtk-ai/rtk/releases/download/v1.0.1/rtk-x86_64-unknown-linux-musl.tar.gz";
+        hash = "sha256-W5GcO8y3mbZ6YYZtDmF0EKT83xc+JhREDlneL6IANDY=";
+      };
+      sourceRoot = ".";
+      installPhase = "install -Dm755 rtk $out/bin/rtk";
     };
     agents = llm-agents.packages.${system};
     # The same harnesses the dotfiles install (d/.config/home-manager/flake.nix),
@@ -52,7 +60,7 @@
       pi = agents.pi;
     };
     busybox = pkgs.pkgsStatic.busybox;
-    base = with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq rtk nix dropbear dumbpipe juicefs rsync ];
+    base = [ rtk ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync ]);
 
     # The login user (SSH lands here, not root), whose HOME is the shared home.
     user = { name = "drewr"; uid = 1000; };
