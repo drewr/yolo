@@ -83,8 +83,12 @@ backend_new() {
     echo "yolo: $DOCKER_RUNTIME on macOS can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session" >&2
   fi
   [ ${#keymount[@]} -gt 0 ] && touch "$dir/ssh_key_mode"
-  [ -f "$HOME/.ssh/allowed_signers" ] \
-    && keymount+=(-v "$HOME/.ssh/allowed_signers:/etc/ssh/allowed_signers:ro")
+  # Copied rather than bind-mounted: it is often a symlink into /nix/store,
+  # which a podman machine VM can't see.
+  if [ -f "$HOME/.ssh/allowed_signers" ]; then
+    cp -L "$HOME/.ssh/allowed_signers" "$dir/allowed_signers"
+    keymount+=(-v "$dir/allowed_signers:/etc/ssh/allowed_signers:ro")
+  fi
 
   local env=(-e YOLO_MODE=local -e SESSION_NAME="$name"
              -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)")
