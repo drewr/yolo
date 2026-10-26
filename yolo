@@ -982,7 +982,7 @@ dockerLs = do
     () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
 
 dockerNew :: FilePath -> Runtime -> Docker -> String -> String -> [String] -> IO ()
-dockerNew root r d name harness opts0 = do
+dockerNew root runtime d name harness opts0 = do
   let parse acc = \case
         v : m : r | v `elem` ["-v", "--volume"] -> do
           let host = takeWhile (/= ':') m
@@ -997,8 +997,8 @@ dockerNew root r d name harness opts0 = do
   -- The session exists from here on, so `yolo ls` shows it while the image
   -- builds; `state` says what it's doing, until it's ready.
   dir <- sessionCreate name "docker" harness
-  writeRuntime dir r
-  hPutStrLn stderr ("yolo: runtime " ++ rtExe r)
+  writeRuntime dir runtime
+  hPutStrLn stderr ("yolo: runtime " ++ rtExe runtime)
   present <- (== ExitSuccess) <$> quiet (rt d) ["image", "inspect", image]
   unless present $ do
     writeFile (dir </> "state") "building\n"
