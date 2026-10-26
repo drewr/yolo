@@ -20,7 +20,7 @@
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, SomeException, bracket, finally, try)
+import Control.Exception (IOException, SomeException, bracket, finally, onException, try)
 import Control.Monad (filterM, forM, forM_, mfilter, unless, when)
 import Crypto.Error (throwCryptoErrorIO)
 import qualified Crypto.PubKey.Ed25519 as Ed
@@ -163,12 +163,13 @@ cmdLs root full = do
   st <- yoloState
   names <- sort <$> (listDirectory st `orElse` [])
   dirs <- filterM (doesDirectoryExist . (st </>)) names
-  printf "%-20s %-8s %-9s %s\n" "NAME" "BACKEND" "HARNESS" "CLASS" :: IO ()
+  printf "%-20s %-8s %-9s %-16s %s\n" "NAME" "BACKEND" "HARNESS" "CLASS" "STATE" :: IO ()
   backends <- forM dirs $ \n -> do
     b <- readMeta (st </> n </> "backend") "?"
     h <- readMeta (st </> n </> "harness") "?"
     c <- readMeta (st </> n </> "class") "-"
-    printf "%-20s %-8s %-9s %s\n" n b h c :: IO ()
+    s <- readMeta (st </> n </> "state") "-"
+    printf "%-20s %-8s %-9s %-16s %s\n" n b h c s :: IO ()
     pure b
   forM_ (filter (`notElem` ["?", "datum"]) (nub backends)) $ \b -> do
     putStrLn ""
@@ -194,7 +195,7 @@ cmdBuild root args0 = do
     "datum" -> buildDatum root (fromMaybe "unikernel" cls) hs0
     "docker" -> do
       when (isJust cls) $ die "--class is for the datum backend"
-      d <- dockerConfig
+      d <- containerRuntime >>= dockerConfig
       mapM_ (dockerBuild root d) hs0
     _ -> die ("unknown backend '" ++ backend ++ "'")
 
@@ -821,18 +822,39 @@ data Docker = Docker
   , dkUser :: String
   }
 
--- The runtime: $YOLO_RUNTIME (or $CONTAINER_RUNTIME), else the first of
--- podman and colima (each from PATH, or else nixpkgs; colima through the
--- docker CLI and its docker context) and docker that is up. Also whether it runs in a VM that
--- can't share host sockets.
-containerRuntime :: IO (String, Bool)
-containerRuntime = do
+-- A container runtime: the executable (a store path, when it came from nix),
+-- whether it runs in a VM that can't share host sockets, and the docker
+-- context it needs, if any. A session keeps the one it was made with in its
+-- `runtime` file, so later commands don't depend on what PATH has.
+data Runtime = Runtime
+  { rtExe :: String
+  , rtVM :: Bool
+  , rtContext :: Maybe String
+  }
+  deriving (Eq)
+
+-- $YOLO_RUNTIME (or $CONTAINER_RUNTIME), else the first of podman and colima
+-- (each from PATH, or else nixpkgs; colima through the docker CLI and its
+-- docker context) and docker that is up.
+containerRuntimeMaybe :: IO (Maybe Runtime)
+containerRuntimeMaybe = do
   explicit <- firstEnv ["YOLO_RUNTIME", "CONTAINER_RUNTIME"]
   case explicit of
-    Just r -> pure (r, os == "darwin" && takeFileName r == "podman")
-    Nothing -> do
-      found <- firstJustM [podmanRuntime, colimaRuntime, dockerRuntime]
-      maybe (die "docker: no podman, colima or docker found (podman and colima must be running)") pure found
+    Just r -> pure (Just (Runtime r (os == "darwin" && takeFileName r == "podman") Nothing))
+    Nothing -> firstJustM [podmanRuntime, colimaRuntime, dockerRuntime]
+
+containerRuntime :: IO Runtime
+containerRuntime = containerRuntimeMaybe >>= maybe (die "docker: no podman, colima or docker found (podman and colima must be running)") pure
+
+writeRuntime :: FilePath -> Runtime -> IO ()
+writeRuntime dir r = writeFile (dir </> "runtime") (unlines [rtExe r, if rtVM r then "vm" else "-", fromMaybe "-" (rtContext r)])
+
+readRuntime :: FilePath -> IO (Maybe Runtime)
+readRuntime dir = do
+  c <- readFileMaybe (dir </> "runtime")
+  pure $ case fmap lines c of
+    Just [e, vm, ctx] | not (null e) -> Just (Runtime e (vm == "vm") (if ctx == "-" then Nothing else Just ctx))
+    _ -> Nothing
 
 firstJustM :: [IO (Maybe a)] -> IO (Maybe a)
 firstJustM = \case
@@ -858,18 +880,18 @@ nixBin pkg exe = do
         Right _ -> pure Nothing
         Left e -> const (pure Nothing) (e :: IOException)
 
-podmanRuntime :: IO (Maybe (String, Bool))
+podmanRuntime :: IO (Maybe Runtime)
 podmanRuntime = do
   podman <- findOrNix "podman" "podman"
   case podman of
     Nothing -> pure Nothing
     Just p -> do
       up <- quiet p ["info"]
-      pure (if up == ExitSuccess then Just (p, os == "darwin") else Nothing)
+      pure (if up == ExitSuccess then Just (Runtime p (os == "darwin") Nothing) else Nothing)
 
 -- Colima runs the docker daemon in a VM; the docker CLI reaches it through
 -- its docker context.
-colimaRuntime :: IO (Maybe (String, Bool))
+colimaRuntime :: IO (Maybe Runtime)
 colimaRuntime = do
   colima <- findOrNix "colima" "colima"
   case colima of
@@ -880,21 +902,22 @@ colimaRuntime = do
         then pure Nothing
         else do
           docker <- findOrNix "docker-client" "docker"
-          forM docker $ \d -> setEnv "DOCKER_CONTEXT" "colima" >> pure (d, os == "darwin")
+          pure (fmap (\d -> Runtime d (os == "darwin") (Just "colima")) docker)
 
-dockerRuntime :: IO (Maybe (String, Bool))
-dockerRuntime = fmap (const ("docker", False)) <$> findExecutable "docker"
+dockerRuntime :: IO (Maybe Runtime)
+dockerRuntime = fmap (const (Runtime "docker" False Nothing)) <$> findExecutable "docker"
 
-dockerConfig :: IO Docker
-dockerConfig = do
-  (runtime, vm) <- containerRuntime
+-- Settings around a runtime, which also takes effect: its docker context.
+dockerConfig :: Runtime -> IO Docker
+dockerConfig r = do
+  mapM_ (setEnv "DOCKER_CONTEXT") (rtContext r)
   home <- getHomeDirectory
   dataHome <- fromMaybe (home </> ".local/share") <$> envNonEmpty "XDG_DATA_HOME"
   configHome <- fromMaybe (home </> ".config") <$> envNonEmpty "XDG_CONFIG_HOME"
   let homeDefault
         | os == "darwin" = home </> "Library/Application Support/yolo/home"
         | otherwise = dataHome </> "yolo/home"
-  Docker runtime vm
+  Docker (rtExe r) (rtVM r)
     <$> opt "DOCKER_HOME" homeDefault
     <*> opt "PROVIDERS_ENV" (configHome </> "yolo/providers.env")
     <*> ((== "1") <$> opt "FORWARD_AGENT" "1")
@@ -915,16 +938,26 @@ dockerBuild root d h = do
   code <- rawSystem (rt d) ["build", "--build-arg", "HARNESS=" ++ h, "-t", dockerImage h, "-f", root </> "image/Dockerfile", root </> "image"]
   unless (code == ExitSuccess) $ die ("docker: could not build " ++ dockerImage h)
 
+-- The runtime a session was made with; failing that (older sessions), the
+-- one found now.
+sessionDocker :: String -> IO Docker
+sessionDocker name = do
+  dir <- sessionDir name
+  readRuntime dir >>= maybe containerRuntime pure >>= dockerConfig
+
 dockerBackend :: FilePath -> IO Backend
-dockerBackend root = do
-  d <- dockerConfig
+dockerBackend root =
   pure
     Backend
-      { bNew = dockerNew root d
-      , bAttach = dockerAttach d
-      , bLs = \_ -> () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
-      , bLogs = \name args -> rawSystem (rt d) (["logs"] ++ args ++ ["yolo-" ++ name]) >>= exitWith
+      { bNew = \name harness opts -> do
+          r <- containerRuntime
+          d <- dockerConfig r
+          dockerNew root r d name harness opts
+      , bAttach = \name args -> sessionDocker name >>= \d -> dockerAttach d name args
+      , bLs = \_ -> dockerLs
+      , bLogs = \name args -> sessionDocker name >>= \d -> rawSystem (rt d) (["logs"] ++ args ++ ["yolo-" ++ name]) >>= exitWith
       , bRm = \name -> do
+          d <- sessionDocker name
           dir <- sessionDir name
           -- Workspaces are bind mounts and HOME is on the host: nothing to save.
           code <- quiet (rt d) ["rm", "-f", "yolo-" ++ name]
@@ -932,8 +965,24 @@ dockerBackend root = do
           removePathForcibly dir
       }
 
-dockerNew :: FilePath -> Docker -> String -> String -> [String] -> IO ()
-dockerNew root d name harness opts0 = do
+-- The containers of every docker session, once per runtime the sessions use.
+dockerLs :: IO ()
+dockerLs = do
+  st <- yoloState
+  names <- sort <$> (listDirectory st `orElse` [])
+  mine <- filterM (\n -> (== "docker") <$> readMeta (st </> n </> "backend") "?") names
+  recorded <- forM mine $ \n -> readRuntime (st </> n)
+  -- Sessions from before runtimes were recorded use the one found now.
+  found <- if any (== Nothing) recorded then containerRuntimeMaybe else pure Nothing
+  let used = nub (mapMaybe (<|> found) recorded)
+  when (null used) $ hPutStrLn stderr "yolo: no container runtime found to list the docker sessions"
+  forM_ used $ \r -> do
+    putStrLn ("runtime: " ++ rtExe r)
+    d <- dockerConfig r
+    () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
+
+dockerNew :: FilePath -> Runtime -> Docker -> String -> String -> [String] -> IO ()
+dockerNew root r d name harness opts0 = do
   let parse acc = \case
         v : m : r | v `elem` ["-v", "--volume"] -> do
           let host = takeWhile (/= ':') m
@@ -945,10 +994,17 @@ dockerNew root d name harness opts0 = do
         [] -> pure acc
   mounts <- parse [] opts0
   let image = dockerImage harness
-  present <- (== ExitSuccess) <$> quiet (rt d) ["image", "inspect", image]
-  unless present $ dockerBuild root d harness
-  createDirectoryIfMissing True (dkHome d)
+  -- The session exists from here on, so `yolo ls` shows it while the image
+  -- builds; `state` says what it's doing, until it's ready.
   dir <- sessionCreate name "docker" harness
+  writeRuntime dir r
+  hPutStrLn stderr ("yolo: runtime " ++ rtExe r)
+  present <- (== ExitSuccess) <$> quiet (rt d) ["image", "inspect", image]
+  unless present $ do
+    writeFile (dir </> "state") "building\n"
+    dockerBuild root d harness `onException` removePathForcibly dir
+  writeFile (dir </> "state") "starting\n"
+  createDirectoryIfMissing True (dkHome d)
   createDirectoryIfMissing True (dir </> "agent")
   let failNew :: String -> IO a
       failNew msg = removePathForcibly dir >> die msg
@@ -1010,9 +1066,10 @@ dockerNew root d name harness opts0 = do
         (_, out, err) <- readProcessWithExitCode (rt d) ["logs", "yolo-" ++ name] ""
         unless ("[agent] ready" `isInfixOf` (out ++ err)) $ do
           n <- secondsSince t0
-          when (n >= 120) $ die ("init not ready after 2 min; try: yolo logs " ++ name)
+          when (n >= 120) $ writeFile (dir </> "state") "not ready\n" >> die ("init not ready after 2 min; try: yolo logs " ++ name)
           threadDelay 1000000 >> wait
   wait
+  removePathForcibly (dir </> "state")
   n <- secondsSince t0
   hPutStrLn stderr ("ready after " ++ show n ++ "s: yolo attach " ++ name)
   where
