@@ -19,13 +19,13 @@ backend, so the other commands just take the name.
 
 | | docker | datum |
 | - | - | - |
-| Runs on | this machine, container `yolo-NAME` | Datum Compute (unikernel class), `us-east-1` |
+| Runs on | this machine, container `yolo-NAME` | Datum Compute, `us-east-1`; unikernel class, or `--class general-purpose` |
 | Attach | `docker exec` | SSH over iroh, host key pinned; no inbound ports |
 | HOME | `~/.local/share/yolo/home` on the host, shared by docker sessions | a JuiceFS home shared by all Datum sessions |
 | Workspaces | `-v HOST:CONTAINER` at `new` | `ws clone/open/save/close` (repos in RAM, saved to the shared home) |
 | Provider keys | `~/.config/yolo/providers.env` (KEY=value, 0600) | the Datum Secret `agent-providers` |
 | SSH agent | relayed while attached; or an injected key (`SSH_PRIVATE_KEY_FILE`, needed for podman on macOS) | forwarded while attached |
-| Images | `yolo/HARNESS:local`, built locally on first use | built on the EC2 build box, pinned in `image/images` |
+| Images | `yolo/HARNESS:local`, built locally on first use | built on the EC2 build box, pinned in `image/images` (`image/images-general-purpose` for general-purpose) |
 
 Choose the default backend with `YOLO_BACKEND=datum` (otherwise `docker`).
 
@@ -57,6 +57,7 @@ the [dotfiles](https://github.com/drewr/dotfiles) through the flake's
 ```sh
 yolo build claude                         # docker: yolo/claude:local
 yolo build claude codex --backend datum   # on the EC2 build box; updates image/images
+yolo build claude --backend datum --class general-purpose   # updates image/images-general-purpose
 nix flake update dotfiles --flake image   # follow newer dotfiles, then build
 ```
 

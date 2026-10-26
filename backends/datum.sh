@@ -3,7 +3,9 @@
 # reached by SSH over iroh. Sourced by yolo after lib/session.sh and lib/keys.sh.
 #
 # new options: --key PUBKEY_FILE (authorize this key instead of the agent's),
-#              --no-home (private, ephemeral HOME instead of the shared home)
+#              --no-home (private, ephemeral HOME instead of the shared home),
+#              --class unikernel|general-purpose (runtime class; default
+#                $YOLO_CLASS, else unikernel)
 #
 # Each session gets a fresh iroh secret and SSH host key generated here, stored
 # in a per-session Datum Secret (agent-NAME) and in the session directory. The
@@ -19,6 +21,8 @@
 # dumbpipe (falls back to `nix build nixpkgs#dumbpipe`).
 
 DATUM_IMAGES=$(opt IMAGES "$YOLO_ROOT/image/images")
+# general-purpose runs standard OCI images, not the unikernel ones.
+DATUM_GP_IMAGES=$(opt GP_IMAGES "$YOLO_ROOT/image/images-general-purpose")
 # Login user in the sandbox (the images' unprivileged user); root also works.
 DATUM_USER=$(opt USER drewr)
 # Forward the local SSH agent, so git over SSH in the sandbox uses your keys
@@ -52,22 +56,30 @@ datum_provider_key_names() {
 
 backend_new() {
   local name=$1 harness=$2; shift 2
-  local key='' home=1
+  local key='' home=1 class=$DATUM_CLASS
   while [ $# -gt 0 ]; do
     case $1 in
       --key) key=$2; shift 2 ;;
+      --class) class=$2; shift 2 ;;
       --no-home) home=0; shift ;;
       *) die "datum: unknown option $1" ;;
     esac
   done
+  case $class in
+    unikernel|general-purpose) ;;
+    *) die "datum: unknown class '$class' (unikernel or general-purpose)" ;;
+  esac
   if [ $home = 1 ] && ! datumctl get secret "$DATUM_HOME_SECRET" >/dev/null 2>&1; then
     echo "yolo: no Secret $DATUM_HOME_SECRET; this session's HOME is ephemeral" >&2
     home=0
   fi
+  local images=$DATUM_IMAGES
+  [ "$class" = general-purpose ] && images=$DATUM_GP_IMAGES
   local image; image=$(opt IMAGE '')
-  [ -n "$image" ] || image=$(awk -v h="$harness" '$1 == h {print $2}' "$DATUM_IMAGES" 2>/dev/null)
-  [ -n "$image" ] || die "no image for harness '$harness' in $DATUM_IMAGES (yolo build $harness)"
+  [ -n "$image" ] || image=$(awk -v h="$harness" '$1 == h {print $2}' "$images" 2>/dev/null)
+  [ -n "$image" ] || die "no $class image for harness '$harness' in $images (yolo build $harness --backend datum --class $class)"
   local dir; dir=$(session_create "$name" datum "$harness")
+  echo "$class" > "$dir/class"
 
   (
     umask 077
@@ -98,7 +110,7 @@ backend_new() {
     done
   fi
   local caps=''
-  if [ "$DATUM_CLASS" = general-purpose ]; then
+  if [ "$class" = general-purpose ]; then
     caps='              securityContext:
                 capabilities:
                   add: [SYS_ADMIN, MKNOD, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT]'
@@ -123,7 +135,7 @@ spec:
   template:
     spec:
       runtime:
-        class: $DATUM_CLASS
+        class: $class
         resources:
           instanceType: $DATUM_INSTANCE_TYPE
         sandbox:

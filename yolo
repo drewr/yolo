@@ -9,8 +9,9 @@
 #   yolo ls                           list sessions
 #   yolo logs NAME [args...]          session logs
 #   yolo rm NAME                      save workspaces, then delete the session
-#   yolo build HARNESS... [--backend docker|datum]
-#                                     build images (datum: on the EC2 build box)
+#   yolo build HARNESS... [--backend docker|datum] [--class CLASS]
+#                                     build images (datum: on the EC2 build box,
+#                                     for --class unikernel or general-purpose)
 #
 # The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
 # remembers its own. Backend options: see backends/docker.sh and
@@ -78,11 +79,12 @@ cmd_rm() {
 
 cmd_ls() {
   local d n b used=''
-  printf '%-20s %-8s %s\n' SESSION BACKEND HARNESS
+  printf '%-20s %-8s %-9s %s\n' SESSION BACKEND HARNESS CLASS
   for d in "$YOLO_STATE"/*/; do
     [ -d "$d" ] || continue
     n=$(basename "$d"); b=$(cat "$d/backend" 2>/dev/null || echo '?')
-    printf '%-20s %-8s %s\n' "$n" "$b" "$(cat "$d/harness" 2>/dev/null || echo '?')"
+    printf '%-20s %-8s %-9s %s\n' "$n" "$b" "$(cat "$d/harness" 2>/dev/null || echo '?')" \
+      "$(cat "$d/class" 2>/dev/null || echo -)"
     case " $used " in *" $b "*) ;; *) used+=" $b" ;; esac
   done
   for b in $used; do
@@ -94,17 +96,19 @@ cmd_ls() {
 
 cmd_build() {
   local backend; backend=$(opt BACKEND docker)
-  local harnesses=() h
+  local harnesses=() h class=()
   while [ $# -gt 0 ]; do
     case $1 in
       --backend) backend=$2; shift 2 ;;
+      --class) class=(--class "$2"); shift 2 ;;
       *) check_harness "$1"; harnesses+=("$1"); shift ;;
     esac
   done
   [ ${#harnesses[@]} -gt 0 ] || die "usage: yolo build HARNESS... [--backend docker|datum]"
   case $backend in
-    datum) exec "$YOLO_ROOT/image/build-image" "${harnesses[@]}" ;;
-    docker) load_backend docker; for h in "${harnesses[@]}"; do docker_build "$h"; done ;;
+    datum) exec "$YOLO_ROOT/image/build-image" "${class[@]}" "${harnesses[@]}" ;;
+    docker) [ ${#class[@]} -eq 0 ] || die "--class is for the datum backend"
+            load_backend docker; for h in "${harnesses[@]}"; do docker_build "$h"; done ;;
     *) die "unknown backend '$backend'" ;;
   esac
 }

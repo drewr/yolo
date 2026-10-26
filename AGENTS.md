@@ -43,8 +43,10 @@ nix run nixpkgs#shellcheck -- -x yolo lib/*.sh backends/*.sh \
 
 Image changes must evaluate for both systems (`nix eval --raw ./image#packages.x86_64-linux.claude.drvPath`, and `aarch64-linux`). Datum
 images are built on the EC2 build box, never locally. Rebuild every harness
-image after changing anything in `image/`, and commit the new digests in
-`image/images` together with the change.
+image for both classes after changing anything in `image/`
+(`yolo build HARNESS... --backend datum`, then again with
+`--class general-purpose`), and commit the new digests in `image/images` and
+`image/images-general-purpose` together with the change.
 
 ## Claude settings (docker backend)
 

@@ -1,0 +1,6 @@
+# One pinned image per harness for the general-purpose class (yolo build HARNESS --backend datum --class general-purpose).
+claude    ghcr.io/drewr/agent-claude@sha256:58ac18b0d45e5ff784e50273f872a66b14430b38f57aea8d0718ad5e7322a4ca
+pi        ghcr.io/drewr/agent-pi@sha256:40219ee11891c618656a366c4089b6ea980922a7036867860784116ade77f309
+opencode  ghcr.io/drewr/agent-opencode@sha256:d60bbcb2d0f45a4dbeed0e195f51e9ff3ff33438ace9202b4ca452fd56430bdb
+codex     ghcr.io/drewr/agent-codex@sha256:10acb60d55e50b265865dcb0a0b7992ed2a9bd1f2ebd1c2fce4be6951de9fedb
+gemini    ghcr.io/drewr/agent-gemini@sha256:e9de46aee61b8c2749f5203702ad5448281fdeb95040f232a6ad23292de016a9

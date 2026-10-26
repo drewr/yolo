@@ -1,6 +1,6 @@
 # The datum backend
 
-`yolo new NAME --backend datum` spawns an agent session on Datum Compute's `unikernel` class and
+`yolo new NAME --backend datum` spawns an agent session on Datum Compute (`unikernel` class by default) and
 connects to it by SSH over iroh. Each session runs **one** harness from the
 dotfiles, in its own image: `claude` (default), `gemini`, `codex`, `opencode`
 or `pi`. There is no inbound port, no Connect
@@ -19,9 +19,17 @@ yolo rm work
   `--key FILE.pub`. If the private key sits next to `FILE.pub`, it is also used
   as the identity.
 - **Providers:** see "Model providers" below.
-- **Images:** one per harness, pinned by digest in `image/images`. Rebuild with
-  `yolo build --backend datum HARNESS...` (the EC2 build box must be running); it
-  updates `image/images`.
+- **Runtime class:** `--class unikernel` (default, or `$YOLO_CLASS`) or
+  `--class general-purpose`. The session remembers it (`yolo ls`, CLASS).
+  general-purpose runs a standard Linux container with the capabilities the
+  shared home's FUSE mount needs; everything else is the same. Its container is
+  capped at 2 GiB of memory on `d1-standard-2` even though the VM has 4 GB,
+  and exceeding the cap silently restarts the container.
+- **Images:** one per harness and class, pinned by digest: unikernel images in
+  `image/images`, general-purpose (standard `linux/amd64`) images in
+  `image/images-general-purpose`. Rebuild with
+  `yolo build --backend datum [--class general-purpose] HARNESS...` (the EC2
+  build box must be running); it updates the matching file.
 - **Needs locally:** `datumctl` (logged in), `ssh` with a working
   `SSH_AUTH_SOCK` (on this host: `export SSH_AUTH_SOCK=~/.ssh/ssh_auth_sock`),
   `ssh-keygen`, `openssl`, `jq`, `xxd`, `base32`, and `dumbpipe` (falls back to
