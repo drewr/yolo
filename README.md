@@ -90,8 +90,10 @@ nix flake update dotfiles --flake image   # follow newer dotfiles, then build
   nix profile install github:drewr/yolo   # or: nix build && ./result/bin/yolo
   ```
 
-  The compiled yolo reads the pins and Dockerfile from the source it was built
-  from. `YOLO_ROOT=<checkout>` points it at a checkout instead; `yolo build
+  `yolo version` says which build you're running: the commit and date it was
+  compiled from (`-dirty` if from uncommitted changes), or for `./yolo` the
+  checkout's commit. The compiled yolo reads the pins and Dockerfile from the
+  source it was built from. `YOLO_ROOT=<checkout>` points it at a checkout instead; `yolo build
   --backend datum` and `yolo sync-pins` need one, since they rewrite `image/`.
 - **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).
 - **datum backend:** `datumctl` signed in to Datum (production), `ssh`,

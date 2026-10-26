@@ -42,7 +42,7 @@ import Numeric (readHex, showHex)
 import qualified Data.Text as T
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
-import Language.Haskell.TH.Syntax (lift, loc_filename, location)
+import Language.Haskell.TH.Syntax (lift, loc_filename, location, runIO)
 import qualified Network.Socket as N
 import System.Directory
 import System.Environment (getArgs, lookupEnv, setEnv)
@@ -75,6 +75,7 @@ usage =
     , "                                    build images (datum: on the EC2 build box,"
     , "                                    for --class unikernel or general-purpose)"
     , "  yolo sync-pins                    pin image/flake.lock to the dotfiles' revisions"
+    , "  yolo version                      which yolo this is (compiled build, or the checkout's commit)"
     , "  yolo infra buildbox|meta CMD      the EC2 build box and the shared home's metadata host:"
     , "                                    launch [REV] | ticket | ipv6 | start | stop | status | terminate,"
     , "                                    and for the build box, tunnel [PORT]"
@@ -94,7 +95,7 @@ main = do
   root <- yoloRoot
   args <- getArgs
   let isHelp = (`elem` ["help", "-h", "--help"])
-  unless (maybe True isHelp (listToMaybe args)) migrateAgentSandboxState
+  unless (maybe True (\a -> isHelp a || a `elem` ["version", "--version", "-V"]) (listToMaybe args)) migrateAgentSandboxState
   case args of
     "new" : rest -> cmdNew root rest
     "attach" : rest -> cmdAttach root rest
@@ -106,8 +107,25 @@ main = do
     "build" : rest -> cmdBuild root rest
     ["sync-pins"] -> syncPins root
     "infra" : rest -> cmdInfra root rest
-    [h] | isHelp h -> putStr usage
+    [v] | v `elem` ["version", "--version", "-V"] -> versionLine root >>= putStrLn
+    [h] | isHelp h -> putStr usage >> versionLine root >>= putStrLn . ("\nVersion: " ++)
     _ -> hPutStr stderr usage >> exitWith (ExitFailure 2)
+
+-- The commit and commit date the flake built this yolo from (set by its
+-- build); empty when it runs as a script.
+buildRev, buildDate :: String
+buildRev = $(runIO (fromMaybe "" <$> lookupEnv "YOLO_BUILD_REV") >>= lift)
+buildDate = $(runIO (fromMaybe "" <$> lookupEnv "YOLO_BUILD_DATE") >>= lift)
+
+-- "yolo REV (DATE, compiled)", or for the script the checkout's commit
+-- ("-dirty" with uncommitted changes) and where it runs from.
+versionLine :: FilePath -> IO String
+versionLine root
+  | not (null buildRev) = pure ("yolo " ++ buildRev ++ " (" ++ buildDate ++ ", compiled)")
+  | otherwise = do
+      (code, out, _) <- readProcessWithExitCode "git" ["-C", root, "describe", "--always", "--dirty", "--abbrev=7", "--match=^"] "" `orElse` (ExitFailure 1, "", "")
+      let rev = if code == ExitSuccess then trim out ++ " " else ""
+      pure ("yolo " ++ rev ++ "(script, " ++ root ++ ")")
 
 -- The repository: $YOLO_ROOT (the compiled yolo's wrapper defaults it to
 -- the flake's source), else this script's directory, through any symlinks.

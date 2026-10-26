@@ -32,6 +32,12 @@
         fileset = ./yolo;
       };
       nativeBuildInputs = [ ghc pkgs.makeWrapper ];
+      # Compiled into `yolo version`: the commit (-dirty for uncommitted
+      # changes) and its date.
+      YOLO_BUILD_REV = self.shortRev or self.dirtyShortRev or "unknown";
+      YOLO_BUILD_DATE = let d = self.lastModifiedDate or ""; in
+        if d == "" then "unknown"
+        else "${builtins.substring 0 4 d}-${builtins.substring 4 2 d}-${builtins.substring 6 2 d}";
       buildPhase = ''
         runHook preBuild
         ghc -O -threaded -rtsopts -x hs yolo -outputdir build -o yolo-bin
