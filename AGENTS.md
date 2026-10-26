@@ -1,7 +1,7 @@
 # Agent Instructions
 
 yolo runs coding agents in named, isolated sessions on two backends: local
-containers (docker or podman) and Datum Compute. See README.md for usage.
+containers (podman, colima or docker) and Datum Compute. See README.md for usage.
 
 ## Commit Conventions
 

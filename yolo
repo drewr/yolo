@@ -12,7 +12,7 @@
 -- tickets). Only `yolo new` needs --backend; later commands read it there.
 --
 -- Not in nixpkgs, or deliberately the host's, so taken from PATH: datumctl
--- (datum backend and builds), docker or podman (docker backend), ssh,
+-- (datum backend and builds), podman, colima or docker (docker backend), ssh,
 -- ssh-keygen, ssh-add and nix.
 
 {-# LANGUAGE LambdaCase #-}
@@ -47,7 +47,7 @@ import qualified Network.Socket as N
 import System.Directory
 import System.Environment (getArgs, lookupEnv, setEnv)
 import System.Exit (ExitCode (..), exitFailure, exitWith)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, takeFileName, (</>))
 import System.IO
 import System.Info (os)
 import System.Posix.Files (fileExist, getFileStatus, isSocket, setFileCreationMask, setFileMode)
@@ -793,7 +793,7 @@ authorizedKeys mfile = do
       else Left "no public key to authorize: load one into ssh-agent (is it responding?) or pass --key FILE"
 
 ----------------------------------------------------------------------------
--- The docker backend: long-lived local containers (docker or podman) running
+-- The docker backend: long-lived local containers (podman, colima or docker) running
 -- the same per-harness image as Datum, in local mode.
 --
 -- - Container yolo-NAME, image yolo/HARNESS:local (built on first use, or
@@ -805,36 +805,96 @@ authorizedKeys mfile = do
 -- - Git: GIT_NAME, GIT_EMAIL, GIT_SIGNING_KEY and GITHUB_TOKEN are passed in.
 -- - SSH agent: while you're attached, a socat relay in the session directory
 --   connects the container to your current $SSH_AUTH_SOCK
---   (YOLO_FORWARD_AGENT=0 turns it off). Podman on macOS can't share sockets
---   with the VM (VirtioFS), so there, or whenever SSH_PRIVATE_KEY_FILE (a key
+--   (YOLO_FORWARD_AGENT=0 turns it off). Podman and colima on macOS can't
+--   share sockets with the VM (VirtioFS), so there, or whenever SSH_PRIVATE_KEY_FILE (a key
 --   path) or SSH_PRIVATE_KEY (base64 key) is set, the key is mounted
 --   read-only instead and loaded into an agent inside the session. It must
 --   have no passphrase.
 -- - ~/.ssh/allowed_signers, if present, is copied in for git signature checks.
 
 data Docker = Docker
-  { rt :: String -- docker or podman
+  { rt :: String -- podman (maybe a store path) or docker
+  , dkVM :: Bool -- runs in a VM that can't share host sockets
   , dkHome :: FilePath
   , dkProvidersEnv :: FilePath
   , dkForwardAgent :: Bool
   , dkUser :: String
   }
 
+-- The runtime: $YOLO_RUNTIME (or $CONTAINER_RUNTIME), else the first of
+-- podman and colima (each from PATH, or else nixpkgs; colima through the
+-- docker CLI and its docker context) and docker that is up. Also whether it runs in a VM that
+-- can't share host sockets.
+containerRuntime :: IO (String, Bool)
+containerRuntime = do
+  explicit <- firstEnv ["YOLO_RUNTIME", "CONTAINER_RUNTIME"]
+  case explicit of
+    Just r -> pure (r, os == "darwin" && takeFileName r == "podman")
+    Nothing -> do
+      found <- firstJustM [podmanRuntime, colimaRuntime, dockerRuntime]
+      maybe (die "docker: no podman, colima or docker found (podman and colima must be running)") pure found
+
+firstJustM :: [IO (Maybe a)] -> IO (Maybe a)
+firstJustM = \case
+  [] -> pure Nothing
+  a : as -> a >>= maybe (firstJustM as) (pure . Just)
+
+-- EXE from PATH, else from nixpkgs#PKG when nix is there to build it.
+findOrNix :: String -> String -> IO (Maybe FilePath)
+findOrNix pkg exe = do
+  onPath <- findExecutable exe
+  maybe (nixBin pkg exe) (const (pure (Just exe))) onPath
+
+nixBin :: String -> String -> IO (Maybe FilePath)
+nixBin pkg exe = do
+  hasNix <- findExecutable "nix"
+  case hasNix of
+    Nothing -> pure Nothing
+    Just _ -> do
+      hPutStrLn stderr ("yolo: no " ++ exe ++ " in PATH; trying nixpkgs#" ++ pkg)
+      r <- try (readProcessWithExitCode "nix" ["--extra-experimental-features", "nix-command flakes", "build", "--no-link", "--print-out-paths", "nixpkgs#" ++ pkg] "")
+      case r of
+        Right (ExitSuccess, out, _) -> listToMaybe <$> filterM doesFileExist [o </> "bin" </> exe | o <- lines out]
+        Right _ -> pure Nothing
+        Left e -> const (pure Nothing) (e :: IOException)
+
+podmanRuntime :: IO (Maybe (String, Bool))
+podmanRuntime = do
+  podman <- findOrNix "podman" "podman"
+  case podman of
+    Nothing -> pure Nothing
+    Just p -> do
+      up <- quiet p ["info"]
+      pure (if up == ExitSuccess then Just (p, os == "darwin") else Nothing)
+
+-- Colima runs the docker daemon in a VM; the docker CLI reaches it through
+-- its docker context.
+colimaRuntime :: IO (Maybe (String, Bool))
+colimaRuntime = do
+  colima <- findOrNix "colima" "colima"
+  case colima of
+    Nothing -> pure Nothing
+    Just c -> do
+      up <- quiet c ["status"]
+      if up /= ExitSuccess
+        then pure Nothing
+        else do
+          docker <- findOrNix "docker-client" "docker"
+          forM docker $ \d -> setEnv "DOCKER_CONTEXT" "colima" >> pure (d, os == "darwin")
+
+dockerRuntime :: IO (Maybe (String, Bool))
+dockerRuntime = fmap (const ("docker", False)) <$> findExecutable "docker"
+
 dockerConfig :: IO Docker
 dockerConfig = do
-  explicit <- firstEnv ["YOLO_RUNTIME", "CONTAINER_RUNTIME"]
-  runtime <- case explicit of
-    Just r -> pure r
-    Nothing -> do
-      found <- filterM (fmap isJust . findExecutable) ["docker", "podman"]
-      maybe (die "docker: neither docker nor podman found in PATH") pure (listToMaybe found)
+  (runtime, vm) <- containerRuntime
   home <- getHomeDirectory
   dataHome <- fromMaybe (home </> ".local/share") <$> envNonEmpty "XDG_DATA_HOME"
   configHome <- fromMaybe (home </> ".config") <$> envNonEmpty "XDG_CONFIG_HOME"
   let homeDefault
         | os == "darwin" = home </> "Library/Application Support/yolo/home"
         | otherwise = dataHome </> "yolo/home"
-  Docker runtime
+  Docker runtime vm
     <$> opt "DOCKER_HOME" homeDefault
     <*> opt "PROVIDERS_ENV" (configHome </> "yolo/providers.env")
     <*> ((== "1") <$> opt "FORWARD_AGENT" "1")
@@ -843,10 +903,10 @@ dockerConfig = do
 dockerImage :: String -> String
 dockerImage h = "yolo/" ++ h ++ ":local"
 
--- Podman machine on macOS shares host files over VirtioFS, which can't carry
--- Unix sockets, so the agent relay can't reach the container.
+-- Podman machine and colima on macOS share host files over VirtioFS, which
+-- can't carry Unix sockets, so the agent relay can't reach the container.
 noSocketRelay :: Docker -> Bool
-noSocketRelay d = rt d == "podman" && os == "darwin"
+noSocketRelay = dkVM
 
 -- yolo/HARNESS:local from image/, with the same Dockerfile Datum uses.
 dockerBuild :: FilePath -> Docker -> String -> IO ()
@@ -909,7 +969,7 @@ dockerNew root d name harness opts0 = do
       pure ["-v", real ++ ":/run/yolo-key/id:ro"]
     _ -> do
       when (noSocketRelay d) $
-        hPutStrLn stderr ("yolo: " ++ rt d ++ " on macOS can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session")
+        hPutStrLn stderr ("yolo: " ++ takeFileName (rt d) ++ " (a VM on macOS) can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session")
       pure []
   unless (null keyMount) $ writeFile (dir </> "ssh_key_mode") ""
   -- Copied rather than bind-mounted: it is often a symlink into /nix/store,
