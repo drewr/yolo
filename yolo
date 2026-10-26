@@ -40,6 +40,7 @@ import Data.List (dropWhileEnd, uncons, isInfixOf, isPrefixOf, isSuffixOf, nub, 
 import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
 import qualified Data.Text as T
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Language.Haskell.TH.Syntax (lift, loc_filename, location)
 import qualified Network.Socket as N
 import System.Directory
@@ -66,7 +67,7 @@ usage =
     , "  yolo new NAME [--backend docker|datum] [--agent HARNESS] [backend options]"
     , "                                    create a session and wait until it's ready"
     , "  yolo attach NAME [args...]        shell as drewr, or run a command (alias: ssh)"
-    , "  yolo ls                           list sessions"
+    , "  yolo ls [--full]                  list sessions (--full: whole image references)"
     , "  yolo logs NAME [args...]          session logs"
     , "  yolo rm NAME                      save workspaces, then delete the session"
     , "  yolo build HARNESS... [--backend docker|datum] [--class CLASS]"
@@ -94,7 +95,8 @@ main = do
     "new" : rest -> cmdNew root rest
     "attach" : rest -> cmdAttach root rest
     "ssh" : rest -> cmdAttach root rest
-    ["ls"] -> cmdLs root
+    ["ls"] -> cmdLs root False
+    ["ls", "--full"] -> cmdLs root True
     "logs" : rest -> cmdLogs root rest
     ["rm", name] -> cmdRm root name
     "build" : rest -> cmdBuild root rest
@@ -139,8 +141,8 @@ cmdLogs root = \case
 cmdRm :: FilePath -> String -> IO ()
 cmdRm root name = sessionBackend name >>= loadBackend root >>= \b -> bRm b name
 
-cmdLs :: FilePath -> IO ()
-cmdLs root = do
+cmdLs :: FilePath -> Bool -> IO ()
+cmdLs root full = do
   st <- yoloState
   names <- sort <$> (listDirectory st `orElse` [])
   dirs <- filterM (doesDirectoryExist . (st </>)) names
@@ -155,7 +157,7 @@ cmdLs root = do
     putStrLn ""
     putStrLn ("== " ++ b)
     hFlush stdout
-    loadBackend root b >>= bLs
+    loadBackend root b >>= \be -> bLs be full
 
 cmdBuild :: FilePath -> [String] -> IO ()
 cmdBuild root args0 = do
@@ -184,7 +186,7 @@ cmdBuild root args0 = do
 data Backend = Backend
   { bNew :: String -> String -> [String] -> IO () -- NAME HARNESS options
   , bAttach :: String -> [String] -> IO () -- shell, or run a command
-  , bLs :: IO ()
+  , bLs :: Bool -> IO () -- full image references?
   , bLogs :: String -> [String] -> IO ()
   , bRm :: String -> IO () -- save workspaces, then delete
   }
@@ -321,13 +323,72 @@ datumBackend root = do
       , bAttach = \name args -> do
           (ssh, sshArgs) <- datumSsh d name args
           executeFile ssh True sshArgs Nothing
-      , bLs = do
-          (_, out, _) <- readProcessWithExitCode "datumctl" ["compute", "workloads"] ""
-          let ls = lines out
-          mapM_ putStrLn (take 1 ls ++ filter ("agent-" `isPrefixOf`) (drop 1 ls))
+      , bLs = datumLs
       , bLogs = \name args -> rawSystem "datumctl" (["compute", "logs", "agent-" ++ name] ++ args) >>= exitWith
       , bRm = datumRm d
       }
+
+-- The agent workloads, one row each. Placements and locations stay: sessions
+-- may run in other locations. Image references are shortened to
+-- repo@digest-prefix unless `full`.
+datumLs :: Bool -> IO ()
+datumLs full = do
+  (code, out, err) <- readProcessWithExitCode "datumctl" ["get", "workloads", "-o", "json"] ""
+  unless (code == ExitSuccess) $ die ("datumctl get workloads: " ++ trim err)
+  now <- getCurrentTime
+  let items = case A.decodeStrict (BC.pack out) of
+        Just v -> [i | A.Array is <- [at ["items"] v], i <- foldr (:) [] is]
+        Nothing -> []
+      str path v = case at path v of A.String t -> T.unpack t; _ -> ""
+      num path v = case at path v of A.Number n -> show (round n :: Int); _ -> "0"
+      list path v = case at path v of A.Array xs -> foldr (:) [] xs; _ -> []
+      row w =
+        let placements = list ["spec", "placements"] w
+            available = [str ["status"] c | c <- list ["status", "conditions"] w, str ["type"] c == "Available"]
+            img = maybe "" (str ["image"]) (listToMaybe (list ["spec", "template", "spec", "runtime", "sandbox", "containers"] w))
+         in [ drop (length "agent-") (str ["metadata", "name"] w)
+            , if available == ["True"] then "Available" else "Unavailable"
+            , num ["status", "readyReplicas"] w ++ "/" ++ num ["status", "replicas"] w
+            , intercalateC (nub [str ["name"] l | p <- placements, l <- list ["locations"] p])
+            , intercalateC [str ["name"] p | p <- placements]
+            , (if full then id else shortImage) img
+            , maybe "?" (age now) (iso8601ParseM (str ["metadata", "creationTimestamp"] w))
+            ]
+      rows = [row w | w <- items, "agent-" `isPrefixOf` str ["metadata", "name"] w]
+  table (["SESSION", "HEALTH", "READY", "LOCATIONS", "PLACEMENTS", "IMAGE", "AGE"] : rows)
+  where
+    intercalateC xs = if null xs then "-" else foldr1 (\a b -> a ++ "," ++ b) xs
+
+-- ghcr.io/drewr/agent-claude@sha256:a415dd44... -> agent-claude@a415dd44231b
+shortImage :: String -> String
+shortImage ref =
+  let (name, digest) = break (== '@') ref
+      base = reverse (takeWhile (/= '/') (reverse name))
+   in case digest of
+        '@' : d -> base ++ "@" ++ take 12 (drop 1 (dropWhile (/= ':') d))
+        _ -> base
+
+-- kubectl-style age: 45s, 12m, 3h, 2d.
+age :: UTCTime -> UTCTime -> String
+age now t =
+  let s = floor (diffUTCTime now t) :: Int
+   in if s < 120 then show s ++ "s" else if s < 7200 then show (s `div` 60) ++ "m" else if s < 172800 then show (s `div` 3600) ++ "h" else show (s `div` 86400) ++ "d"
+
+-- A JSON value at a path of object keys (Null when missing).
+at :: [String] -> A.Value -> A.Value
+at [] v = v
+at (k : ks) (A.Object o) = maybe A.Null (at ks) (KM.lookup (K.fromString k) o)
+at _ _ = A.Null
+
+-- Left-aligned columns, three spaces apart.
+table :: [[String]] -> IO ()
+table rows =
+  let widths = map (maximum . map length) (transpose' rows)
+      line r = trimEnd (concat (zipWith (\w c -> c ++ replicate (w - length c + 3) ' ') widths r))
+      trimEnd = dropWhileEnd (== ' ')
+      transpose' xs = if any null xs || null xs then [] else map head' xs : transpose' (map (drop 1) xs)
+      head' = fromMaybe "" . listToMaybe
+   in mapM_ (putStrLn . line) rows
 
 datumNew :: Datum -> String -> String -> [String] -> IO ()
 datumNew d name harness opts0 = do
@@ -663,7 +724,7 @@ dockerBackend root = do
     Backend
       { bNew = dockerNew root d
       , bAttach = dockerAttach d
-      , bLs = () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
+      , bLs = \_ -> () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
       , bLogs = \name args -> rawSystem (rt d) (["logs"] ++ args ++ ["yolo-" ++ name]) >>= exitWith
       , bRm = \name -> do
           dir <- sessionDir name
