@@ -15,6 +15,12 @@ yolo rm work
 `yolo help` lists every command. After `yolo new`, each session remembers its
 backend, so the other commands just take the name.
 
+Datum sessions follow you between machines: Datum is the source of truth, and
+local state is a cache. `yolo ls` sets up every Datum session that has none
+here and drops local sessions whose workload is gone; `attach`, `logs` and
+`rm` set up a session they don't know yet the same way. You still need a key
+the session authorizes.
+
 ## Backends
 
 | | docker | datum |

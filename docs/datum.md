@@ -15,6 +15,12 @@ yolo ls
 yolo rm work
 ```
 
+- **Other machines:** a session's ticket and host key are derived from its
+  Secret `agent-NAME`, so any machine can rebuild the local state (the host's
+  private key is only used to derive the key to pin, not kept). `yolo ls`
+  syncs: it sets up every Datum session missing here and removes local ones
+  whose workload is gone, but only sessions of the current Datum login
+  (recorded in `datum_session`), and nothing at all if Datum can't be read.
 - **Keys:** `new` authorizes the keys in your ssh-agent, or `~/.ssh/id_*.pub`, or
   `--key FILE.pub`. If the private key sits next to `FILE.pub`, it is also used
   as the identity.

@@ -156,6 +156,10 @@ cmdRm root name = sessionBackend name >>= loadBackend root >>= \b -> bRm b name
 
 cmdLs :: FilePath -> Bool -> IO ()
 cmdLs root full = do
+  -- Datum is the source of truth for datum sessions: bring the local state
+  -- in line with it first, wherever each session was made.
+  hasDatumctl <- isJust <$> findExecutable "datumctl"
+  datumItems <- if hasDatumctl then useDatumSession >> datumSync else pure Nothing
   st <- yoloState
   names <- sort <$> (listDirectory st `orElse` [])
   dirs <- filterM (doesDirectoryExist . (st </>)) names
@@ -166,11 +170,14 @@ cmdLs root full = do
     c <- readMeta (st </> n </> "class") "-"
     printf "%-20s %-8s %-9s %s\n" n b h c :: IO ()
     pure b
-  forM_ (filter (/= "?") (nub backends)) $ \b -> do
+  forM_ (filter (`notElem` ["?", "datum"]) (nub backends)) $ \b -> do
     putStrLn ""
     putStrLn ("== " ++ b)
     hFlush stdout
     loadBackend root b >>= \be -> bLs be full
+  when ("datum" `elem` backends && not hasDatumctl) $
+    hPutStrLn stderr "yolo: datumctl isn't in PATH, so the datum sessions can't be checked"
+  mapM_ (datumTable full) datumItems
 
 cmdBuild :: FilePath -> [String] -> IO ()
 cmdBuild root args0 = do
@@ -242,8 +249,20 @@ sessionBackend :: String -> IO String
 sessionBackend name = do
   dir <- sessionDir name
   e <- doesFileExist (dir </> "backend")
-  unless e $ die ("no session " ++ name ++ " (yolo ls)")
-  readMeta (dir </> "backend") "?"
+  if e
+    then readMeta (dir </> "backend") "?"
+    else do
+      -- Not made here: maybe a datum session from another machine.
+      adopted <- adoptDatum True name
+      unless adopted $ die ("no session " ++ name ++ " (yolo ls)")
+      pure "datum"
+
+-- Sessions of one backend that have local state.
+localSessions :: String -> IO [String]
+localSessions backend = do
+  st <- yoloState
+  names <- sort <$> (listDirectory st `orElse` [])
+  filterM (\n -> (== backend) <$> readMeta (st </> n </> "backend") "") names
 
 -- The session's directory, mode 700, with its backend and harness recorded.
 sessionCreate :: String -> String -> String -> IO FilePath
@@ -311,10 +330,7 @@ data Datum = Datum
 
 datumBackend :: FilePath -> IO Backend
 datumBackend root = do
-  -- Datum production (api.datum.net), project drewr-y4nd1b; an explicit
-  -- session wins.
-  s <- firstEnv ["YOLO_DATUM_SESSION", "AGENT_SANDBOX_DATUM_SESSION", "DATUM_SESSION"]
-  setEnv "DATUM_SESSION" (fromMaybe "aaraines@gmail.com@api.datum.net" s)
+  useDatumSession
   d <-
     Datum
       <$> opt "IMAGES" (root </> "image/images")
@@ -326,7 +342,7 @@ datumBackend root = do
       <*> opt "NETWORK" "default"
       <*> opt "INSTANCE_TYPE" "datumcloud/d1-standard-2"
       <*> opt "CLASS" "unikernel"
-      <*> opt "RELAY" "https://use1-1.relay.n0.iroh.link./"
+      <*> opt "RELAY" defaultRelay
       <*> opt "HOME_SECRET" "agent-home"
       <*> opt "PROVIDERS_SECRET" "agent-providers"
       <*> opt "JFS_OPTS" ""
@@ -336,41 +352,75 @@ datumBackend root = do
       , bAttach = \name args -> do
           (ssh, sshArgs) <- datumSsh d name args
           executeFile ssh True sshArgs Nothing
-      , bLs = datumLs
+      , bLs = \full -> datumSync >>= mapM_ (datumTable full)
       , bLogs = \name args -> rawSystem "datumctl" (["compute", "logs", "agent-" ++ name] ++ args) >>= exitWith
       , bRm = datumRm d
       }
 
--- The agent workloads, one row each. Placements and locations stay: sessions
--- may run in other locations. Image references are shortened to
+-- The agent workloads on Datum, after making the local state match them:
+-- sessions made elsewhere are set up here, and local sessions whose
+-- workload is gone are removed (only those of the current Datum login, so
+-- another login's sessions survive a switch). Nothing changes when Datum
+-- can't be read.
+datumSync :: IO (Maybe [A.Value])
+datumSync = do
+  r <- try (readProcessWithExitCode "datumctl" ["get", "workloads", "-o", "json"] "")
+  case r of
+    Right (ExitSuccess, out, _) | Just v <- A.decodeStrict (BC.pack out) -> do
+      let items = [w | A.Array is <- [at ["items"] v], w <- foldr (:) [] is, "agent-" `isPrefixOf` jstr ["metadata", "name"] w]
+          remote = [drop (length "agent-") (jstr ["metadata", "name"] w) | w <- items]
+      st <- yoloState
+      local <- localSessions "datum"
+      forM_ (filter (`notElem` local) remote) $ \n -> do
+        taken <- doesPathExist (st </> n)
+        if taken
+          then hPutStrLn stderr ("yolo: Datum session " ++ n ++ " isn't set up here: a local " ++ n ++ " of another backend has the name")
+          else
+            try (adoptDatum False n) >>= \case
+              Left e -> hPutStrLn stderr ("yolo: couldn't set up " ++ n ++ " from Datum: " ++ show (e :: SomeException))
+              Right _ -> pure ()
+      current <- fromMaybe "" <$> lookupEnv "DATUM_SESSION"
+      forM_ (filter (`notElem` remote) local) $ \n -> do
+        owner <- readMeta (st </> n </> "datum_session") current
+        when (owner == current) $ do
+          removePathForcibly (st </> n)
+          hPutStrLn stderr ("yolo: removed " ++ n ++ ": its workload is gone from Datum")
+      pure (Just items)
+    Right (_, _, err) -> warn (trim err)
+    Left e -> warn (show (e :: IOException))
+  where
+    warn msg = Nothing <$ hPutStrLn stderr ("yolo: can't list Datum sessions, so they weren't synced: " ++ msg)
+
+-- One row per agent workload. Placements and locations stay: sessions may
+-- run in other locations. Image references are shortened to
 -- repo@digest-prefix unless `full`.
-datumLs :: Bool -> IO ()
-datumLs full = do
-  (code, out, err) <- readProcessWithExitCode "datumctl" ["get", "workloads", "-o", "json"] ""
-  unless (code == ExitSuccess) $ die ("datumctl get workloads: " ++ trim err)
+datumTable :: Bool -> [A.Value] -> IO ()
+datumTable full items = do
   now <- getCurrentTime
-  let items = case A.decodeStrict (BC.pack out) of
-        Just v -> [i | A.Array is <- [at ["items"] v], i <- foldr (:) [] is]
-        Nothing -> []
-      str path v = case at path v of A.String t -> T.unpack t; _ -> ""
-      num path v = case at path v of A.Number n -> show (round n :: Int); _ -> "0"
+  let num path v = case at path v of A.Number n -> show (round n :: Int); _ -> "0"
       list path v = case at path v of A.Array xs -> foldr (:) [] xs; _ -> []
       row w =
         let placements = list ["spec", "placements"] w
-            available = [str ["status"] c | c <- list ["status", "conditions"] w, str ["type"] c == "Available"]
-            img = maybe "" (str ["image"]) (listToMaybe (list ["spec", "template", "spec", "runtime", "sandbox", "containers"] w))
-         in [ drop (length "agent-") (str ["metadata", "name"] w)
+            available = [jstr ["status"] c | c <- list ["status", "conditions"] w, jstr ["type"] c == "Available"]
+            img = maybe "" (jstr ["image"]) (listToMaybe (list ["spec", "template", "spec", "runtime", "sandbox", "containers"] w))
+         in [ drop (length "agent-") (jstr ["metadata", "name"] w)
             , if available == ["True"] then "Available" else "Unavailable"
             , num ["status", "readyReplicas"] w ++ "/" ++ num ["status", "replicas"] w
-            , intercalateC (nub [str ["name"] l | p <- placements, l <- list ["locations"] p])
-            , intercalateC [str ["name"] p | p <- placements]
+            , commas (nub [jstr ["name"] l | p <- placements, l <- list ["locations"] p])
+            , commas [jstr ["name"] p | p <- placements]
             , (if full then id else shortImage) img
-            , maybe "?" (age now) (iso8601ParseM (str ["metadata", "creationTimestamp"] w))
+            , maybe "?" (age now) (iso8601ParseM (jstr ["metadata", "creationTimestamp"] w))
             ]
-      rows = [row w | w <- items, "agent-" `isPrefixOf` str ["metadata", "name"] w]
-  table (["SESSION", "HEALTH", "READY", "LOCATIONS", "PLACEMENTS", "IMAGE", "AGE"] : rows)
+  unless (null items) $ do
+    putStrLn ""
+    putStrLn "== datum"
+    table (["SESSION", "HEALTH", "READY", "LOCATIONS", "PLACEMENTS", "IMAGE", "AGE"] : map row items)
   where
-    intercalateC xs = if null xs then "-" else foldr1 (\a b -> a ++ "," ++ b) xs
+    commas xs = if null xs then "-" else foldr1 (\a b -> a ++ "," ++ b) xs
+
+-- A string at a JSON path ("" when missing).
+jstr :: [String] -> A.Value -> String
+jstr path v = case at path v of A.String t -> T.unpack t; _ -> ""
 
 -- ghcr.io/drewr/agent-claude@sha256:a415dd44... -> agent-claude@a415dd44231b
 shortImage :: String -> String
@@ -403,6 +453,77 @@ table rows =
       head' = fromMaybe "" . listToMaybe
    in mapM_ (putStrLn . line) rows
 
+-- Datum production (api.datum.net), project drewr-y4nd1b; an explicit
+-- session wins.
+useDatumSession :: IO ()
+useDatumSession = do
+  s <- firstEnv ["YOLO_DATUM_SESSION", "AGENT_SANDBOX_DATUM_SESSION", "DATUM_SESSION"]
+  setEnv "DATUM_SESSION" (fromMaybe "aaraines@gmail.com@api.datum.net" s)
+
+-- The Datum login a session belongs to, so syncing under another login
+-- leaves it alone.
+recordDatumSession :: FilePath -> IO ()
+recordDatumSession dir = lookupEnv "DATUM_SESSION" >>= mapM_ (writeFile (dir </> "datum_session") . (++ "\n"))
+
+defaultRelay :: String
+defaultRelay = "https://use1-1.relay.n0.iroh.link./"
+
+-- Rebuild the local state of a datum session made on another machine, from
+-- its Datum Secret (iroh secret, host key, authorized keys) and Workload
+-- (harness, class). The host's private key is only used to derive the key
+-- to pin; it isn't kept. False if there's no such session on Datum.
+adoptDatum :: Bool -> String -> IO Bool
+adoptDatum checkKeys name = do
+  hasDatumctl <- isJust <$> findExecutable "datumctl"
+  if not hasDatumctl
+    then pure False
+    else do
+      useDatumSession
+      (wc, wout, _) <- readProcessWithExitCode "datumctl" ["get", "workload", "agent-" ++ name, "-o", "json"] ""
+      case (wc, A.decodeStrict (BC.pack wout)) of
+        (ExitSuccess, Just w) -> do
+          (sc, sout, serr) <- readProcessWithExitCode "datumctl" ["get", "secret", "agent-" ++ name, "-o", "json"] ""
+          secret <- case (sc, A.decodeStrict (BC.pack sout)) of
+            (ExitSuccess, Just v) -> pure v
+            _ -> die ("agent-" ++ name ++ " exists on Datum, but its Secret can't be read: " ++ trim serr)
+          let str path v = case at path v of A.String t -> T.unpack t; _ -> ""
+              -- Secret data is base64; the *_B64 values are base64 again.
+              field k = either (const Nothing) Just (B64.decode (BC.pack (str ["data", k] secret)))
+              twice k = field k >>= either (const Nothing) Just . B64.decode
+              harness = case str ["metadata", "labels", "agent-harness"] w of "" -> "?"; h -> h
+              cls = case str ["spec", "template", "spec", "runtime", "class"] w of "" -> "unikernel"; c -> c
+          (irohSecret, hostKey, authorized) <-
+            maybe (die ("the Secret agent-" ++ name ++ " is missing session keys")) pure $
+              (,,) <$> field "IROH_SECRET" <*> twice "SSH_HOST_KEY_B64" <*> twice "AUTHORIZED_KEYS_B64"
+          relay <- opt "RELAY" defaultRelay
+          dir <- sessionCreate name "datum" harness
+          writeFile (dir </> "class") (cls ++ "\n")
+          recordDatumSession dir
+          withUmask 0o077 $ do
+            let hex = trim (BC.unpack irohSecret)
+            writeFile (dir </> "iroh_secret") (hex ++ "\n")
+            endpointTicket relay hex >>= writeFile (dir </> "ticket") . (++ "\n")
+            B.writeFile (dir </> "authorized_keys") authorized
+            let tmp = dir </> "host_key.adopt"
+            B.writeFile tmp hostKey
+            (kc, pub, _) <- readProcessWithExitCode "ssh-keygen" ["-y", "-f", tmp] ""
+            removePathForcibly tmp
+            when (kc /= ExitSuccess) $ removePathForcibly dir >> die ("can't read the host key of agent-" ++ name)
+            writeFile (dir </> "known_hosts") (unwords (("agent-" ++ name) : take 2 (words pub)) ++ "\n")
+          hPutStrLn stderr ("yolo: set up " ++ name ++ " from Datum")
+          -- Logging in needs one of this machine's keys among the session's.
+          when checkKeys $ do
+           r <- timeout 10000000 (try (readProcessWithExitCode "ssh-add" ["-L"] ""))
+           let mine = case r of
+                 Just (Right (_, out, _)) -> [k | _ : k : _ <- map words (lines out)]
+                 Just (Left e) -> const [] (e :: IOException)
+                 Nothing -> []
+               theirs = [k | _ : k : _ <- map words (lines (BC.unpack authorized))]
+           when (not (null mine) && not (any (`elem` theirs) mine)) $
+             hPutStrLn stderr ("yolo: none of your agent's keys is authorized for " ++ name ++ "; logging in will fail")
+          pure True
+        _ -> pure False
+
 datumNew :: Datum -> String -> String -> [String] -> IO ()
 datumNew d name harness opts0 = do
   let go k h c = \case
@@ -434,6 +555,7 @@ datumNew d name harness opts0 = do
       image
   dir <- sessionCreate name "datum" harness
   writeFile (dir </> "class") (cls ++ "\n")
+  recordDatumSession dir
 
   -- Session keys, readable only by this user.
   keys <- withUmask 0o077 $ do
