@@ -163,7 +163,7 @@ cmdLs root full = do
   st <- yoloState
   names <- sort <$> (listDirectory st `orElse` [])
   dirs <- filterM (doesDirectoryExist . (st </>)) names
-  printf "%-20s %-8s %-9s %s\n" "SESSION" "BACKEND" "HARNESS" "CLASS" :: IO ()
+  printf "%-20s %-8s %-9s %s\n" "NAME" "BACKEND" "HARNESS" "CLASS" :: IO ()
   backends <- forM dirs $ \n -> do
     b <- readMeta (st </> n </> "backend") "?"
     h <- readMeta (st </> n </> "harness") "?"
@@ -414,7 +414,7 @@ datumTable full items = do
   unless (null items) $ do
     putStrLn ""
     putStrLn "== datum"
-    table (["SESSION", "HEALTH", "READY", "LOCATIONS", "PLACEMENTS", "IMAGE", "AGE"] : map row items)
+    table (["NAME", "HEALTH", "READY", "LOCATIONS", "PLACEMENTS", "IMAGE", "AGE"] : map row items)
   where
     commas xs = if null xs then "-" else foldr1 (\a b -> a ++ "," ++ b) xs
 
