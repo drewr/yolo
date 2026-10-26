@@ -67,17 +67,26 @@ nix flake update dotfiles --flake image   # follow newer dotfiles, then build
 | Path | What |
 | - | - |
 | `yolo` | the CLI, a Haskell script (sessions, both backends, image builds) |
+| `flake.nix` | the compiled `yolo` |
 | `image/` | image flake, Dockerfile, in-image scripts (init, `ws`, `agent-providers`), pinned Datum images |
-| `infra/provision` | launch and manage the EC2 boxes (Haskell) |
-| `infra/buildbox/ec2`, `infra/meta/ec2` | EC2 build box and JuiceFS metadata host (NixOS configs) |
+| `infra/buildbox/ec2`, `infra/meta/ec2` | EC2 build box and JuiceFS metadata host (NixOS configs; `yolo infra`) |
 | `docs/` | Datum details and the shared-home benchmarks |
 
 ## Requirements
 
-- **Nix**, with `nix-shell`: `yolo` and `infra/provision` are runghc scripts
-  whose shebang pulls GHC, their libraries, dumbpipe, socat and buildctl from a
-  pinned nixpkgs. The first run downloads them (about 30 s); each run after
-  that starts in about 3 s.
+- **Nix.** `yolo` is a runghc script whose shebang
+  pulls GHC, their libraries, dumbpipe, socat and buildctl from a pinned
+  nixpkgs: `./yolo` works from a checkout, but every command pays about 3 s of
+  startup (30 s the first time). For everyday use, run the compiled one from
+  the flake, which starts in milliseconds:
+
+  ```sh
+  nix profile install github:drewr/yolo   # or: nix build && ./result/bin/yolo
+  ```
+
+  The compiled yolo reads the pins and Dockerfile from the source it was built
+  from. `YOLO_ROOT=<checkout>` points it at a checkout instead; `yolo build
+  --backend datum` and `yolo sync-pins` need one, since they rewrite `image/`.
 - **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).
 - **datum backend:** `datumctl` signed in to Datum (production), `ssh`,
   `ssh-keygen` and `ssh-add`. Building Datum images needs the EC2 build box

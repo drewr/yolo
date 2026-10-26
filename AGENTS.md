@@ -20,7 +20,7 @@ Common types: `feat`, `fix`, `chore`, `docs`, `refactor`, `ci`
 ## Language: Haskell, run as Nix scripts
 
 Write new host-side tooling in Haskell, in the style of `yolo` and
-`infra/provision` (after drewr/birdhaus `run.hs`):
+its `flake.nix` (after drewr/birdhaus `run.hs`):
 
 - An executable file with a `nix-shell` shebang that runs it with `runghc`:
 
@@ -33,7 +33,11 @@ Write new host-side tooling in Haskell, in the style of `yolo` and
 
 - Pin nixpkgs with `-I` to the rev in `image/flake.lock`, so GHC and the
   libraries come from cache.nixos.org and don't change under you. Bump all
-  scripts' pins together.
+  scripts' pins together, along with `flake.nix`'s nixpkgs.
+- `flake.nix` compiles `yolo` (`nix build`): keep its Haskell package list and
+  tools the same as the shebang's. The binary finds the repository through
+  `YOLO_ROOT`, which its wrapper defaults to the flake's source; commands that
+  write to `image/` refuse to run against that read-only copy.
 - Tools from nixpkgs go in the shebang's `-p`. Tools that aren't in nixpkgs or
   must be the host's own (datumctl, docker/podman, ssh, aws, nix, git) come
   from PATH; say so in the header comment.
@@ -57,7 +61,9 @@ whole image lives in RAM.
   record (`bNew`, `bAttach`, `bLs`, `bLogs`, `bRm`) per backend. A new backend
   is a new `Backend` value plus its name in `loadBackend`. `yolo build` also
   holds the Datum image builds and `yolo sync-pins`.
-- `infra/provision BOX ...`: the EC2 build box and the JuiceFS metadata host.
+- `yolo infra BOX ...`: the EC2 build box and the JuiceFS metadata host;
+  `yolo build --backend datum` starts the build box when BuildKit doesn't
+  answer, and reads its ticket over SSM when none is saved.
 - `image/init.sh` is PID 1 in every image. `YOLO_MODE=datum` (the default)
   serves SSH over iroh and mounts the shared home; `YOLO_MODE=local` sets up
   the same user and environment and idles for `docker exec`.
@@ -71,6 +77,7 @@ whole image lives in RAM.
 
 There are no tests. Before committing:
 
+- `nix build` must succeed (it compiles `yolo` with `-O`).
 - Type-check each Haskell script with `-Wall`, using the shebang's packages,
   and fix every warning:
 

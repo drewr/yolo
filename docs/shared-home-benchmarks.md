@@ -124,7 +124,7 @@ an instance lost before upload loses those writes.
 
 ## Round 4 (2026-10-19): direct iroh path to the metadata host
 
-Gave the metadata host public IPv6 (`infra/provision meta ipv6`; VPC block
+Gave the metadata host public IPv6 (`yolo infra meta ipv6`; VPC block
 `2600:1f18:4a26:af00::/56`) and a fixed iroh port (UDP 7842, opened in the NixOS
 firewall). The security group still has **no inbound rule**: hole punching
 works through its stateful tracking. From a sandbox, the first connection

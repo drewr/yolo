@@ -21,14 +21,14 @@
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, SomeException, bracket, finally, try)
-import Control.Monad (filterM, forM, forM_, unless, when)
+import Control.Monad (filterM, forM, forM_, mfilter, unless, when)
 import Crypto.Error (throwCryptoErrorIO)
 import qualified Crypto.PubKey.Ed25519 as Ed
 import Crypto.Random (getRandomBytes)
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
-import Data.Bits (testBit)
+import Data.Bits (testBit, (.&.), (.|.))
 import qualified Data.ByteArray as BA
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base16 as B16
@@ -36,8 +36,9 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isAlphaNum, isAsciiLower, isDigit, isHexDigit, isSpace, toLower)
 import Data.IORef (modifyIORef, newIORef, readIORef)
-import Data.List (dropWhileEnd, uncons, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
+import Data.List (dropWhileEnd, intercalate, uncons, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
 import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
+import Numeric (readHex, showHex)
 import qualified Data.Text as T
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
@@ -74,6 +75,9 @@ usage =
     , "                                    build images (datum: on the EC2 build box,"
     , "                                    for --class unikernel or general-purpose)"
     , "  yolo sync-pins                    pin image/flake.lock to the dotfiles' revisions"
+    , "  yolo infra buildbox|meta CMD      the EC2 build box and the shared home's metadata host:"
+    , "                                    launch [REV] | ticket | ipv6 | start | stop | status | terminate,"
+    , "                                    and for the build box, tunnel [PORT]"
     , ""
     , "The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session"
     , "remembers its own. Backend options for `new`:"
@@ -101,12 +105,21 @@ main = do
     ["rm", name] -> cmdRm root name
     "build" : rest -> cmdBuild root rest
     ["sync-pins"] -> syncPins root
+    "infra" : rest -> cmdInfra root rest
     [h] | isHelp h -> putStr usage
     _ -> hPutStr stderr usage >> exitWith (ExitFailure 2)
 
--- The repository: this script's directory, through any symlinks to it.
+-- The repository: $YOLO_ROOT (the compiled yolo's wrapper defaults it to
+-- the flake's source), else this script's directory, through any symlinks.
 yoloRoot :: IO FilePath
-yoloRoot = takeDirectory <$> canonicalizePath $(location >>= lift . loc_filename)
+yoloRoot = envNonEmpty "YOLO_ROOT" >>= maybe (takeDirectory <$> canonicalizePath $(location >>= lift . loc_filename)) pure
+
+-- Commands that rewrite image/ (pins, flake.lock) need a checkout, not the
+-- read-only copy a compiled yolo carries.
+needCheckout :: FilePath -> String -> IO ()
+needCheckout root what =
+  when ("/nix/store/" `isPrefixOf` root) $
+    die (what ++ " updates image/ in the repository; run it from a yolo checkout (./yolo) or set YOLO_ROOT to one")
 
 ----------------------------------------------------------------------------
 -- Commands
@@ -401,6 +414,9 @@ datumNew d name harness opts0 = do
   (key, wantHome, cls) <- either die pure (go Nothing True (dClass d) opts0)
   unless (cls `elem` ["unikernel", "general-purpose"]) $
     die ("datum: unknown class '" ++ cls ++ "' (unikernel or general-purpose)")
+  forM_ key $ \k -> do
+    ok <- (readable <$> getPermissions k) `orElse` False
+    unless ok $ die ("datum: cannot read " ++ k)
   homeOk <- (== ExitSuccess) <$> quiet "datumctl" ["get", "secret", dHomeSecret d]
   home <-
     if wantHome && not homeOk
@@ -636,7 +652,7 @@ endpointTicket relay secretHex = do
 authorizedKeys :: Maybe FilePath -> IO (Either String String)
 authorizedKeys mfile = do
   keys <- case mfile of
-    Just f -> readFile f
+    Just f -> fromMaybe "" <$> readFileMaybe f
     Nothing -> do
       r <- timeout 10000000 (try (readProcessWithExitCode "ssh-add" ["-L"] ""))
       let agentKeys = case r of
@@ -861,6 +877,371 @@ dockerAttach d name args = do
   exitWith code
 
 ----------------------------------------------------------------------------
+-- The EC2 boxes whose NixOS configs live in this repo: the image build box
+-- (infra/buildbox/ec2) and the JuiceFS metadata host for the shared home
+-- (infra/meta/ec2). Idempotent for the security group and IAM role; `launch`
+-- starts a new instance each time, so check `status` first. REV must be
+-- pushed: the box fetches github:drewr/yolo/REV?dir=CONFIG#ATTR. Uses the
+-- aws CLI from PATH with $AWS_PROFILE (default datum-sandbox-admin); TYPE,
+-- DISK_GB and IPV6=1 override a box's defaults.
+
+data Box = Box
+  { boxName :: String
+  , boxRegion :: String
+  , boxType :: String
+  , boxDiskGb :: String
+  , boxConfigDir :: String -- the NixOS flake's directory in this repo
+  , boxAttr :: String -- its nixosConfigurations attribute
+  , boxTicketFile :: String -- where the box writes its dumbpipe ticket
+  , boxIpv6 :: Bool -- public IPv6 (sets up the VPC once)
+  , boxProfile :: String
+  }
+
+boxConfig :: String -> IO Box
+boxConfig which = do
+  b <- case which of
+    -- 8 GB: the bigger harness images wedged a 4 GB box. The agent image is
+    -- ~4 GB and staged 3-4 times, hence the disk.
+    "buildbox" -> pure (Box "datum-buildbox" "us-east-2" "t3a.large" "64" "infra/buildbox/ec2" "buildbox" "/var/lib/dumbpipe/ticket" False)
+    -- Same metro as Datum us-east-1 (IAD); IPv6 so Datum's IPv6-only
+    -- sandboxes reach it directly over iroh rather than through the relay.
+    "meta" -> pure (Box "agent-meta" "us-east-1" "t3a.small" "16" "infra/meta/ec2" "agentmeta" "/var/lib/agent-meta/ticket" True)
+    _ -> die ("unknown box '" ++ which ++ "' (buildbox or meta)")
+  t <- envNonEmpty "TYPE"
+  d <- envNonEmpty "DISK_GB"
+  v6 <- envNonEmpty "IPV6"
+  profile <- fromMaybe "datum-sandbox-admin" <$> envNonEmpty "AWS_PROFILE"
+  let p = b profile
+  pure p {boxType = fromMaybe (boxType p) t, boxDiskGb = fromMaybe (boxDiskGb p) d, boxIpv6 = maybe (boxIpv6 p) (== "1") v6}
+
+cmdInfra :: FilePath -> [String] -> IO ()
+cmdInfra root args = case args of
+  which : cmd -> do
+    b <- boxConfig which
+    case cmd of
+      ["launch"] -> infraLaunch root b Nothing
+      ["launch", rev] -> infraLaunch root b (Just rev)
+      ["ticket"] -> boxTicket b >>= putStrLn
+      ["ipv6"] -> do
+        ensureIpv6 b
+        -- For an instance launched before IPV6=1: give it an address now,
+        -- unless it has one.
+        i <- instanceId b
+        let nic q = aws b ["ec2", "describe-instances", "--instance-ids", i, "--query", "Reservations[0].Instances[0].NetworkInterfaces[0]." ++ q, "--output", "text"]
+        existing <- nic "Ipv6Addresses[0].Ipv6Address"
+        if existing `notElem` ["", "None"]
+          then putStrLn existing
+          else nic "NetworkInterfaceId" >>= \eni -> aws b ["ec2", "assign-ipv6-addresses", "--ipv6-address-count", "1", "--network-interface-id", eni, "--query", "AssignedIpv6Addresses[0]", "--output", "text"] >>= putStrLn
+      ["start"] -> startBox b
+      ["stop"] -> instanceId b >>= \i -> () <$ aws b ["ec2", "stop-instances", "--instance-ids", i]
+      ["terminate"] -> instanceId b >>= \i -> () <$ aws b ["ec2", "terminate-instances", "--instance-ids", i]
+      [] -> infraStatus b
+      ["status"] -> infraStatus b
+      "tunnel" : rest | which == "buildbox", length rest <= 1 -> do
+        let port = fromMaybe "12340" (listToMaybe rest)
+        tk <- buildboxTicket b
+        hPutStrLn stderr ("BuildKit at tcp://127.0.0.1:" ++ port ++ " (ctrl-c to close)")
+        executeFile "dumbpipe" True ["connect-tcp", "--addr", "127.0.0.1:" ++ port, tk] Nothing
+      _ -> infraUsage
+  [] -> infraUsage
+  where
+    infraUsage = die "usage: yolo infra buildbox|meta launch [REV] | ticket | ipv6 | start | stop | status | terminate | tunnel [PORT]"
+
+infraStatus :: Box -> IO ()
+infraStatus b =
+  aws b
+    [ "ec2", "describe-instances", "--filters", "Name=tag:Name,Values=" ++ boxName b
+    , "--query", "Reservations[].Instances[].[InstanceId,State.Name,InstanceType,Tags[?Key==`rev`]|[0].Value]"
+    , "--output", "table"
+    ]
+    >>= putStrLn
+
+-- The box's instance and state (any state but terminated), if there is one.
+findInstance :: Box -> IO (Maybe (String, String))
+findInstance b = do
+  out <-
+    aws b
+      [ "ec2", "describe-instances"
+      , "--filters", "Name=tag:Name,Values=" ++ boxName b, "Name=instance-state-name,Values=pending,running,stopping,stopped"
+      , "--query", "Reservations[].Instances[].[InstanceId,State.Name]", "--output", "text"
+      ]
+  pure $ case words out of
+    i : st : _ -> Just (i, st)
+    _ -> Nothing
+
+instanceId :: Box -> IO String
+instanceId b = findInstance b >>= maybe (die ("no instance named " ++ boxName b ++ " (yolo infra ... launch)")) (pure . fst)
+
+-- Start the box if it's stopped (or stopping), and wait until it runs.
+startBox :: Box -> IO ()
+startBox b =
+  findInstance b >>= \case
+    Nothing -> die ("no instance named " ++ boxName b ++ " (yolo infra ... launch)")
+    Just (i, st) -> do
+      when (st == "stopping") $ () <$ aws b ["ec2", "wait", "instance-stopped", "--instance-ids", i]
+      when (st `elem` ["stopped", "stopping"]) $ do
+        hPutStrLn stderr ("yolo: starting " ++ boxName b ++ " (" ++ i ++ ")")
+        () <$ aws b ["ec2", "start-instances", "--instance-ids", i]
+      () <$ aws b ["ec2", "wait", "instance-running", "--instance-ids", i]
+
+-- The box's dumbpipe ticket, read on the box over SSM (it must be running).
+boxTicket :: Box -> IO String
+boxTicket b = do
+  i <- instanceId b
+  -- SSM's agent registers a while after EC2 reports the instance running.
+  t0 <- getCurrentTime
+  let online = do
+        st <- aws b ["ssm", "describe-instance-information", "--filters", "Key=InstanceIds,Values=" ++ i, "--query", "InstanceInformationList[0].PingStatus", "--output", "text"]
+        n <- secondsSince t0
+        unless (st == "Online") $ do
+          when (n >= 300) $ die (boxName b ++ " isn't reachable over SSM after 5 min (SSM status: " ++ st ++ ")")
+          threadDelay 5000000 >> online
+  online
+  cmd <-
+    aws b
+      [ "ssm", "send-command", "--instance-ids", i, "--document-name", "AWS-RunShellScript"
+      , "--parameters", "commands=[\"cat " ++ boxTicketFile b ++ "\"]"
+      , "--query", "Command.CommandId", "--output", "text"
+      ]
+  _ <- aws b ["ssm", "wait", "command-executed", "--command-id", cmd, "--instance-id", i]
+  aws b ["ssm", "get-command-invocation", "--command-id", cmd, "--instance-id", i, "--query", "StandardOutputContent", "--output", "text"]
+
+-- The build box's ticket: $BUILDBOX_TICKET, else the saved one, else read
+-- from the box (starting it if needed) and saved for next time.
+buildboxTicket :: Box -> IO String
+buildboxTicket b = do
+  env <- envNonEmpty "BUILDBOX_TICKET"
+  saved <- fmap trim <$> (ticketFile >>= readFileMaybe)
+  case env <|> mfilter (not . null) saved of
+    Just t -> pure t
+    Nothing -> do
+      hPutStrLn stderr "yolo: no saved build box ticket; reading it from the box"
+      startBox b
+      t <- freshTicket b
+      saveTicket t
+      pure t
+
+ticketFile :: IO FilePath
+ticketFile = (</> "agent-sandbox-build/buildbox-ticket") <$> stateHome
+
+saveTicket :: String -> IO ()
+saveTicket t = do
+  file <- ticketFile
+  createDirectoryIfMissing True (takeDirectory file)
+  withUmask 0o077 (writeFile file (t ++ "\n"))
+
+-- The ticket the box has now; a new box writes it once NixOS has configured
+-- it, a few minutes after launch.
+freshTicket :: Box -> IO String
+freshTicket b = do
+  t <- boxTicket b
+  unless ("endpoint" `isPrefixOf` t) $
+    die ("the build box has no ticket yet (still configuring itself after launch?); try again in a few minutes")
+  pure t
+
+-- Run `act` with BuildKit on the build box reachable through a local tunnel.
+-- When it doesn't answer, the box is started if it's stopped; and if it's
+-- running but still silent, its ticket is read again in case the box was
+-- replaced (yolo infra buildbox launch), and the new one saved.
+withBuildkit :: Box -> String -> IO a -> IO a
+withBuildkit b port act = do
+  let addr = "tcp://127.0.0.1:" ++ port
+      attempt t = withTunnel t port (ensureBuildkit b addr >>= \up -> if up then Just <$> act else pure Nothing)
+  t <- buildboxTicket b
+  attempt t >>= \case
+    Just x -> pure x
+    Nothing -> do
+      fresh <- freshTicket b
+      when (fresh == t) $ die "BuildKit on the build box isn't answering (yolo infra buildbox status)"
+      envTicket <- envNonEmpty "BUILDBOX_TICKET"
+      when (isJust envTicket) $ die ("$BUILDBOX_TICKET is stale; the box's ticket is now " ++ fresh)
+      hPutStrLn stderr "yolo: the build box has a new ticket (it was replaced); saved it"
+      saveTicket fresh
+      attempt fresh >>= maybe (die "BuildKit on the build box isn't answering (yolo infra buildbox status)") pure
+
+-- Whether BuildKit answers through the tunnel, starting the box if it's
+-- stopped (it powers itself off after 30 idle minutes) and waiting for it:
+-- up to 10 min after a start, 90 s if it was already running.
+ensureBuildkit :: Box -> String -> IO Bool
+ensureBuildkit b addr = do
+  ok <- buildkitUp
+  if ok
+    then pure True
+    else do
+      wasRunning <-
+        findInstance b >>= \case
+          Nothing -> die "no build box (yolo infra buildbox launch)"
+          Just (_, "running") -> True <$ hPutStrLn stderr "yolo: the build box is running but BuildKit isn't answering; waiting"
+          _ -> False <$ startBox b
+      t0 <- getCurrentTime
+      let limit = if wasRunning then 90 else 600
+          wait = do
+            up <- buildkitUp
+            n <- secondsSince t0
+            if up || n >= limit then pure up else threadDelay 10000000 >> wait
+      up <- wait
+      n <- secondsSince t0
+      when up $ hPutStrLn stderr ("yolo: BuildKit is up after " ++ show n ++ "s")
+      pure up
+  where
+    buildkitUp = maybe False (== ExitSuccess) <$> timeout 30000000 (quiet "buildctl" ["--addr", addr, "debug", "workers"])
+
+infraLaunch :: FilePath -> Box -> Maybe String -> IO ()
+infraLaunch root b mrev = do
+  needCheckout root "yolo infra launch"
+  rev <- maybe (git ["rev-parse", "HEAD"]) pure mrev
+  pushed <- git ["branch", "-r", "--contains", rev]
+  when (null pushed) $ die ("rev " ++ rev ++ " is not on any pushed branch; the box fetches its config from GitHub")
+  findInstance b >>= mapM_ (\(i, _) -> die ("already exists: " ++ i))
+  sg <- ensureSecurityGroup b
+  ensureInstanceProfile b
+  v6 <- if boxIpv6 b then ensureIpv6 b >> pure ["--ipv6-address-count", "1"] else pure []
+  (ami, amiName, rootDev) <-
+    aws b
+      [ "ec2", "describe-images", "--owners", "427812963091" -- official NixOS AMIs
+      , "--filters", "Name=architecture,Values=x86_64", "Name=name,Values=nixos/*"
+      , "--query", "sort_by(Images,&CreationDate)[-1].[ImageId,Name,RootDeviceName]", "--output", "text"
+      ]
+      >>= \case
+        out | [a, n, r] <- words out -> pure (a, n, r)
+        out -> die ("unexpected AMI lookup result: " ++ out)
+  putStrLn ("ami=" ++ ami ++ " (" ++ amiName ++ ") rev=" ++ rev ++ " sg=" ++ sg)
+  tmp <- getTemporaryDirectory
+  (userData, h) <- openTempFile tmp "user-data"
+  hPutStr h . unlines $
+    [ "#!/bin/sh"
+    , "# Apply the " ++ boxAttr b ++ " config pinned to " ++ rev ++ ". Re-runs on every boot as a no-op."
+    , "nixos-rebuild switch --option experimental-features 'nix-command flakes' \\"
+    , "  --flake 'github:drewr/yolo/" ++ rev ++ "?dir=" ++ boxConfigDir b ++ "#" ++ boxAttr b ++ "'"
+    ]
+  hClose h
+  i <-
+    aws b
+      ( [ "ec2", "run-instances", "--image-id", ami, "--instance-type", boxType b
+        , "--security-group-ids", sg, "--iam-instance-profile", "Name=" ++ boxName b
+        , "--block-device-mappings", "DeviceName=" ++ rootDev ++ ",Ebs={VolumeSize=" ++ boxDiskGb b ++ ",VolumeType=gp3,DeleteOnTermination=true}"
+        , "--metadata-options", "HttpTokens=required"
+        ]
+          ++ v6
+          ++ [ "--user-data", "file://" ++ userData
+             , "--tag-specifications", "ResourceType=instance,Tags=[{Key=Name,Value=" ++ boxName b ++ "},{Key=rev,Value=" ++ rev ++ "}]"
+             , "--query", "Instances[0].InstanceId", "--output", "text"
+             ]
+      )
+  removePathForcibly userData
+  putStrLn i
+  -- The new instance makes its own iroh key, so its ticket is new.
+  if boxName b == "datum-buildbox"
+    then do
+      ticketFile >>= removePathForcibly
+      hPutStrLn stderr "yolo: dropped the saved build box ticket; yolo build reads the new one once the box has configured itself (~5 min)"
+    else
+      hPutStrLn stderr ("yolo: the new " ++ boxName b ++ " has a new ticket (yolo infra meta ticket, after ~5 min); update META_TICKET in the agent-home Secret before starting sessions")
+  where
+    git a = (\(_, o, _) -> trim o) <$> readProcessWithExitCode "git" (["-C", root] ++ a) ""
+
+-- No ingress rules: everything reaches the box over iroh or SSM.
+ensureSecurityGroup :: Box -> IO String
+ensureSecurityGroup b = do
+  sg <- aws b ["ec2", "describe-security-groups", "--filters", "Name=group-name,Values=" ++ boxName b, "--query", "SecurityGroups[0].GroupId", "--output", "text"]
+  if sg /= "None"
+    then pure sg
+    else do
+      vpc <- defaultVpc b
+      aws b ["ec2", "create-security-group", "--group-name", boxName b, "--vpc-id", vpc, "--description", boxName b ++ ", no inbound", "--query", "GroupId", "--output", "text"]
+
+-- An instance profile that SSM can manage (for the ticket; no SSH needed).
+ensureInstanceProfile :: Box -> IO ()
+ensureInstanceProfile b = do
+  code <- quiet "aws" (awsArgs b ["iam", "get-instance-profile", "--instance-profile-name", boxName b])
+  unless (code == ExitSuccess) $ do
+    _ <-
+      aws b
+        [ "iam", "create-role", "--role-name", boxName b, "--assume-role-policy-document"
+        , "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+        ]
+    _ <- aws b ["iam", "attach-role-policy", "--role-name", boxName b, "--policy-arn", "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+    _ <- aws b ["iam", "create-instance-profile", "--instance-profile-name", boxName b]
+    _ <- aws b ["iam", "add-role-to-instance-profile", "--instance-profile-name", boxName b, "--role-name", boxName b]
+    threadDelay 10000000 -- instance profiles take a moment to become usable
+
+-- Public IPv6 for the default VPC, once: an Amazon-provided block, a /64 per
+-- default subnet (so any AZ works), and a ::/0 route to the internet gateway.
+-- Sandboxes on Datum are IPv6-only, so this is what lets iroh go direct
+-- instead of through the relay. Idempotent.
+ensureIpv6 :: Box -> IO ()
+ensureIpv6 b = do
+  vpc <- defaultVpc b
+  let vpcBlock = aws b ["ec2", "describe-vpcs", "--vpc-ids", vpc, "--query", "Vpcs[0].Ipv6CidrBlockAssociationSet[?Ipv6CidrBlockState.State==`associated`]|[0].Ipv6CidrBlock", "--output", "text"]
+      waitBlock :: Int -> IO String
+      waitBlock n = do
+        blk <- vpcBlock
+        if blk /= "None" || n == 0 then pure blk else threadDelay 2000000 >> waitBlock (n - 1)
+  block0 <- vpcBlock
+  block <-
+    if block0 /= "None"
+      then pure block0
+      else aws b ["ec2", "associate-vpc-cidr-block", "--vpc-id", vpc, "--amazon-provided-ipv6-cidr-block"] >> waitBlock 30
+  hPutStrLn stderr ("vpc " ++ vpc ++ " ipv6 " ++ block)
+  subnets <- words <$> aws b ["ec2", "describe-subnets", "--filters", "Name=vpc-id,Values=" ++ vpc, "Name=default-for-az,Values=true", "--query", "sort_by(Subnets,&AvailabilityZone)[].SubnetId", "--output", "text"]
+  forM_ (zip [0 ..] subnets) $ \(i, subnet) -> do
+    n <- aws b ["ec2", "describe-subnets", "--subnet-ids", subnet, "--query", "length(Subnets[0].Ipv6CidrBlockAssociationSet[?Ipv6CidrBlockState.State==`associated`])", "--output", "text"]
+    when (n == "0") $ do
+      cidr <- either die pure (subnet64 block i)
+      () <$ aws b ["ec2", "associate-subnet-cidr-block", "--subnet-id", subnet, "--ipv6-cidr-block", cidr]
+    () <$ aws b ["ec2", "modify-subnet-attribute", "--subnet-id", subnet, "--assign-ipv6-address-on-creation"]
+  rtb <- aws b ["ec2", "describe-route-tables", "--filters", "Name=vpc-id,Values=" ++ vpc, "Name=association.main,Values=true", "--query", "RouteTables[0].RouteTableId", "--output", "text"]
+  igw <- aws b ["ec2", "describe-internet-gateways", "--filters", "Name=attachment.vpc-id,Values=" ++ vpc, "--query", "InternetGateways[0].InternetGatewayId", "--output", "text"]
+  -- Fails harmlessly if the route exists.
+  () <$ quiet "aws" (awsArgs b ["ec2", "create-route", "--route-table-id", rtb, "--destination-ipv6-cidr-block", "::/0", "--gateway-id", igw])
+
+-- The i-th /64 of an Amazon /56 block (its fourth group's low byte).
+subnet64 :: String -> Int -> Either String String
+subnet64 block i = do
+  let addr = takeWhile (/= '/') block
+      (left, right) = breakOn "::" addr
+      groupsOf str = if null str then [] else splitOn ':' str
+      l = groupsOf left
+      r = groupsOf (drop 2 right)
+      full = l ++ replicate (8 - length l - length r) "0" ++ r
+  gs <- mapM hex full
+  when (length gs /= 8 || i > 255) $ Left ("can't split " ++ block ++ " into /64s")
+  let g3 = (gs !! 3 .&. 0xff00) .|. i
+  pure (intercalate ":" (map (`showHex` "") (take 3 gs ++ [g3])) ++ "::/64")
+  where
+    hex str = case readHex str of
+      [(n, "")] -> Right n
+      _ -> Left ("bad IPv6 group " ++ str ++ " in " ++ block)
+    breakOn pat = go ""
+      where
+        go acc str = case str of
+          [] -> (reverse acc, "")
+          c : rest
+            | take (length pat) str == pat -> (reverse acc, str)
+            | otherwise -> go (c : acc) rest
+    splitOn c str = case break (== c) str of
+      (a, []) -> [a]
+      (a, _ : rest) -> a : splitOn c rest
+
+defaultVpc :: Box -> IO String
+defaultVpc b = aws b ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true", "--query", "Vpcs[0].VpcId", "--output", "text"]
+
+awsArgs :: Box -> [String] -> [String]
+awsArgs b args = ["--profile", boxProfile b, "--region", boxRegion b] ++ args
+
+-- The aws CLI's trimmed stdout, with the box's profile and region; dies with
+-- its error, or with how to log in when the SSO session has expired.
+aws :: Box -> [String] -> IO String
+aws b args = do
+  r <- try (readProcessWithExitCode "aws" (awsArgs b args) "")
+  (code, out, err) <- either (\e -> const (die "the aws CLI isn't in PATH") (e :: IOException)) pure r
+  unless (code == ExitSuccess) $
+    if any (`isInfixOf` err) ["Token has expired", "token is expired", "SSO session", "sso login", "Unable to locate credentials"]
+      then die ("AWS login needed for profile " ++ boxProfile b ++ ": aws sso login --profile " ++ boxProfile b)
+      else die ("aws " ++ unwords (take 2 args) ++ ": " ++ trim err)
+  pure (trim out)
+
+----------------------------------------------------------------------------
 -- Image builds (datum): on the EC2 build box, over iroh.
 --
 -- unikernel (default): `datumctl compute build` against the box's BuildKit,
@@ -869,29 +1250,26 @@ dockerAttach d name args = do
 -- registry login (~/.docker/config.json). Pins llm-agents and nixpkgs to the
 -- dotfiles' revisions first (sync-pins). The box must be running; its ticket
 -- comes from $BUILDBOX_TICKET or ~/.local/state/agent-sandbox-build
--- (infra/provision buildbox ticket).
+-- (yolo infra buildbox ticket). If BuildKit doesn't answer, the box is
+-- started (it stops itself after 30 idle minutes) and waited for.
 
 buildDatum :: FilePath -> String -> [String] -> IO ()
 buildDatum root cls hs = do
+  needCheckout root "yolo build --backend datum"
   (images, tag) <- case cls of
     "unikernel" -> pure (root </> "image/images", "dev")
     "general-purpose" -> pure (root </> "image/images-general-purpose", "gp-dev")
     _ -> die ("unknown class '" ++ cls ++ "' (unikernel or general-purpose)")
   state <- (</> "agent-sandbox-build") <$> stateHome
   registry <- fromMaybe "ghcr.io/drewr" <$> envNonEmpty "AGENT_IMAGE_REGISTRY"
-  ticket <-
-    envNonEmpty "BUILDBOX_TICKET" >>= \case
-      Just t -> pure t
-      Nothing ->
-        readFileMaybe (state </> "buildbox-ticket")
-          >>= maybe (die "build: no BUILDBOX_TICKET (infra/provision buildbox ticket)") (pure . trim)
+  box <- boxConfig "buildbox"
   port <- fromMaybe "12340" <$> envNonEmpty "BUILDBOX_PORT"
   createDirectoryIfMissing True (state </> "logs")
   syncPins root
   let ctx = root </> "image"
       buildkit = "tcp://127.0.0.1:" ++ port
   failures <- newIORef (0 :: Int)
-  withTunnel ticket port $ forM_ hs $ \h -> do
+  withBuildkit box port $ forM_ hs (\h -> do
     let logFile = state </> "logs" </> ("build-" ++ h ++ "-" ++ cls ++ ".log")
         meta = state </> "logs" </> ("build-" ++ h ++ "-" ++ cls ++ ".json")
         image = registry ++ "/agent-" ++ h ++ ":" ++ tag
@@ -928,7 +1306,7 @@ buildDatum root cls hs = do
       Nothing -> do
         let errLine = take 200 (fromMaybe "" (lastLine (unlines (filter (("error" `isInfixOf`) . map toLower) (lines out)))))
         hPrintf stderr "%s: FAILED after %ds: %s (log: %s)\n" h n errLine logFile :: IO ()
-        modifyIORef failures (+ 1)
+        modifyIORef failures (+ 1))
   bad <- readIORef failures
   when (bad > 0) exitFailure
 
@@ -993,6 +1371,7 @@ pinImage file cls h ref = do
 -- --flake image, then build.
 syncPins :: FilePath -> IO ()
 syncPins root = do
+  needCheckout root "yolo sync-pins"
   let here = root </> "image"
       nix = ["--extra-experimental-features", "nix-command flakes"]
   (code, dotfiles, err) <- readProcessWithExitCode "nix" (nix ++ ["eval", "--raw", here ++ "#lib.dotfiles"]) ""
