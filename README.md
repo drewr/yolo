@@ -52,7 +52,8 @@ The same image and init run on both backends:
 `image/flake.nix` builds one rootfs per harness from Nix: the harness from
 llm-agents.nix plus a shared base. The llm-agents and nixpkgs revisions follow
 the [dotfiles](https://github.com/drewr/dotfiles) through the flake's
-`dotfiles` input (`image/sync-pins`), and so does the zsh config.
+`dotfiles` input (`yolo sync-pins`, run by every Datum build), and so does the
+zsh config.
 
 ```sh
 yolo build claude                         # docker: yolo/claude:local
@@ -65,17 +66,19 @@ nix flake update dotfiles --flake image   # follow newer dotfiles, then build
 
 | Path | What |
 | - | - |
-| `yolo` | CLI; dispatches to the session's backend |
-| `lib/` | session state and iroh/SSH key helpers |
-| `backends/docker.sh`, `backends/datum.sh` | the two backends |
-| `image/` | image flake, Dockerfile, init, `ws`, `agent-providers`, pinned Datum images |
-| `infra/buildbox/ec2`, `infra/meta/ec2` | EC2 build box and JuiceFS metadata host (NixOS) |
+| `yolo` | the CLI, a Haskell script (sessions, both backends, image builds) |
+| `image/` | image flake, Dockerfile, in-image scripts (init, `ws`, `agent-providers`), pinned Datum images |
+| `infra/provision` | launch and manage the EC2 boxes (Haskell) |
+| `infra/buildbox/ec2`, `infra/meta/ec2` | EC2 build box and JuiceFS metadata host (NixOS configs) |
 | `docs/` | Datum details and the shared-home benchmarks |
 
 ## Requirements
 
+- **Nix**, with `nix-shell`: `yolo` and `infra/provision` are runghc scripts
+  whose shebang pulls GHC, their libraries, dumbpipe, socat and buildctl from a
+  pinned nixpkgs. The first run downloads them (about 30 s); each run after
+  that starts in about 3 s.
 - **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).
-- **datum backend:** `datumctl` signed in to Datum (production), plus `ssh`,
-  `ssh-keygen`, `openssl`, `jq`, `xxd` and `base32`. `dumbpipe` comes from
-  nixpkgs if missing. Building Datum images needs the EC2 build box
-  (`infra/buildbox/ec2`).
+- **datum backend:** `datumctl` signed in to Datum (production), `ssh`,
+  `ssh-keygen` and `ssh-add`. Building Datum images needs the EC2 build box
+  (`infra/buildbox/ec2`) and the `aws` CLI to manage it.

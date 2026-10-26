@@ -168,15 +168,15 @@ set `YOLO_RELAY` to match.
 
 ## Image contents (`image/flake.nix`)
 
-`packages.<harness>`: one harness from llm-agents.nix at the dotfiles' pinned
+`packages.<system>.<harness>`: one harness from llm-agents.nix at the dotfiles' pinned
 rev (claude-code, gemini-cli, codex, opencode or pi), plus the
 same base in every image: zsh, bash, git, ripgrep, curl, jq, nix, rsync,
 juicefs, dropbear, dumbpipe, `ws`, `agent-providers`, `nix-zsh-env` (a sh port
 of the zigutils tool, which no longer builds: its pinned zig dev tarball is
 gone), the en_US.UTF-8 locale, CA certificates, the dotfiles' zsh config, and
-static busybox for everything else. `Dockerfile.datum` picks the harness with
-the `HARNESS` build argument; `build-image` adds the zsh config to the build
-context.
+static busybox for everything else. `image/Dockerfile` picks the harness with
+the `HARNESS` build argument; the zsh config comes from the flake's `dotfiles`
+input.
 Each is shipped as its full nix closure at the original `/nix/store` paths
 (the image is ~480 MB). This keeps wrapBuddy's hardcoded paths valid and needs
 no patchelf. About 1.83 GiB of the instance's memory is free with a session
@@ -186,6 +186,13 @@ open.
 
 - Anything outside the shared home and `ws` workspaces (e.g. `nix shell`
   installs, `/tmp`) is lost when the instance goes.
+- Big nix closures don't fit. On unikernel, `/nix/store` is in RAM, and
+  `nix shell nixpkgs#ghc` (~2.9 GiB) panics the 2 GiB VM ("System is
+  deadlocked on memory"), which reboots it; ssh then reports "Bad packet
+  length". On general-purpose the store is on disk, but the container is
+  capped at 2 GiB and still restarts silently during the ghc fetch
+  (datum-cloud/compute#491); the `nix` evaluation alone holds ~560 MB. Only
+  `d1-standard-2` (2 GiB) exists so far.
 - `datumctl connect local` (the project-less Connect tunnel) would replace
   dumbpipe once it ships.
 - Spike 5B (an API call and a Bash tool call) still needs an API key.

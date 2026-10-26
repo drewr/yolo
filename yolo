@@ -1,126 +1,1025 @@
-#!/usr/bin/env bash
-# yolo: run coding agents in named, isolated sessions, locally (docker or
-# podman) or on Datum Compute. Each session runs one harness's image: claude
-# (default), gemini, codex, opencode or pi.
-#
-#   yolo new NAME [--backend docker|datum] [--agent HARNESS] [backend options]
-#                                     create a session and wait until it's ready
-#   yolo attach NAME [args...]        shell as drewr, or run a command (alias: ssh)
-#   yolo ls                           list sessions
-#   yolo logs NAME [args...]          session logs
-#   yolo rm NAME                      save workspaces, then delete the session
-#   yolo build HARNESS... [--backend docker|datum] [--class CLASS]
-#                                     build images (datum: on the EC2 build box,
-#                                     for --class unikernel or general-purpose)
-#
-# The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
-# remembers its own. Backend options: see backends/docker.sh and
-# backends/datum.sh. Session state lives in $YOLO_STATE
-# (~/.local/state/yolo/sessions).
-set -euo pipefail
+#!/usr/bin/env nix-shell
+#! nix-shell -i runghc -I nixpkgs=https://github.com/NixOS/nixpkgs/archive/02c087f3fe673c9e317f206a627cb6b910336dbe.tar.gz
+#! nix-shell -p "haskellPackages.ghcWithPackages (pkgs: with pkgs; [ aeson crypton memory base16-bytestring base64-bytestring network ])"
+#! nix-shell -p dumbpipe socat buildkit
 
-YOLO_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
-# shellcheck source=lib/session.sh
-. "$YOLO_ROOT/lib/session.sh"
-# shellcheck source=lib/keys.sh
-. "$YOLO_ROOT/lib/keys.sh"
+-- yolo: run coding agents in named, isolated sessions, locally (docker or
+-- podman) or on Datum Compute. Each session runs one harness's image: claude
+-- (default), gemini, codex, opencode or pi. `yolo help` lists the commands.
+--
+-- Session state lives in $YOLO_STATE (~/.local/state/yolo/sessions/NAME): at
+-- least `backend` and `harness`, plus each backend's own files (keys,
+-- tickets). Only `yolo new` needs --backend; later commands read it there.
+--
+-- Not in nixpkgs, or deliberately the host's, so taken from PATH: datumctl
+-- (datum backend and builds), docker or podman (docker backend), ssh,
+-- ssh-keygen, ssh-add and nix.
 
-# The header comment through the command list (up to the second "#" line).
-usage() {
-  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); if ($0 == "" && ++blank == 2) exit; print; next } { exit }' \
-    "${BASH_SOURCE[0]}"
-  exit "${1:-2}"
-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TemplateHaskell #-}
 
-load_backend() {
-  case $1 in
-    docker|datum) ;;
-    *) die "unknown backend '$1' (docker or datum)" ;;
-  esac
-  # shellcheck source=/dev/null
-  . "$YOLO_ROOT/backends/$1.sh"
-}
+import Control.Applicative ((<|>))
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, SomeException, bracket, finally, try)
+import Control.Monad (filterM, forM, forM_, unless, when)
+import Crypto.Error (throwCryptoErrorIO)
+import qualified Crypto.PubKey.Ed25519 as Ed
+import Crypto.Random (getRandomBytes)
+import qualified Data.Aeson as A
+import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
+import Data.Bits (testBit)
+import qualified Data.ByteArray as BA
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Base16 as B16
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Char8 as BC
+import Data.Char (isAlphaNum, isAsciiLower, isDigit, isHexDigit, isSpace, toLower)
+import Data.IORef (modifyIORef, newIORef, readIORef)
+import Data.List (dropWhileEnd, uncons, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
+import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
+import qualified Data.Text as T
+import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
+import Language.Haskell.TH.Syntax (lift, loc_filename, location)
+import qualified Network.Socket as N
+import System.Directory
+import System.Environment (getArgs, lookupEnv, setEnv)
+import System.Exit (ExitCode (..), exitFailure, exitWith)
+import System.FilePath (takeDirectory, (</>))
+import System.IO
+import System.Info (os)
+import System.Posix.Files (fileExist, getFileStatus, isSocket, setFileCreationMask, setFileMode)
+import System.Posix.Process (executeFile)
+import System.Posix.Types (FileMode)
+import System.Posix.User (getRealGroupID, getRealUserID)
+import System.Process
+import System.Timeout (timeout)
+import Text.Printf (hPrintf, printf)
 
-cmd_new() {
-  local name=${1:?usage: yolo new NAME [--backend docker|datum] [--agent HARNESS] [options]}; shift
-  local backend; backend=$(opt BACKEND docker)
-  local harness; harness=$(opt AGENT claude)
-  local rest=()
-  while [ $# -gt 0 ]; do
-    case $1 in
-      --backend) backend=$2; shift 2 ;;
-      --agent) harness=$2; shift 2 ;;
-      *) rest+=("$1"); shift ;;
-    esac
-  done
-  check_harness "$harness"
-  session_dir "$name" >/dev/null
-  load_backend "$backend"
-  backend_new "$name" "$harness" "${rest[@]}"
-}
+usage :: String
+usage =
+  unlines
+    [ "yolo: run coding agents in named, isolated sessions, locally (docker or"
+    , "podman) or on Datum Compute. Each session runs one harness's image: claude"
+    , "(default), gemini, codex, opencode or pi."
+    , ""
+    , "  yolo new NAME [--backend docker|datum] [--agent HARNESS] [backend options]"
+    , "                                    create a session and wait until it's ready"
+    , "  yolo attach NAME [args...]        shell as drewr, or run a command (alias: ssh)"
+    , "  yolo ls                           list sessions"
+    , "  yolo logs NAME [args...]          session logs"
+    , "  yolo rm NAME                      save workspaces, then delete the session"
+    , "  yolo build HARNESS... [--backend docker|datum] [--class CLASS]"
+    , "                                    build images (datum: on the EC2 build box,"
+    , "                                    for --class unikernel or general-purpose)"
+    , "  yolo sync-pins                    pin image/flake.lock to the dotfiles' revisions"
+    , ""
+    , "The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session"
+    , "remembers its own. Backend options for `new`:"
+    , "  docker  -v HOST:CONTAINER[:ro]    bind-mount a directory (repeatable)"
+    , "  datum   --key PUBKEY_FILE         authorize this key instead of the agent's"
+    , "          --no-home                 private, ephemeral HOME, not the shared home"
+    , "          --class unikernel|general-purpose"
+    , "                                    runtime class (default $YOLO_CLASS, else unikernel)"
+    , "Session state lives in $YOLO_STATE (~/.local/state/yolo/sessions)."
+    ]
 
-cmd_attach() {
-  local name=${1:?usage: yolo attach NAME [args...]}; shift
-  load_backend "$(session_backend "$name")"
-  backend_attach "$name" "$@"
-}
+main :: IO ()
+main = do
+  root <- yoloRoot
+  args <- getArgs
+  let isHelp = (`elem` ["help", "-h", "--help"])
+  unless (maybe True isHelp (listToMaybe args)) migrateAgentSandboxState
+  case args of
+    "new" : rest -> cmdNew root rest
+    "attach" : rest -> cmdAttach root rest
+    "ssh" : rest -> cmdAttach root rest
+    ["ls"] -> cmdLs root
+    "logs" : rest -> cmdLogs root rest
+    ["rm", name] -> cmdRm root name
+    "build" : rest -> cmdBuild root rest
+    ["sync-pins"] -> syncPins root
+    [h] | isHelp h -> putStr usage
+    _ -> hPutStr stderr usage >> exitWith (ExitFailure 2)
 
-cmd_logs() {
-  local name=${1:?usage: yolo logs NAME [args...]}; shift
-  load_backend "$(session_backend "$name")"
-  backend_logs "$name" "$@"
-}
+-- The repository: this script's directory, through any symlinks to it.
+yoloRoot :: IO FilePath
+yoloRoot = takeDirectory <$> canonicalizePath $(location >>= lift . loc_filename)
 
-cmd_rm() {
-  local name=${1:?usage: yolo rm NAME}
-  load_backend "$(session_backend "$name")"
-  backend_rm "$name"
-}
+----------------------------------------------------------------------------
+-- Commands
 
-cmd_ls() {
-  local d n b used=''
-  printf '%-20s %-8s %-9s %s\n' SESSION BACKEND HARNESS CLASS
-  for d in "$YOLO_STATE"/*/; do
-    [ -d "$d" ] || continue
-    n=$(basename "$d"); b=$(cat "$d/backend" 2>/dev/null || echo '?')
-    printf '%-20s %-8s %-9s %s\n' "$n" "$b" "$(cat "$d/harness" 2>/dev/null || echo '?')" \
-      "$(cat "$d/class" 2>/dev/null || echo -)"
-    case " $used " in *" $b "*) ;; *) used+=" $b" ;; esac
-  done
-  for b in $used; do
-    [ "$b" = '?' ] && continue
-    echo; echo "== $b"
-    ( load_backend "$b"; backend_ls )
-  done
-}
+cmdNew :: FilePath -> [String] -> IO ()
+cmdNew root = \case
+  [] -> die "usage: yolo new NAME [--backend docker|datum] [--agent HARNESS] [options]"
+  name : rest0 -> do
+    backend0 <- opt "BACKEND" "docker"
+    harness0 <- opt "AGENT" "claude"
+    let go b h acc = \case
+          "--backend" : v : r -> go v h acc r
+          "--agent" : v : r -> go b v acc r
+          x : r -> go b h (acc ++ [x]) r
+          [] -> (b, h, acc)
+        (backend, harness, rest) = go backend0 harness0 [] rest0
+    checkHarness harness
+    _ <- sessionDir name
+    b <- loadBackend root backend
+    bNew b name harness rest
 
-cmd_build() {
-  local backend; backend=$(opt BACKEND docker)
-  local harnesses=() h class=()
-  while [ $# -gt 0 ]; do
-    case $1 in
-      --backend) backend=$2; shift 2 ;;
-      --class) class=(--class "$2"); shift 2 ;;
-      *) check_harness "$1"; harnesses+=("$1"); shift ;;
-    esac
-  done
-  [ ${#harnesses[@]} -gt 0 ] || die "usage: yolo build HARNESS... [--backend docker|datum]"
-  case $backend in
-    datum) exec "$YOLO_ROOT/image/build-image" "${class[@]}" "${harnesses[@]}" ;;
-    docker) [ ${#class[@]} -eq 0 ] || die "--class is for the datum backend"
-            load_backend docker; for h in "${harnesses[@]}"; do docker_build "$h"; done ;;
-    *) die "unknown backend '$backend'" ;;
-  esac
-}
+cmdAttach :: FilePath -> [String] -> IO ()
+cmdAttach root = \case
+  [] -> die "usage: yolo attach NAME [args...]"
+  name : rest -> sessionBackend name >>= loadBackend root >>= \b -> bAttach b name rest
 
-case ${1:-} in
-  help|-h|--help|'') ;;
-  *) migrate_agent_sandbox_state ;;
-esac
+cmdLogs :: FilePath -> [String] -> IO ()
+cmdLogs root = \case
+  [] -> die "usage: yolo logs NAME [args...]"
+  name : rest -> sessionBackend name >>= loadBackend root >>= \b -> bLogs b name rest
 
-case ${1:-} in
-  new|attach|ls|logs|rm|build) c=$1; shift; "cmd_$c" "$@" ;;
-  ssh) shift; cmd_attach "$@" ;;
-  help|-h|--help) usage 0 ;;
-  *) usage ;;
-esac
+cmdRm :: FilePath -> String -> IO ()
+cmdRm root name = sessionBackend name >>= loadBackend root >>= \b -> bRm b name
+
+cmdLs :: FilePath -> IO ()
+cmdLs root = do
+  st <- yoloState
+  names <- sort <$> (listDirectory st `orElse` [])
+  dirs <- filterM (doesDirectoryExist . (st </>)) names
+  printf "%-20s %-8s %-9s %s\n" "SESSION" "BACKEND" "HARNESS" "CLASS" :: IO ()
+  backends <- forM dirs $ \n -> do
+    b <- readMeta (st </> n </> "backend") "?"
+    h <- readMeta (st </> n </> "harness") "?"
+    c <- readMeta (st </> n </> "class") "-"
+    printf "%-20s %-8s %-9s %s\n" n b h c :: IO ()
+    pure b
+  forM_ (filter (/= "?") (nub backends)) $ \b -> do
+    putStrLn ""
+    putStrLn ("== " ++ b)
+    hFlush stdout
+    loadBackend root b >>= bLs
+
+cmdBuild :: FilePath -> [String] -> IO ()
+cmdBuild root args0 = do
+  backend0 <- opt "BACKEND" "docker"
+  let go b c hs = \case
+        "--backend" : v : r -> go v c hs r
+        "--class" : v : r -> go b (Just v) hs r
+        h : r -> go b c (hs ++ [h]) r
+        [] -> (b, c, hs)
+      (backend, cls, hs0) = go backend0 Nothing [] args0
+  mapM_ checkHarness hs0
+  when (null hs0) $ die "usage: yolo build HARNESS... [--backend docker|datum] [--class CLASS]"
+  case backend of
+    "datum" -> buildDatum root (fromMaybe "unikernel" cls) hs0
+    "docker" -> do
+      when (isJust cls) $ die "--class is for the datum backend"
+      d <- dockerConfig
+      mapM_ (dockerBuild root d) hs0
+    _ -> die ("unknown backend '" ++ backend ++ "'")
+
+----------------------------------------------------------------------------
+-- Sessions
+
+-- What a backend implements. A new backend is a new value of this type plus
+-- its name in loadBackend.
+data Backend = Backend
+  { bNew :: String -> String -> [String] -> IO () -- NAME HARNESS options
+  , bAttach :: String -> [String] -> IO () -- shell, or run a command
+  , bLs :: IO ()
+  , bLogs :: String -> [String] -> IO ()
+  , bRm :: String -> IO () -- save workspaces, then delete
+  }
+
+loadBackend :: FilePath -> String -> IO Backend
+loadBackend root = \case
+  "docker" -> dockerBackend root
+  "datum" -> datumBackend root
+  b -> die ("unknown backend '" ++ b ++ "' (docker or datum)")
+
+harnesses :: [String]
+harnesses = ["claude", "gemini", "codex", "opencode", "pi"]
+
+checkHarness :: String -> IO ()
+checkHarness h =
+  unless (h `elem` harnesses) $ die ("unknown harness '" ++ h ++ "' (have: " ++ unwords harnesses ++ ")")
+
+stateHome :: IO FilePath
+stateHome = do
+  x <- envNonEmpty "XDG_STATE_HOME"
+  home <- getHomeDirectory
+  pure (fromMaybe (home </> ".local/state") x)
+
+defaultState :: IO FilePath
+defaultState = (</> "yolo/sessions") <$> stateHome
+
+yoloState :: IO FilePath
+yoloState = envNonEmpty "YOLO_STATE" >>= maybe defaultState pure
+
+sessionDir :: String -> IO FilePath
+sessionDir name = do
+  let ok c = isAsciiLower c || isDigit c
+      valid =
+        length name <= 40 && all (\c -> ok c || c == '-') name
+          && maybe False (ok . fst) (uncons name) && maybe False (ok . fst) (uncons (reverse name))
+  unless valid $ die "name must be lowercase letters, digits and '-', at most 40 chars"
+  (</> name) <$> yoloState
+
+sessionBackend :: String -> IO String
+sessionBackend name = do
+  dir <- sessionDir name
+  e <- doesFileExist (dir </> "backend")
+  unless e $ die ("no session " ++ name ++ " (yolo ls)")
+  readMeta (dir </> "backend") "?"
+
+-- The session's directory, mode 700, with its backend and harness recorded.
+sessionCreate :: String -> String -> String -> IO FilePath
+sessionCreate name backend harness = do
+  dir <- sessionDir name
+  e <- doesPathExist dir
+  when e $ die ("session " ++ name ++ " exists (" ++ dir ++ "); yolo rm " ++ name ++ " first")
+  createDirectoryIfMissing True dir
+  setFileMode dir 0o700
+  writeFile (dir </> "backend") (backend ++ "\n")
+  writeFile (dir </> "harness") (harness ++ "\n")
+  pure dir
+
+-- Sessions created by agent-sandbox (Datum only) move here once; the old
+-- directory becomes a symlink to the new one. Skipped when YOLO_STATE is
+-- overridden.
+migrateAgentSandboxState :: IO ()
+migrateAgentSandboxState = do
+  st <- yoloState
+  def <- defaultState
+  old <- (</> "agent-sandbox") <$> stateHome
+  isDir <- doesDirectoryExist old
+  isLink <- pathIsSymbolicLink old `orElse` False
+  when (st == def && isDir && not isLink) $ do
+    createDirectoryIfMissing True st
+    ns <- listDirectory old
+    forM_ ns $ \n -> do
+      d <- doesDirectoryExist (old </> n)
+      when d $ do
+        taken <- doesPathExist (st </> n)
+        when taken $ die ("can't migrate " ++ n ++ ": " ++ st </> n ++ " exists")
+        renameDirectory (old </> n) (st </> n)
+        writeFile (st </> n </> "backend") "datum\n"
+        hPutStrLn stderr ("yolo: moved agent-sandbox session " ++ n ++ " to " ++ st)
+    removeDirectory old
+    createDirectoryLink st old
+
+----------------------------------------------------------------------------
+-- The datum backend: sessions on Datum Compute, reached by SSH over iroh.
+--
+-- Each session gets a fresh iroh secret and SSH host key generated here,
+-- stored in a per-session Datum Secret (agent-NAME) and in the session
+-- directory. The client derives the iroh ticket from the secret and pins the
+-- host key, so nothing is read from instance logs and there is no
+-- trust-on-first-use. Every key in the Secret agent-providers is passed to
+-- the session as a variable of the same name (only key names are read here).
+-- If the Secret agent-home exists, every session mounts the same JuiceFS
+-- volume as HOME. See docs/datum.md.
+
+data Datum = Datum
+  { dImages :: FilePath -- unikernel images, one per harness
+  , dGpImages :: FilePath -- general-purpose (standard OCI) images
+  , dUser :: String -- login user in the sandbox; root also works
+  , dForwardAgent :: Bool -- forward the local agent while connected, for git over SSH
+  , dPullSecret :: String
+  , dLocation :: String
+  , dNetwork :: String
+  , dInstanceType :: String
+  , dClass :: String -- unikernel, or general-purpose
+  , dRelay :: String -- the relay instances have chosen in every run so far (n0 use1)
+  , dHomeSecret :: String
+  , dProvidersSecret :: String
+  , dJfsOpts :: String -- extra `juicefs mount` options for the shared home
+  }
+
+datumBackend :: FilePath -> IO Backend
+datumBackend root = do
+  -- Datum production (api.datum.net), project drewr-y4nd1b; an explicit
+  -- session wins.
+  s <- firstEnv ["YOLO_DATUM_SESSION", "AGENT_SANDBOX_DATUM_SESSION", "DATUM_SESSION"]
+  setEnv "DATUM_SESSION" (fromMaybe "aaraines@gmail.com@api.datum.net" s)
+  d <-
+    Datum
+      <$> opt "IMAGES" (root </> "image/images")
+      <*> opt "GP_IMAGES" (root </> "image/images-general-purpose")
+      <*> opt "USER" "drewr"
+      <*> ((== "1") <$> opt "FORWARD_AGENT" "1")
+      <*> opt "PULL_SECRET" "ghcr-drewr"
+      <*> opt "LOCATION" "us-east-1"
+      <*> opt "NETWORK" "default"
+      <*> opt "INSTANCE_TYPE" "datumcloud/d1-standard-2"
+      <*> opt "CLASS" "unikernel"
+      <*> opt "RELAY" "https://use1-1.relay.n0.iroh.link./"
+      <*> opt "HOME_SECRET" "agent-home"
+      <*> opt "PROVIDERS_SECRET" "agent-providers"
+      <*> opt "JFS_OPTS" ""
+  pure
+    Backend
+      { bNew = datumNew d
+      , bAttach = \name args -> do
+          (ssh, sshArgs) <- datumSsh d name args
+          executeFile ssh True sshArgs Nothing
+      , bLs = do
+          (_, out, _) <- readProcessWithExitCode "datumctl" ["compute", "workloads"] ""
+          let ls = lines out
+          mapM_ putStrLn (take 1 ls ++ filter ("agent-" `isPrefixOf`) (drop 1 ls))
+      , bLogs = \name args -> rawSystem "datumctl" (["compute", "logs", "agent-" ++ name] ++ args) >>= exitWith
+      , bRm = datumRm d
+      }
+
+datumNew :: Datum -> String -> String -> [String] -> IO ()
+datumNew d name harness opts0 = do
+  let go k h c = \case
+        "--key" : v : r -> go (Just v) h c r
+        "--no-home" : r -> go k False c r
+        "--class" : v : r -> go k h v r
+        o : _ -> Left ("datum: unknown option " ++ o)
+        [] -> Right (k, h, c)
+  (key, wantHome, cls) <- either die pure (go Nothing True (dClass d) opts0)
+  unless (cls `elem` ["unikernel", "general-purpose"]) $
+    die ("datum: unknown class '" ++ cls ++ "' (unikernel or general-purpose)")
+  homeOk <- (== ExitSuccess) <$> quiet "datumctl" ["get", "secret", dHomeSecret d]
+  home <-
+    if wantHome && not homeOk
+      then hPutStrLn stderr ("yolo: no Secret " ++ dHomeSecret d ++ "; this session's HOME is ephemeral") >> pure False
+      else pure wantHome
+  let images = if cls == "general-purpose" then dGpImages d else dImages d
+  image <-
+    opt "IMAGE" "" >>= \case
+      "" -> lookupImage images harness
+      i -> pure (Just i)
+  img <-
+    maybe
+      (die ("no " ++ cls ++ " image for harness '" ++ harness ++ "' in " ++ images ++ " (yolo build " ++ harness ++ " --backend datum --class " ++ cls ++ ")"))
+      pure
+      image
+  dir <- sessionCreate name "datum" harness
+  writeFile (dir </> "class") (cls ++ "\n")
+
+  -- Session keys, readable only by this user.
+  keys <- withUmask 0o077 $ do
+    secret <- B16.encode <$> (getRandomBytes 32 :: IO B.ByteString)
+    B.writeFile (dir </> "iroh_secret") (secret <> BC.pack "\n")
+    ticket <- endpointTicket (dRelay d) (BC.unpack secret)
+    writeFile (dir </> "ticket") (ticket ++ "\n")
+    _ <- quiet "ssh-keygen" ["-q", "-t", "ed25519", "-N", "", "-C", "agent-" ++ name, "-f", dir </> "host_key"]
+    pub <- words <$> readFile (dir </> "host_key.pub")
+    writeFile (dir </> "known_hosts") (unwords (("agent-" ++ name) : take 2 pub) ++ "\n")
+    ks <- authorizedKeys key
+    forM_ ks (writeFile (dir </> "authorized_keys"))
+    -- A --key FILE.pub with its private key beside it is also the identity.
+    forM_ key $ \k -> do
+      let priv = take (length k - 4) k
+      hasPriv <- doesFileExist priv
+      when (".pub" `isSuffixOf` k && hasPriv) $
+        canonicalizePath priv >>= writeFile (dir </> "identity") . (++ "\n")
+    pure ks
+  ticketOk <- ("endpoint" `isPrefixOf`) <$> readMeta (dir </> "ticket") ""
+  unless ticketOk $ removePathForcibly dir >> die "could not derive the iroh ticket"
+  either (\e -> removePathForcibly dir >> die (e ++ "; session not created")) (const (pure ())) keys
+
+  secretHex <- readMeta (dir </> "iroh_secret") ""
+  authorized <- B.readFile (dir </> "authorized_keys")
+  hostKey <- B.readFile (dir </> "host_key")
+  apply "the session Secret" $
+    unlines
+      [ "apiVersion: v1"
+      , "kind: Secret"
+      , "metadata:"
+      , "  name: agent-" ++ name
+      , "type: Opaque"
+      , "stringData:"
+      , "  IROH_SECRET: \"" ++ secretHex ++ "\""
+      , "  AUTHORIZED_KEYS_B64: \"" ++ BC.unpack (B64.encode authorized) ++ "\""
+      , "  SSH_HOST_KEY_B64: \"" ++ BC.unpack (B64.encode hostKey) ++ "\""
+      ]
+
+  providerKeys <- datumProviderKeyNames d
+  pubkey <- pubFromSecretHex secretHex
+  let fromSecret s k =
+        [ "                - name: " ++ k
+        , "                  valueFrom:"
+        , "                    secretKeyRef: { name: " ++ s ++ ", key: " ++ k ++ " }"
+        ]
+      value k v =
+        [ "                - name: " ++ k
+        , "                  value: " ++ v
+        ]
+      -- What the shared home's FUSE mount needs outside the unikernel class.
+      caps =
+        [ "              securityContext:"
+        , "                capabilities:"
+        , "                  add: [SYS_ADMIN, MKNOD, CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, NET_BIND_SERVICE, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT]"
+        ]
+  apply "the Workload" . unlines $
+    [ "apiVersion: compute.datumapis.com/v1alpha"
+    , "kind: Workload"
+    , "metadata:"
+    , "  name: agent-" ++ name
+    , "  labels:"
+    , "    agent-sandbox: \"true\""
+    , "    agent-harness: " ++ harness
+    , "spec:"
+    , "  template:"
+    , "    spec:"
+    , "      runtime:"
+    , "        class: " ++ cls
+    , "        resources:"
+    , "          instanceType: " ++ dInstanceType d
+    , "        sandbox:"
+    , "          imagePullSecrets:"
+    , "            - name: " ++ dPullSecret d
+    , "          containers:"
+    , "            - name: agent"
+    , "              image: " ++ img
+    ]
+      ++ (if cls == "general-purpose" then caps else [])
+      ++ ["              env:"]
+      ++ value "YOLO_MODE" "datum"
+      ++ value "SESSION_NAME" name
+      ++ value "JFS_MOUNT_OPTS" (show (dJfsOpts d))
+      ++ value "ENDPOINT_DNS" ("_iroh." ++ zbase32 pubkey ++ ".dns.iroh.link")
+      ++ concatMap (fromSecret ("agent-" ++ name)) ["IROH_SECRET", "AUTHORIZED_KEYS_B64", "SSH_HOST_KEY_B64"]
+      -- One secretKeyRef per provider key (the unikernel class has no envFrom).
+      ++ value "PROVIDER_KEYS" (show (unwords providerKeys))
+      ++ concatMap (fromSecret (dProvidersSecret d)) providerKeys
+      ++ (if home then concatMap (fromSecret (dHomeSecret d)) ["META_TICKET", "META_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] else [])
+      ++ [ "      networkInterfaces:"
+         , "        - network:"
+         , "            name: " ++ dNetwork d
+         , "  placements:"
+         , "    - name: default"
+         , "      locations:"
+         , "        - name: " ++ dLocation d
+         , "      scaleSettings:"
+         , "        minReplicas: 1"
+         ]
+  hPutStrLn stderr ("created agent-" ++ name ++ " (" ++ harness ++ ": " ++ img ++ "); waiting for SSH...")
+  t0 <- getCurrentTime
+  let wait = do
+        (ssh, args) <- datumSsh d name ["-o", "ConnectTimeout=20", "-o", "BatchMode=yes", "true"]
+        ok <- (== ExitSuccess) <$> quiet ssh args
+        n <- secondsSince t0
+        unless ok $ do
+          when (n >= 300) $ die ("no SSH after 5 min; try: yolo logs " ++ name)
+          threadDelay 10000000 >> wait
+  wait
+  n <- secondsSince t0
+  hPutStrLn stderr ("ready after " ++ show n ++ "s: yolo attach " ++ name)
+
+-- ssh and its arguments for the session. Options go before the destination;
+-- anything after "--", or from the first non-option on, is the command.
+datumSsh :: Datum -> String -> [String] -> IO (FilePath, [String])
+datumSsh d name args = do
+  dir <- sessionDir name
+  hasTicket <- doesFileExist (dir </> "ticket")
+  unless hasTicket $ die ("no local state for " ++ name)
+  ticket <- readMeta (dir </> "ticket") ""
+  identity <- readFileMaybe (dir </> "identity")
+  let split acc = \case
+        "--" : r -> (acc, r)
+        o : v : r | o `elem` ["-o", "-L", "-R", "-D", "-i"] -> split (acc ++ [o, v]) r
+        o : r | "-" `isPrefixOf` o -> split (acc ++ [o]) r
+        r -> (acc, r)
+      (opts, cmd) = split [] args
+      idOpts = maybe [] (\i -> ["-i", trim i, "-o", "IdentitiesOnly=yes"]) identity
+      fwd = if dForwardAgent d then ["-o", "ForwardAgent=yes"] else []
+  pure
+    ( "ssh"
+    , [ "-o", "ProxyCommand=dumbpipe connect " ++ ticket ++ " 2>/dev/null"
+      , "-o", "UserKnownHostsFile=" ++ dir </> "known_hosts"
+      , "-o", "HostKeyAlias=agent-" ++ name
+      , "-o", "StrictHostKeyChecking=yes"
+      , "-o", "ServerAliveInterval=30"
+      ]
+        ++ idOpts ++ fwd ++ opts ++ [dUser d ++ "@agent-" ++ name] ++ cmd
+    )
+
+datumRm :: Datum -> String -> IO ()
+datumRm d name = do
+  dir <- sessionDir name
+  -- Persist RAM workspaces (/work) to the shared home and release their locks
+  -- before the instance goes, so another session can open them right away.
+  hasTicket <- doesFileExist (dir </> "ticket")
+  when hasTicket $ do
+    (ssh, args) <- datumSsh d name ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", "HOME=/home/agent; [ -d /work ] && ws close --all"]
+    quiet ssh args >>= \case
+      ExitSuccess -> hPutStrLn stderr "workspaces saved"
+      _ -> hPutStrLn stderr ("yolo: could not save workspaces of " ++ name)
+  forM_ ["workload", "secret"] $ \kind -> do
+    -- The outcome: stdout's last line ("... deleted"), else the error.
+    (_, out, err) <- readProcessWithExitCode "datumctl" ["delete", kind, "agent-" ++ name] ""
+    mapM_ putStrLn (lastLine out <|> lastLine err)
+  removePathForcibly dir
+
+-- Key names in the providers Secret that are valid variable names. Values
+-- are never read here.
+datumProviderKeyNames :: Datum -> IO [String]
+datumProviderKeyNames d = do
+  (code, out, _) <- readProcessWithExitCode "datumctl" ["get", "secret", dProvidersSecret d, "-o", "json"] ""
+  let keys = case A.decodeStrict (BC.pack out) of
+        Just (A.Object o) | code == ExitSuccess, Just (A.Object dat) <- KM.lookup (K.fromString "data") o -> map K.toString (KM.keys dat)
+        _ -> []
+  pure (filter isVarName keys)
+
+apply :: String -> String -> IO ()
+apply what yaml = do
+  (code, _, err) <- readProcessWithExitCode "datumctl" ["apply", "-f", "-"] yaml
+  unless (code == ExitSuccess) $ die ("could not apply " ++ what ++ ": " ++ trim err)
+
+lookupImage :: FilePath -> String -> IO (Maybe String)
+lookupImage file harness = do
+  ls <- maybe [] lines <$> readFileMaybe file
+  pure (listToMaybe [i | h : i : _ <- map words ls, h == harness])
+
+----------------------------------------------------------------------------
+-- Keys and iroh tickets
+
+-- The iroh endpoint public key for a hex ed25519 secret.
+pubFromSecretHex :: String -> IO B.ByteString
+pubFromSecretHex hex = do
+  raw <- either (const (die "bad iroh secret")) pure (B16.decode (BC.pack (trim hex)))
+  sk <- throwCryptoErrorIO (Ed.secretKey raw)
+  pure (BA.convert (Ed.toPublic sk))
+
+-- 5-bit groups over the bytes, zero-padded at the end (base32 without '=').
+encode5 :: String -> B.ByteString -> String
+encode5 alphabet bytes = map (\g -> alphabet !! foldl (\a b -> a * 2 + fromEnum b) 0 g) (groups padded)
+  where
+    bits = concatMap (\w -> [testBit w i | i <- [7, 6 .. 0]]) (B.unpack bytes)
+    padded = bits ++ replicate ((5 - length bits `mod` 5) `mod` 5) False
+    groups [] = []
+    groups xs = take 5 xs : groups (drop 5 xs)
+
+-- z-base-32 label for iroh's DNS discovery name _iroh.<label>.dns.iroh.link.
+zbase32 :: B.ByteString -> String
+zbase32 = encode5 "ybndrfg8ejkmcpqxot1uwisza345h769"
+
+-- An iroh endpoint ticket that carries the relay URL, so the client dials the
+-- relay directly instead of depending on DNS discovery, which instances have
+-- failed to publish to (docs/datum.md). Wire format, as decoded from dumbpipe
+-- tickets: 00 | pubkey(32) | n_addrs | 00 len url.
+endpointTicket :: String -> String -> IO String
+endpointTicket relay secretHex = do
+  when (length relay >= 128) $ die "relay URL too long"
+  pub <- pubFromSecretHex secretHex
+  let url = BC.pack relay
+      bytes = B.concat [B.singleton 0, pub, B.pack [1, 0, fromIntegral (B.length url)], url]
+  pure ("endpoint" ++ encode5 "abcdefghijklmnopqrstuvwxyz234567" bytes)
+
+-- Public keys to authorize: FILE if given, else the SSH agent's, else
+-- ~/.ssh/id_*.pub. Never empty: a session nobody can log in to is useless.
+-- The agent query has a timeout because forwarded agents can stall.
+authorizedKeys :: Maybe FilePath -> IO (Either String String)
+authorizedKeys mfile = do
+  keys <- case mfile of
+    Just f -> readFile f
+    Nothing -> do
+      r <- timeout 10000000 (try (readProcessWithExitCode "ssh-add" ["-L"] ""))
+      let agentKeys = case r of
+            Just (Right (_, out, _)) -> unlines (filter ("ssh-" `isPrefixOf`) (lines out))
+            Just (Left e) -> const "" (e :: IOException)
+            Nothing -> ""
+      if not (null agentKeys)
+        then pure agentKeys
+        else do
+          home <- getHomeDirectory
+          found <- filterM doesFileExist [home </> ".ssh" </> f | f <- ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]]
+          maybe (pure "") readFile (listToMaybe found)
+  pure $
+    if any ("ssh-" `isPrefixOf`) (lines keys)
+      then Right (unlines (lines keys))
+      else Left "no public key to authorize: load one into ssh-agent (is it responding?) or pass --key FILE"
+
+----------------------------------------------------------------------------
+-- The docker backend: long-lived local containers (docker or podman) running
+-- the same per-harness image as Datum, in local mode.
+--
+-- - Container yolo-NAME, image yolo/HARNESS:local (built on first use, or
+--   with `yolo build HARNESS`).
+-- - HOME is $YOLO_DOCKER_HOME (~/.local/share/yolo/home), shared by every
+--   docker session and kept across `yolo rm`. The login user takes your uid.
+-- - Provider keys: $YOLO_PROVIDERS_ENV (~/.config/yolo/providers.env;
+--   KEY=value lines, keep it 0600), if it exists.
+-- - Git: GIT_NAME, GIT_EMAIL, GIT_SIGNING_KEY and GITHUB_TOKEN are passed in.
+-- - SSH agent: while you're attached, a socat relay in the session directory
+--   connects the container to your current $SSH_AUTH_SOCK
+--   (YOLO_FORWARD_AGENT=0 turns it off). Podman on macOS can't share sockets
+--   with the VM (VirtioFS), so there, or whenever SSH_PRIVATE_KEY_FILE (a key
+--   path) or SSH_PRIVATE_KEY (base64 key) is set, the key is mounted
+--   read-only instead and loaded into an agent inside the session. It must
+--   have no passphrase.
+-- - ~/.ssh/allowed_signers, if present, is copied in for git signature checks.
+
+data Docker = Docker
+  { rt :: String -- docker or podman
+  , dkHome :: FilePath
+  , dkProvidersEnv :: FilePath
+  , dkForwardAgent :: Bool
+  , dkUser :: String
+  }
+
+dockerConfig :: IO Docker
+dockerConfig = do
+  explicit <- firstEnv ["YOLO_RUNTIME", "CONTAINER_RUNTIME"]
+  runtime <- case explicit of
+    Just r -> pure r
+    Nothing -> do
+      found <- filterM (fmap isJust . findExecutable) ["docker", "podman"]
+      maybe (die "docker: neither docker nor podman found in PATH") pure (listToMaybe found)
+  home <- getHomeDirectory
+  dataHome <- fromMaybe (home </> ".local/share") <$> envNonEmpty "XDG_DATA_HOME"
+  configHome <- fromMaybe (home </> ".config") <$> envNonEmpty "XDG_CONFIG_HOME"
+  let homeDefault
+        | os == "darwin" = home </> "Library/Application Support/yolo/home"
+        | otherwise = dataHome </> "yolo/home"
+  Docker runtime
+    <$> opt "DOCKER_HOME" homeDefault
+    <*> opt "PROVIDERS_ENV" (configHome </> "yolo/providers.env")
+    <*> ((== "1") <$> opt "FORWARD_AGENT" "1")
+    <*> opt "USER" "drewr"
+
+dockerImage :: String -> String
+dockerImage h = "yolo/" ++ h ++ ":local"
+
+-- Podman machine on macOS shares host files over VirtioFS, which can't carry
+-- Unix sockets, so the agent relay can't reach the container.
+noSocketRelay :: Docker -> Bool
+noSocketRelay d = rt d == "podman" && os == "darwin"
+
+-- yolo/HARNESS:local from image/, with the same Dockerfile Datum uses.
+dockerBuild :: FilePath -> Docker -> String -> IO ()
+dockerBuild root d h = do
+  hPutStrLn stderr ("yolo: building " ++ dockerImage h)
+  code <- rawSystem (rt d) ["build", "--build-arg", "HARNESS=" ++ h, "-t", dockerImage h, "-f", root </> "image/Dockerfile", root </> "image"]
+  unless (code == ExitSuccess) $ die ("docker: could not build " ++ dockerImage h)
+
+dockerBackend :: FilePath -> IO Backend
+dockerBackend root = do
+  d <- dockerConfig
+  pure
+    Backend
+      { bNew = dockerNew root d
+      , bAttach = dockerAttach d
+      , bLs = () <$ rawSystem (rt d) ["ps", "-a", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
+      , bLogs = \name args -> rawSystem (rt d) (["logs"] ++ args ++ ["yolo-" ++ name]) >>= exitWith
+      , bRm = \name -> do
+          dir <- sessionDir name
+          -- Workspaces are bind mounts and HOME is on the host: nothing to save.
+          code <- quiet (rt d) ["rm", "-f", "yolo-" ++ name]
+          when (code == ExitSuccess) $ hPutStrLn stderr ("removed yolo-" ++ name)
+          removePathForcibly dir
+      }
+
+dockerNew :: FilePath -> Docker -> String -> String -> [String] -> IO ()
+dockerNew root d name harness opts0 = do
+  let parse acc = \case
+        v : m : r | v `elem` ["-v", "--volume"] -> do
+          let host = takeWhile (/= ':') m
+          e <- doesPathExist host
+          unless e $ die ("docker: " ++ host ++ " does not exist")
+          real <- canonicalizePath host
+          parse (acc ++ ["-v", real ++ dropWhile (/= ':') m]) r
+        o : _ -> die ("docker: unknown option " ++ o)
+        [] -> pure acc
+  mounts <- parse [] opts0
+  let image = dockerImage harness
+  present <- (== ExitSuccess) <$> quiet (rt d) ["image", "inspect", image]
+  unless present $ dockerBuild root d harness
+  createDirectoryIfMissing True (dkHome d)
+  dir <- sessionCreate name "docker" harness
+  createDirectoryIfMissing True (dir </> "agent")
+  let failNew :: String -> IO a
+      failNew msg = removePathForcibly dir >> die msg
+
+  -- SSH: relay the host agent at attach, or inject a key (see above).
+  keyB64 <- envNonEmpty "SSH_PRIVATE_KEY"
+  keyFile <- envNonEmpty "SSH_PRIVATE_KEY_FILE"
+  keyMount <- case (keyB64, keyFile) of
+    (Just b64, _) -> case B64.decode (BC.filter (not . isSpace) (BC.pack b64)) of
+      Left _ -> failNew "docker: SSH_PRIVATE_KEY is not valid base64"
+      Right key -> do
+        withUmask 0o077 (B.writeFile (dir </> "ssh_key") key)
+        pure ["-v", dir </> "ssh_key" ++ ":/run/yolo-key/id:ro"]
+    (_, Just f) -> do
+      ok <- (readable <$> getPermissions f) `orElse` False
+      unless ok $ failNew ("docker: cannot read " ++ f)
+      real <- canonicalizePath f
+      pure ["-v", real ++ ":/run/yolo-key/id:ro"]
+    _ -> do
+      when (noSocketRelay d) $
+        hPutStrLn stderr ("yolo: " ++ rt d ++ " on macOS can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session")
+      pure []
+  unless (null keyMount) $ writeFile (dir </> "ssh_key_mode") ""
+  -- Copied rather than bind-mounted: it is often a symlink into /nix/store,
+  -- which a podman machine VM can't see.
+  home <- getHomeDirectory
+  hasSigners <- doesFileExist (home </> ".ssh/allowed_signers")
+  signers <-
+    if hasSigners
+      then do
+        copyFile (home </> ".ssh/allowed_signers") (dir </> "allowed_signers")
+        pure ["-v", dir </> "allowed_signers" ++ ":/etc/ssh/allowed_signers:ro"]
+      else pure []
+
+  uid <- getRealUserID
+  gid <- getRealGroupID
+  git <- filterM (fmap isJust . envNonEmpty) ["GIT_NAME", "GIT_EMAIL", "GIT_SIGNING_KEY", "GITHUB_TOKEN"]
+  hasProviders <- doesFileExist (dkProvidersEnv d)
+  providers <-
+    if hasProviders
+      then do
+        names <- mapMaybe providerName . lines <$> readFile (dkProvidersEnv d)
+        pure ["--env-file", dkProvidersEnv d, "-e", "PROVIDER_KEYS=" ++ unwords names]
+      else pure []
+  let env =
+        ["-e", "YOLO_MODE=local", "-e", "SESSION_NAME=" ++ name, "-e", "HOST_UID=" ++ show uid, "-e", "HOST_GID=" ++ show gid]
+          ++ concatMap (\v -> ["-e", v]) git
+          ++ providers
+  code <-
+    quiet (rt d) $
+      ["run", "-d", "--name", "yolo-" ++ name, "--hostname", name]
+        ++ env
+        ++ ["-v", dkHome d ++ ":/home/agent", "-v", dir </> "agent" ++ ":/run/yolo-agent"]
+        ++ keyMount ++ signers ++ mounts ++ [image]
+  unless (code == ExitSuccess) $ failNew ("docker: could not start yolo-" ++ name)
+  hPutStrLn stderr ("started yolo-" ++ name ++ " (" ++ harness ++ ": " ++ image ++ "); waiting for init...")
+  t0 <- getCurrentTime
+  let wait = do
+        (_, out, err) <- readProcessWithExitCode (rt d) ["logs", "yolo-" ++ name] ""
+        unless ("[agent] ready" `isInfixOf` (out ++ err)) $ do
+          n <- secondsSince t0
+          when (n >= 120) $ die ("init not ready after 2 min; try: yolo logs " ++ name)
+          threadDelay 1000000 >> wait
+  wait
+  n <- secondsSince t0
+  hPutStrLn stderr ("ready after " ++ show n ++ "s: yolo attach " ++ name)
+  where
+    providerName l = case break (== '=') l of
+      (k, '=' : _) | isVarName k -> Just k
+      _ -> Nothing
+
+dockerAttach :: Docker -> String -> [String] -> IO ()
+dockerAttach d name args = do
+  dir <- sessionDir name
+  tty <- (&&) <$> hIsTerminalDevice stdin <*> hIsTerminalDevice stdout
+  keyMode <- doesFileExist (dir </> "ssh_key_mode")
+  hostSock <- envNonEmpty "SSH_AUTH_SOCK"
+  sockOk <- maybe (pure False) (\s -> (isSocket <$> getFileStatus s) `orElse` False) hostSock
+  term <- fromMaybe "xterm-256color" <$> envNonEmpty "TERM"
+  let sock = dir </> "agent/agent.sock"
+  -- The session's own agent holding an injected key, or else the current SSH
+  -- agent, relayed only while attached.
+  (relay, agentEnv) <-
+    if keyMode
+      then pure (Nothing, ["-e", "SSH_AUTH_SOCK=/run/yolo-ssh/agent.sock"])
+      else case hostSock of
+        Just hs | dkForwardAgent d && sockOk && not (noSocketRelay d) -> do
+          removePathForcibly sock
+          devnull <- openFile "/dev/null" WriteMode
+          (_, _, _, p) <-
+            createProcess
+              (proc "socat" ["UNIX-LISTEN:" ++ sock ++ ",fork,mode=600", "UNIX-CONNECT:" ++ hs])
+                { std_out = UseHandle devnull, std_err = UseHandle devnull }
+          let waitSock n = do
+                up <- fileExist sock
+                unless (up || n == (0 :: Int)) $ threadDelay 100000 >> waitSock (n - 1)
+          waitSock 50
+          pure (Just p, ["-e", "SSH_AUTH_SOCK=/run/yolo-agent/agent.sock"])
+        _ -> pure (Nothing, [])
+  let zsh = if null args then ["zsh", "-l"] else ["zsh", "-lc", unwords args]
+  code <-
+    rawSystem
+      (rt d)
+      ( ["exec", if tty then "-it" else "-i", "-u", dkUser d, "-w", "/home/agent", "-e", "SHELL=/bin/zsh", "-e", "TERM=" ++ term]
+          ++ agentEnv ++ ["yolo-" ++ name] ++ zsh
+      )
+      `finally` (mapM_ terminateProcess relay >> removePathForcibly sock)
+  exitWith code
+
+----------------------------------------------------------------------------
+-- Image builds (datum): on the EC2 build box, over iroh.
+--
+-- unikernel (default): `datumctl compute build` against the box's BuildKit,
+-- pinned in image/images. general-purpose: a standard linux/amd64 image via
+-- buildctl, pinned in image/images-general-purpose and pushed with your
+-- registry login (~/.docker/config.json). Pins llm-agents and nixpkgs to the
+-- dotfiles' revisions first (sync-pins). The box must be running; its ticket
+-- comes from $BUILDBOX_TICKET or ~/.local/state/agent-sandbox-build
+-- (infra/provision buildbox ticket).
+
+buildDatum :: FilePath -> String -> [String] -> IO ()
+buildDatum root cls hs = do
+  (images, tag) <- case cls of
+    "unikernel" -> pure (root </> "image/images", "dev")
+    "general-purpose" -> pure (root </> "image/images-general-purpose", "gp-dev")
+    _ -> die ("unknown class '" ++ cls ++ "' (unikernel or general-purpose)")
+  state <- (</> "agent-sandbox-build") <$> stateHome
+  registry <- fromMaybe "ghcr.io/drewr" <$> envNonEmpty "AGENT_IMAGE_REGISTRY"
+  ticket <-
+    envNonEmpty "BUILDBOX_TICKET" >>= \case
+      Just t -> pure t
+      Nothing ->
+        readFileMaybe (state </> "buildbox-ticket")
+          >>= maybe (die "build: no BUILDBOX_TICKET (infra/provision buildbox ticket)") (pure . trim)
+  port <- fromMaybe "12340" <$> envNonEmpty "BUILDBOX_PORT"
+  createDirectoryIfMissing True (state </> "logs")
+  syncPins root
+  let ctx = root </> "image"
+      buildkit = "tcp://127.0.0.1:" ++ port
+  failures <- newIORef (0 :: Int)
+  withTunnel ticket port $ forM_ hs $ \h -> do
+    let logFile = state </> "logs" </> ("build-" ++ h ++ "-" ++ cls ++ ".log")
+        meta = state </> "logs" </> ("build-" ++ h ++ "-" ++ cls ++ ".json")
+        image = registry ++ "/agent-" ++ h ++ ":" ++ tag
+        repo = registry ++ "/agent-" ++ h
+    t0 <- getCurrentTime
+    removePathForcibly meta
+    code <- withFile logFile WriteMode $ \lh ->
+      if cls == "general-purpose"
+        then
+          runLogged lh "buildctl" $
+            [ "--addr", buildkit, "build", "--progress", "plain"
+            , "--frontend", "dockerfile.v0", "--local", "context=" ++ ctx, "--local", "dockerfile=" ++ ctx
+            , "--opt", "platform=linux/amd64", "--opt", "build-arg:HARNESS=" ++ h
+            , "--output", "type=image,name=" ++ image ++ ",push=true", "--metadata-file", meta
+            ]
+        else runLogged lh "datumctl" ["compute", "build", "--analyze", "--push", "--buildkit-host", buildkit, "-o", image, "--build-arg", "HARNESS=" ++ h, ctx]
+    out <- fromMaybe "" <$> readFileMaybe logFile
+    ref <-
+      if code /= ExitSuccess
+        then pure Nothing
+        else
+          if cls == "general-purpose"
+            then do
+              m <- readFileMaybe meta
+              pure $ case m >>= A.decodeStrict . BC.pack of
+                Just (A.Object o) | Just (A.String dg) <- KM.lookup (K.fromString "containerimage.digest") o -> Just (repo ++ "@" ++ T.unpack dg)
+                _ -> Nothing
+            else pure (lastDigestRef repo out)
+    n <- secondsSince t0
+    case ref of
+      Just r -> do
+        pinImage images cls h r
+        (printf "%s: %s (%ds)\n" h r n :: IO ()) >> hFlush stdout
+      Nothing -> do
+        let errLine = take 200 (fromMaybe "" (lastLine (unlines (filter (("error" `isInfixOf`) . map toLower) (lines out)))))
+        hPrintf stderr "%s: FAILED after %ds: %s (log: %s)\n" h n errLine logFile :: IO ()
+        modifyIORef failures (+ 1)
+  bad <- readIORef failures
+  when (bad > 0) exitFailure
+
+-- A local port forwarded to the build box's BuildKit while `act` runs.
+withTunnel :: String -> String -> IO a -> IO a
+withTunnel ticket port act = do
+  devnull <- openFile "/dev/null" WriteMode
+  bracket
+    ( do
+        (_, _, _, p) <-
+          createProcess
+            (proc "dumbpipe" ["connect-tcp", "--addr", "127.0.0.1:" ++ port, ticket])
+              { std_out = UseHandle devnull, std_err = UseHandle devnull }
+        pure p
+    )
+    terminateProcess
+    ( \_ -> do
+        let up n = do
+              ok <- canConnect port
+              unless (ok || n == (0 :: Int)) $ threadDelay 1000000 >> up (n - 1)
+        up 30
+        act
+    )
+
+canConnect :: String -> IO Bool
+canConnect port = do
+  r <- try $ do
+    addrs <- N.getAddrInfo (Just N.defaultHints {N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just port)
+    case addrs of
+      addr : _ -> bracket (N.openSocket addr) N.close (\s -> N.connect s (N.addrAddress addr))
+      [] -> fail "no address"
+  pure (either (\e -> const False (e :: SomeException)) (const True) r)
+
+runLogged :: Handle -> FilePath -> [String] -> IO ExitCode
+runLogged lh cmd args = do
+  (_, _, _, p) <- createProcess (proc cmd args) {std_out = UseHandle lh, std_err = UseHandle lh}
+  waitForProcess p
+
+-- The last REPO@sha256:... in a build log.
+lastDigestRef :: String -> String -> Maybe String
+lastDigestRef repo out = if null refs then Nothing else Just (last refs)
+  where
+    pre = repo ++ "@sha256:"
+    refs = go out
+    go s
+      | null s = []
+      | pre `isPrefixOf` s = (pre ++ takeWhile isHexDigit (drop (length pre) s)) : go (drop (length pre) s)
+      | otherwise = go (drop 1 s)
+
+-- Replace HARNESS's line in an images file (created with a header).
+pinImage :: FilePath -> String -> String -> String -> IO ()
+pinImage file cls h ref = do
+  old <- readFileMaybe file
+  let header = "# One pinned image per harness for the " ++ cls ++ " class (yolo build HARNESS --backend datum --class " ++ cls ++ ")."
+      kept = filter (\l -> listToMaybe (words l) /= Just h) (maybe [header] lines old)
+  writeFile file (unlines (kept ++ [h ++ replicate (9 - length h) ' ' ++ " " ++ ref]))
+
+-- Pin image/flake.lock's llm-agents and nixpkgs to the revisions the dotfiles
+-- use (d/.config/home-manager/flake.lock in the locked `dotfiles` input), so
+-- the images carry the same harness versions and nixpkgs as a laptop with
+-- these dotfiles. To follow newer dotfiles: nix flake update dotfiles
+-- --flake image, then build.
+syncPins :: FilePath -> IO ()
+syncPins root = do
+  let here = root </> "image"
+      nix = ["--extra-experimental-features", "nix-command flakes"]
+  (code, dotfiles, err) <- readProcessWithExitCode "nix" (nix ++ ["eval", "--raw", here ++ "#lib.dotfiles"]) ""
+  unless (code == ExitSuccess) $ die ("sync-pins: " ++ trim err)
+  dot <- B.readFile (dotfiles </> "d/.config/home-manager/flake.lock")
+  lock <- B.readFile (here </> "flake.lock")
+  let rev l i = fromMaybe "?" (lockedRev l i)
+      (wantA, wantN) = (rev dot "llm-agents", rev dot "nixpkgs")
+      (haveA, haveN) = (rev lock "llm-agents", rev lock "nixpkgs")
+      short = take 7
+  if wantA == haveA && wantN == haveN
+    then printf "sync-pins: already at the dotfiles' pins (llm-agents %s, nixpkgs %s)\n" (short wantA) (short wantN) :: IO ()
+    else do
+      (c, o, e) <-
+        readProcessWithExitCode
+          "nix"
+          (nix ++ ["flake", "lock", here, "--override-input", "llm-agents", "github:numtide/llm-agents.nix/" ++ wantA, "--override-input", "nixpkgs", "github:nixos/nixpkgs/" ++ wantN])
+          ""
+      putStr (unlines (filter (not . ("warning: Git tree" `isPrefixOf`)) (lines (o ++ e))))
+      unless (c == ExitSuccess) $ die "sync-pins: nix flake lock failed"
+      printf "sync-pins: llm-agents %s -> %s, nixpkgs %s -> %s\n" (short haveA) (short wantA) (short haveN) (short wantN) :: IO ()
+  hFlush stdout
+
+-- The locked rev of a root input in a flake.lock.
+lockedRev :: B.ByteString -> String -> Maybe String
+lockedRev lockFile input = do
+  A.Object top <- A.decodeStrict lockFile
+  A.Object nodes <- KM.lookup (K.fromString "nodes") top
+  A.String rootName <- KM.lookup (K.fromString "root") top
+  A.Object rootNode <- KM.lookup (K.fromText rootName) nodes
+  A.Object inputs <- KM.lookup (K.fromString "inputs") rootNode
+  A.String node <- KM.lookup (K.fromString input) inputs
+  A.Object n <- KM.lookup (K.fromText node) nodes
+  A.Object locked <- KM.lookup (K.fromString "locked") n
+  A.String r <- KM.lookup (K.fromString "rev") locked
+  pure (T.unpack r)
+
+----------------------------------------------------------------------------
+-- Helpers
+
+die :: String -> IO a
+die msg = hPutStrLn stderr ("yolo: " ++ msg) >> exitFailure
+
+envNonEmpty :: String -> IO (Maybe String)
+envNonEmpty k = (\v -> if v == Just "" then Nothing else v) <$> lookupEnv k
+
+firstEnv :: [String] -> IO (Maybe String)
+firstEnv ks = foldr (<|>) Nothing <$> mapM envNonEmpty ks
+
+-- $YOLO_NAME, else the old $AGENT_SANDBOX_NAME, else the default.
+opt :: String -> String -> IO String
+opt name def = fromMaybe def <$> firstEnv ["YOLO_" ++ name, "AGENT_SANDBOX_" ++ name]
+
+isVarName :: String -> Bool
+isVarName k = case k of
+  c : _ -> not (isDigit c) && all (\x -> isAlphaNum x || x == '_') k
+  [] -> False
+
+-- Run with output captured and dropped; just the exit code (127 if the
+-- program is missing).
+quiet :: FilePath -> [String] -> IO ExitCode
+quiet cmd args = do
+  r <- try (readProcessWithExitCode cmd args "")
+  pure $ case r of
+    Right (code, _, _) -> code
+    Left e -> const (ExitFailure 127) (e :: IOException)
+
+withUmask :: FileMode -> IO a -> IO a
+withUmask mask act = bracket (setFileCreationMask mask) setFileCreationMask (const act)
+
+readFileMaybe :: FilePath -> IO (Maybe String)
+readFileMaybe f = do
+  r <- try (readFile f >>= \s -> length s `seq` pure s)
+  pure (either (\e -> const Nothing (e :: IOException)) Just r)
+
+readMeta :: FilePath -> String -> IO String
+readMeta f def = maybe def trim <$> readFileMaybe f
+
+orElse :: IO a -> a -> IO a
+orElse act def = either (\e -> const def (e :: IOException)) id <$> try act
+
+trim :: String -> String
+trim = dropWhileEnd isSpace . dropWhile isSpace
+
+lastLine :: String -> Maybe String
+lastLine s = case filter (not . null) (lines s) of
+  [] -> Nothing
+  ls -> Just (last ls)
+
+secondsSince :: UTCTime -> IO Int
+secondsSince t0 = (\t -> floor (diffUTCTime t t0)) <$> getCurrentTime

@@ -5,7 +5,7 @@
   # SSH over iroh; the docker backend runs the host's architecture
   # (x86_64-linux or aarch64-linux). Providers beyond each harness's native
   # ones come from ./providers via agent-providers. llm-agents and nixpkgs
-  # follow the dotfiles' pins (image/sync-pins, run by image/build-image).
+  # follow the dotfiles' pins (`yolo sync-pins`, run by `yolo build`).
   #
   # Every tool ships as its full nix closure at the original /nix/store paths:
   # no patchelf (it can corrupt Bun executables), and wrapBuddy's hardcoded
@@ -17,7 +17,7 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    # Same rev as the dotfiles (image/sync-pins), but on llm-agents' own nixpkgs
+    # Same rev as the dotfiles (`yolo sync-pins`), but on llm-agents' own nixpkgs
     # rather than following ours as the dotfiles do: the harness versions are
     # the same, and only these builds are in cache.numtide.com.
     llm-agents.url = "github:numtide/llm-agents.nix";
@@ -173,7 +173,7 @@
     in builtins.mapAttrs mkRootfs harnesses;
   in {
     packages = nixpkgs.lib.genAttrs systems perSystem;
-    # For sync-pins: the locked dotfiles source.
+    # For `yolo sync-pins`: the locked dotfiles source.
     lib.dotfiles = "${dotfiles}";
   };
 }

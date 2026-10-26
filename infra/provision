@@ -1,0 +1,326 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i runghc -I nixpkgs=https://github.com/NixOS/nixpkgs/archive/02c087f3fe673c9e317f206a627cb6b910336dbe.tar.gz
+#! nix-shell -p "haskellPackages.ghcWithPackages (pkgs: with pkgs; [ ])"
+#! nix-shell -p dumbpipe
+
+-- Provision the NixOS EC2 boxes whose configs live in this repo: the image
+-- build box (infra/buildbox/ec2) and the JuiceFS metadata host for the shared
+-- home (infra/meta/ec2). Idempotent for the security group and IAM role;
+-- `launch` starts a new instance each time, so check `status` first.
+--
+--   infra/provision BOX launch [REV]   REV defaults to HEAD, which must be pushed:
+--                                      the box fetches github:drewr/yolo/REV?dir=CONFIG#ATTR
+--   infra/provision BOX ticket         print the box's dumbpipe ticket (via SSM)
+--   infra/provision BOX ipv6           public IPv6 for the VPC and the running instance
+--   infra/provision BOX start|stop|status|terminate
+--   infra/provision buildbox tunnel [PORT]
+--                                      forward 127.0.0.1:PORT (12340) to the box's
+--                                      BuildKit, for builds outside yolo:
+--                                      datumctl compute build --buildkit-host tcp://127.0.0.1:12340 ...
+--
+-- BOX is buildbox or meta. Uses the aws CLI from PATH with AWS_PROFILE
+-- (default datum-sandbox-admin); TYPE, DISK_GB and IPV6=1 override a box's
+-- defaults.
+
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TemplateHaskell #-}
+
+import Control.Exception (IOException, try)
+import Control.Monad (forM_, unless, when)
+import Data.Bits ((.&.), (.|.))
+import Data.Char (isSpace)
+import Data.List (dropWhileEnd, intercalate)
+import Data.Maybe (fromMaybe)
+import Language.Haskell.TH.Syntax (lift, loc_filename, location)
+import Numeric (readHex, showHex)
+import System.Directory (canonicalizePath, getHomeDirectory, getTemporaryDirectory, removeFile)
+import System.Environment (getArgs, lookupEnv, setEnv)
+import System.Exit (ExitCode (..), exitFailure, exitWith)
+import System.FilePath (takeDirectory, (</>))
+import System.IO (hClose, hPutStr, hPutStrLn, openTempFile, stderr)
+import System.Posix.Process (executeFile)
+import System.Process (readProcessWithExitCode)
+
+data Box = Box
+  { name :: String
+  , region :: String
+  , instanceType :: String
+  , diskGb :: String
+  , config :: String -- the NixOS flake's directory in this repo
+  , attr :: String -- its nixosConfigurations attribute
+  , ticketFile :: String -- where the box writes its dumbpipe ticket
+  , ipv6 :: Bool -- public IPv6 (sets up the VPC once)
+  }
+
+box :: String -> Maybe Box
+box = \case
+  -- 8 GB: the bigger harness images wedged a 4 GB box. The agent image is
+  -- ~4 GB and staged 3-4 times, hence the disk.
+  "buildbox" -> Just (Box "datum-buildbox" "us-east-2" "t3a.large" "64" "infra/buildbox/ec2" "buildbox" "/var/lib/dumbpipe/ticket" False)
+  -- Same metro as Datum us-east-1 (IAD); IPv6 so Datum's IPv6-only sandboxes
+  -- reach it directly over iroh rather than through the relay.
+  "meta" -> Just (Box "agent-meta" "us-east-1" "t3a.small" "16" "infra/meta/ec2" "agentmeta" "/var/lib/agent-meta/ticket" True)
+  _ -> Nothing
+
+nixosAmiOwner :: String
+nixosAmiOwner = "427812963091" -- official NixOS AMIs
+
+main :: IO ()
+main = do
+  args <- getArgs
+  (b0, cmd) <- case args of
+    b : rest | Just bx <- box b -> pure (bx, rest)
+    _ -> usage
+  t <- fromMaybe (instanceType b0) <$> envNonEmpty "TYPE"
+  d <- fromMaybe (diskGb b0) <$> envNonEmpty "DISK_GB"
+  v6 <- maybe (ipv6 b0) (== "1") <$> envNonEmpty "IPV6"
+  let b = b0 {instanceType = t, diskGb = d, ipv6 = v6}
+  profile <- fromMaybe "datum-sandbox-admin" <$> envNonEmpty "AWS_PROFILE"
+  setEnv "AWS_PROFILE" profile
+  setEnv "AWS_REGION" (region b)
+  case cmd of
+    ["launch"] -> launch b Nothing
+    ["launch", rev] -> launch b (Just rev)
+    ["ticket"] -> ticket b >>= putStrLn
+    ["ipv6"] -> do
+      ensureIpv6
+      -- For an instance launched before IPV6=1: give it an address now.
+      i <- instanceId b
+      eni <- aws ["ec2", "describe-instances", "--instance-ids", i, "--query", "Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId", "--output", "text"]
+      aws ["ec2", "assign-ipv6-addresses", "--ipv6-address-count", "1", "--network-interface-id", eni, "--query", "AssignedIpv6Addresses[0]", "--output", "text"] >>= putStrLn
+    ["start"] -> instanceId b >>= \i -> () <$ aws ["ec2", "start-instances", "--instance-ids", i]
+    ["stop"] -> instanceId b >>= \i -> () <$ aws ["ec2", "stop-instances", "--instance-ids", i]
+    ["terminate"] -> instanceId b >>= \i -> () <$ aws ["ec2", "terminate-instances", "--instance-ids", i]
+    [] -> status b
+    ["status"] -> status b
+    "tunnel" : rest | name b == "datum-buildbox", length rest <= 1 -> do
+      let port = case rest of [p] -> p; _ -> "12340"
+      -- The ticket yolo build uses, else the box's own.
+      home <- getHomeDirectory
+      state <- fromMaybe (home </> ".local/state") <$> envNonEmpty "XDG_STATE_HOME"
+      saved <- readFileMaybe (state </> "agent-sandbox-build/buildbox-ticket")
+      tk <- maybe (ticket b) (pure . trim) saved
+      hPutStrLn stderr ("BuildKit at tcp://127.0.0.1:" ++ port ++ " (ctrl-c to close)")
+      executeFile "dumbpipe" True ["connect-tcp", "--addr", "127.0.0.1:" ++ port, tk] Nothing
+    _ -> usage
+
+usage :: IO a
+usage = do
+  hPutStr stderr . unlines $
+    [ "usage: infra/provision buildbox|meta launch [REV] | ticket | ipv6 | start | stop | status | terminate"
+    , "       infra/provision buildbox tunnel [PORT]"
+    ]
+  exitWith (ExitFailure 2)
+
+status :: Box -> IO ()
+status b =
+  aws
+    [ "ec2", "describe-instances", "--filters", "Name=tag:Name,Values=" ++ name b
+    , "--query", "Reservations[].Instances[].[InstanceId,State.Name,InstanceType,Tags[?Key==`rev`]|[0].Value]"
+    , "--output", "table"
+    ]
+    >>= putStrLn
+
+-- The box's instance (any state but terminated), or "" if there is none.
+findInstance :: Box -> IO String
+findInstance b =
+  aws
+    [ "ec2", "describe-instances"
+    , "--filters", "Name=tag:Name,Values=" ++ name b, "Name=instance-state-name,Values=pending,running,stopping,stopped"
+    , "--query", "Reservations[].Instances[].InstanceId", "--output", "text"
+    ]
+
+instanceId :: Box -> IO String
+instanceId b = do
+  i <- findInstance b
+  when (null i) $ die ("no instance named " ++ name b ++ " (infra/provision ... launch)")
+  pure i
+
+ticket :: Box -> IO String
+ticket b = do
+  i <- instanceId b
+  cmd <-
+    aws
+      [ "ssm", "send-command", "--instance-ids", i, "--document-name", "AWS-RunShellScript"
+      , "--parameters", "commands=[\"cat " ++ ticketFile b ++ "\"]"
+      , "--query", "Command.CommandId", "--output", "text"
+      ]
+  _ <- aws ["ssm", "wait", "command-executed", "--command-id", cmd, "--instance-id", i]
+  aws ["ssm", "get-command-invocation", "--command-id", cmd, "--instance-id", i, "--query", "StandardOutputContent", "--output", "text"]
+
+launch :: Box -> Maybe String -> IO ()
+launch b mrev = do
+  root <- repoRoot
+  rev <- maybe (trim <$> git root ["rev-parse", "HEAD"]) pure mrev
+  pushed <- git root ["branch", "-r", "--contains", rev]
+  when (null pushed) $ die ("rev " ++ rev ++ " is not on any pushed branch; the box fetches its config from GitHub")
+  existing <- findInstance b
+  unless (null existing) $ die ("already exists: " ++ existing)
+  sg <- ensureSecurityGroup b
+  ensureInstanceProfile b
+  v6 <- if ipv6 b then ensureIpv6 >> pure ["--ipv6-address-count", "1"] else pure []
+  (ami, amiName, rootDev) <-
+    aws
+      [ "ec2", "describe-images", "--owners", nixosAmiOwner
+      , "--filters", "Name=architecture,Values=x86_64", "Name=name,Values=nixos/*"
+      , "--query", "sort_by(Images,&CreationDate)[-1].[ImageId,Name,RootDeviceName]", "--output", "text"
+      ]
+      >>= \case
+        out | [a, n, r] <- words out -> pure (a, n, r)
+        out -> die ("unexpected AMI lookup result: " ++ out)
+  putStrLn ("ami=" ++ ami ++ " (" ++ amiName ++ ") rev=" ++ rev ++ " sg=" ++ sg)
+  tmp <- getTemporaryDirectory
+  (userData, h) <- openTempFile tmp "user-data"
+  hPutStr h . unlines $
+    [ "#!/bin/sh"
+    , "# Apply the " ++ attr b ++ " config pinned to " ++ rev ++ ". Re-runs on every boot as a no-op."
+    , "nixos-rebuild switch --option experimental-features 'nix-command flakes' \\"
+    , "  --flake 'github:drewr/yolo/" ++ rev ++ "?dir=" ++ config b ++ "#" ++ attr b ++ "'"
+    ]
+  hClose h
+  i <-
+    aws
+      ( [ "ec2", "run-instances", "--image-id", ami, "--instance-type", instanceType b
+        , "--security-group-ids", sg, "--iam-instance-profile", "Name=" ++ name b
+        , "--block-device-mappings", "DeviceName=" ++ rootDev ++ ",Ebs={VolumeSize=" ++ diskGb b ++ ",VolumeType=gp3,DeleteOnTermination=true}"
+        , "--metadata-options", "HttpTokens=required"
+        ]
+          ++ v6
+          ++ [ "--user-data", "file://" ++ userData
+             , "--tag-specifications", "ResourceType=instance,Tags=[{Key=Name,Value=" ++ name b ++ "},{Key=rev,Value=" ++ rev ++ "}]"
+             , "--query", "Instances[0].InstanceId", "--output", "text"
+             ]
+      )
+  removeFile userData
+  putStrLn i
+
+-- No ingress rules: everything reaches the box over iroh or SSM.
+ensureSecurityGroup :: Box -> IO String
+ensureSecurityGroup b = do
+  sg <- aws ["ec2", "describe-security-groups", "--filters", "Name=group-name,Values=" ++ name b, "--query", "SecurityGroups[0].GroupId", "--output", "text"]
+  if sg /= "None"
+    then pure sg
+    else do
+      vpc <- defaultVpc
+      aws ["ec2", "create-security-group", "--group-name", name b, "--vpc-id", vpc, "--description", name b ++ ", no inbound", "--query", "GroupId", "--output", "text"]
+
+-- An instance profile that SSM can manage (ticket, and no SSH needed).
+ensureInstanceProfile :: Box -> IO ()
+ensureInstanceProfile b = do
+  (code, _, _) <- readProcessWithExitCode "aws" ["iam", "get-instance-profile", "--instance-profile-name", name b] ""
+  unless (code == ExitSuccess) $ do
+    _ <-
+      aws
+        [ "iam", "create-role", "--role-name", name b, "--assume-role-policy-document"
+        , "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+        ]
+    _ <- aws ["iam", "attach-role-policy", "--role-name", name b, "--policy-arn", "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+    _ <- aws ["iam", "create-instance-profile", "--instance-profile-name", name b]
+    _ <- aws ["iam", "add-role-to-instance-profile", "--instance-profile-name", name b, "--role-name", name b]
+    sleep 10 -- instance profiles take a moment to become usable
+
+-- Public IPv6 for the default VPC, once: an Amazon-provided block, a /64 per
+-- default subnet (so any AZ works), and a ::/0 route to the internet gateway.
+-- Sandboxes on Datum are IPv6-only, so this is what lets iroh go direct
+-- instead of through the relay. Idempotent.
+ensureIpv6 :: IO ()
+ensureIpv6 = do
+  vpc <- defaultVpc
+  let vpcBlock = aws ["ec2", "describe-vpcs", "--vpc-ids", vpc, "--query", "Vpcs[0].Ipv6CidrBlockAssociationSet[?Ipv6CidrBlockState.State==`associated`]|[0].Ipv6CidrBlock", "--output", "text"]
+      waitBlock :: Int -> IO String
+      waitBlock n = do
+        blk <- vpcBlock
+        if blk /= "None" || n == 0 then pure blk else sleep 2 >> waitBlock (n - 1)
+  block0 <- vpcBlock
+  block <-
+    if block0 /= "None"
+      then pure block0
+      else do
+        _ <- aws ["ec2", "associate-vpc-cidr-block", "--vpc-id", vpc, "--amazon-provided-ipv6-cidr-block"]
+        waitBlock 30
+  hPutStrLn stderr ("vpc " ++ vpc ++ " ipv6 " ++ block)
+  subnets <- words <$> aws ["ec2", "describe-subnets", "--filters", "Name=vpc-id,Values=" ++ vpc, "Name=default-for-az,Values=true", "--query", "sort_by(Subnets,&AvailabilityZone)[].SubnetId", "--output", "text"]
+  forM_ (zip [0 ..] subnets) $ \(i, subnet) -> do
+    n <- aws ["ec2", "describe-subnets", "--subnet-ids", subnet, "--query", "length(Subnets[0].Ipv6CidrBlockAssociationSet[?Ipv6CidrBlockState.State==`associated`])", "--output", "text"]
+    when (n == "0") $ do
+      cidr <- either die pure (subnet64 block i)
+      () <$ aws ["ec2", "associate-subnet-cidr-block", "--subnet-id", subnet, "--ipv6-cidr-block", cidr]
+    () <$ aws ["ec2", "modify-subnet-attribute", "--subnet-id", subnet, "--assign-ipv6-address-on-creation"]
+  rt <- aws ["ec2", "describe-route-tables", "--filters", "Name=vpc-id,Values=" ++ vpc, "Name=association.main,Values=true", "--query", "RouteTables[0].RouteTableId", "--output", "text"]
+  igw <- aws ["ec2", "describe-internet-gateways", "--filters", "Name=attachment.vpc-id,Values=" ++ vpc, "--query", "InternetGateways[0].InternetGatewayId", "--output", "text"]
+  -- Fails harmlessly if the route exists.
+  () <$ readProcessWithExitCode "aws" ["ec2", "create-route", "--route-table-id", rt, "--destination-ipv6-cidr-block", "::/0", "--gateway-id", igw] ""
+
+-- The i-th /64 of an Amazon /56 block (its fourth group's low byte).
+subnet64 :: String -> Int -> Either String String
+subnet64 block i = do
+  let addr = takeWhile (/= '/') block
+      (left, right) = breakOn "::" addr
+      groupsOf s = if null s then [] else splitOn ':' s
+      l = groupsOf left
+      r = groupsOf (drop 2 right)
+      full = l ++ replicate (8 - length l - length r) "0" ++ r
+  gs <- mapM hex full
+  when (length gs /= 8 || i > 255) $ Left ("can't split " ++ block ++ " into /64s")
+  let g3 = (gs !! 3 .&. 0xff00) .|. i
+  pure (intercalate ":" (map (`showHex` "") (take 3 gs ++ [g3])) ++ "::/64")
+  where
+    hex s = case readHex s of
+      [(n, "")] -> Right n
+      _ -> Left ("bad IPv6 group " ++ s ++ " in " ++ block)
+
+defaultVpc :: IO String
+defaultVpc = aws ["ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true", "--query", "Vpcs[0].VpcId", "--output", "text"]
+
+----------------------------------------------------------------------------
+-- Helpers
+
+-- The aws CLI's trimmed stdout; dies with its error output on failure.
+aws :: [String] -> IO String
+aws args = do
+  (code, out, err) <- readProcessWithExitCode "aws" args "" `orDie` "aws CLI not found in PATH"
+  unless (code == ExitSuccess) $ die ("aws " ++ unwords (take 2 args) ++ ": " ++ trim err)
+  pure (trim out)
+
+git :: FilePath -> [String] -> IO String
+git root args = do
+  (_, out, _) <- readProcessWithExitCode "git" (["-C", root] ++ args) ""
+  pure (trim out)
+
+-- The repository: two levels above this script (infra/provision).
+repoRoot :: IO FilePath
+repoRoot = takeDirectory . takeDirectory <$> canonicalizePath $(location >>= lift . loc_filename)
+
+orDie :: IO a -> String -> IO a
+orDie act msg = try act >>= either (\e -> const (die msg) (e :: IOException)) pure
+
+die :: String -> IO a
+die msg = hPutStrLn stderr ("provision: " ++ msg) >> exitFailure
+
+envNonEmpty :: String -> IO (Maybe String)
+envNonEmpty k = (\v -> if v == Just "" then Nothing else v) <$> lookupEnv k
+
+readFileMaybe :: FilePath -> IO (Maybe String)
+readFileMaybe f = do
+  r <- try (readFile f >>= \s -> length s `seq` pure s)
+  pure (either (\e -> const Nothing (e :: IOException)) Just r)
+
+sleep :: Int -> IO ()
+sleep n = () <$ readProcessWithExitCode "sleep" [show n] ""
+
+trim :: String -> String
+trim = dropWhileEnd isSpace . dropWhile isSpace
+
+breakOn :: String -> String -> (String, String)
+breakOn pat = go ""
+  where
+    go acc s = case s of
+      [] -> (reverse acc, "")
+      c : rest
+        | take (length pat) s == pat -> (reverse acc, s)
+        | otherwise -> go (c : acc) rest
+
+splitOn :: Char -> String -> [String]
+splitOn c s = case break (== c) s of
+  (a, []) -> [a]
+  (a, _ : rest) -> a : splitOn c rest
