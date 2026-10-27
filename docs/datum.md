@@ -16,7 +16,7 @@ yolo rm work
 ```
 
 - **Other machines:** a session's ticket and host key are derived from its
-  Secret `agent-NAME`, so any machine can rebuild the local state (the host's
+  Secret `yolo-NAME`, so any machine can rebuild the local state (the host's
   private key is only used to derive the key to pin, not kept). `yolo ls`
   syncs: it sets up every Datum session missing here and removes local ones
   whose workload is gone, but only sessions of the current Datum login
@@ -156,7 +156,7 @@ save 0.8 s. First `ws open` of the repo 7.7 s; first `ws clone` plus save 15 s.
    is no trust-on-first-use.
 3. **authorized_keys.**
 
-All three go into the Datum Secret `agent-NAME`, which the workload reads with
+All three go into the Datum Secret `yolo-NAME` (`agent-NAME` for sessions made before the rename), which the workload reads with
 `secretKeyRef`. Inside, `init.sh` brings up loopback, installs the keys, writes
 a login environment, and supervises dropbear on `127.0.0.1:2222` and
 `dumbpipe listen-tcp`.

@@ -323,7 +323,7 @@ migrateAgentSandboxState = do
 -- The datum backend: sessions on Datum Compute, reached by SSH over iroh.
 --
 -- Each session gets a fresh iroh secret and SSH host key generated here,
--- stored in a per-session Datum Secret (agent-NAME) and in the session
+-- stored in a per-session Datum Secret (yolo-NAME) and in the session
 -- directory. The client derives the iroh ticket from the secret and pins the
 -- host key, so nothing is read from instance logs and there is no
 -- trust-on-first-use. Every key in the Secret agent-providers is passed to
@@ -372,7 +372,10 @@ datumBackend root = do
           (ssh, sshArgs) <- datumSsh d name args
           executeFile ssh True sshArgs Nothing
       , bLs = \full -> datumSync >>= mapM_ (datumTable full)
-      , bLogs = \name args -> rawSystem "datumctl" (["compute", "logs", "agent-" ++ name] ++ args) >>= exitWith
+      , bLogs = \name args -> do
+          dir <- sessionDir name
+          wl <- sessionWorkload dir name
+          rawSystem "datumctl" (["compute", "logs", wl] ++ args) >>= exitWith
       , bRm = datumRm d
       }
 
@@ -386,8 +389,8 @@ datumSync = do
   r <- try (readProcessWithExitCode "datumctl" ["get", "workloads", "-o", "json"] "")
   case r of
     Right (ExitSuccess, out, _) | Just v <- A.decodeStrict (BC.pack out) -> do
-      let items = [w | A.Array is <- [at ["items"] v], w <- foldr (:) [] is, "agent-" `isPrefixOf` jstr ["metadata", "name"] w]
-          remote = [drop (length "agent-") (jstr ["metadata", "name"] w) | w <- items]
+      let items = [w | A.Array is <- [at ["items"] v], w <- foldr (:) [] is, isJust (sessionOfWorkload (jstr ["metadata", "name"] w))]
+          remote = nub (mapMaybe (sessionOfWorkload . jstr ["metadata", "name"]) items)
       st <- yoloState
       local <- localSessions "datum"
       forM_ (filter (`notElem` local) remote) $ \n -> do
@@ -422,7 +425,7 @@ datumTable full items = do
         let placements = list ["spec", "placements"] w
             available = [jstr ["status"] c | c <- list ["status", "conditions"] w, jstr ["type"] c == "Available"]
             img = maybe "" (jstr ["image"]) (listToMaybe (list ["spec", "template", "spec", "runtime", "sandbox", "containers"] w))
-         in [ drop (length "agent-") (jstr ["metadata", "name"] w)
+         in [ fromMaybe "?" (sessionOfWorkload (jstr ["metadata", "name"] w))
             , if available == ["True"] then "Available" else "Unavailable"
             , num ["status", "readyReplicas"] w ++ "/" ++ num ["status", "replicas"] w
             , commas (nub [jstr ["name"] l | p <- placements, l <- list ["locations"] p])
@@ -487,6 +490,20 @@ recordDatumSession dir = lookupEnv "DATUM_SESSION" >>= mapM_ (writeFile (dir </>
 defaultRelay :: String
 defaultRelay = "https://use1-1.relay.n0.iroh.link./"
 
+-- Datum names a session's Workload and Secret PREFIX-NAME. New sessions
+-- are yolo-NAME; agent-NAME is how they were named before, and still works.
+workloadPrefixes :: [String]
+workloadPrefixes = ["yolo-", "agent-"]
+
+-- NAME for a session workload name, if it is one.
+sessionOfWorkload :: String -> Maybe String
+sessionOfWorkload w = listToMaybe [drop (length p) w | p <- workloadPrefixes, p `isPrefixOf` w, length w > length p]
+
+-- The session's workload (and Secret) name, as recorded in its local state;
+-- sessions from before the record are agent-NAME.
+sessionWorkload :: FilePath -> String -> IO String
+sessionWorkload dir name = readMeta (dir </> "workload") ("agent-" ++ name)
+
 -- Rebuild the local state of a datum session made on another machine, from
 -- its Datum Secret (iroh secret, host key, authorized keys) and Workload
 -- (harness, class). The host's private key is only used to derive the key
@@ -498,13 +515,19 @@ adoptDatum checkKeys name = do
     then pure False
     else do
       useDatumSession
-      (wc, wout, _) <- readProcessWithExitCode "datumctl" ["get", "workload", "agent-" ++ name, "-o", "json"] ""
-      case (wc, A.decodeStrict (BC.pack wout)) of
-        (ExitSuccess, Just w) -> do
-          (sc, sout, serr) <- readProcessWithExitCode "datumctl" ["get", "secret", "agent-" ++ name, "-o", "json"] ""
+      let lookupWorkload = \case
+            [] -> pure Nothing
+            p : ps -> do
+              (wc, wout, _) <- readProcessWithExitCode "datumctl" ["get", "workload", p ++ name, "-o", "json"] ""
+              case (wc, A.decodeStrict (BC.pack wout)) of
+                (ExitSuccess, Just w) -> pure (Just (p ++ name, w))
+                _ -> lookupWorkload ps
+      lookupWorkload workloadPrefixes >>= \case
+        Just (wl, w) -> do
+          (sc, sout, serr) <- readProcessWithExitCode "datumctl" ["get", "secret", wl, "-o", "json"] ""
           secret <- case (sc, A.decodeStrict (BC.pack sout)) of
             (ExitSuccess, Just v) -> pure v
-            _ -> die ("agent-" ++ name ++ " exists on Datum, but its Secret can't be read: " ++ trim serr)
+            _ -> die (wl ++ " exists on Datum, but its Secret can't be read: " ++ trim serr)
           let str path v = case at path v of A.String t -> T.unpack t; _ -> ""
               -- Secret data is base64; the *_B64 values are base64 again.
               field k = either (const Nothing) Just (B64.decode (BC.pack (str ["data", k] secret)))
@@ -512,11 +535,12 @@ adoptDatum checkKeys name = do
               harness = case str ["metadata", "labels", "agent-harness"] w of "" -> "?"; h -> h
               cls = case str ["spec", "template", "spec", "runtime", "class"] w of "" -> "unikernel"; c -> c
           (irohSecret, hostKey, authorized) <-
-            maybe (die ("the Secret agent-" ++ name ++ " is missing session keys")) pure $
+            maybe (die ("the Secret " ++ wl ++ " is missing session keys")) pure $
               (,,) <$> field "IROH_SECRET" <*> twice "SSH_HOST_KEY_B64" <*> twice "AUTHORIZED_KEYS_B64"
           relay <- opt "RELAY" defaultRelay
           dir <- sessionCreate name "datum" harness
           writeFile (dir </> "class") (cls ++ "\n")
+          writeFile (dir </> "workload") (wl ++ "\n")
           recordDatumSession dir
           withUmask 0o077 $ do
             let hex = trim (BC.unpack irohSecret)
@@ -527,8 +551,8 @@ adoptDatum checkKeys name = do
             B.writeFile tmp hostKey
             (kc, pub, _) <- readProcessWithExitCode "ssh-keygen" ["-y", "-f", tmp] ""
             removePathForcibly tmp
-            when (kc /= ExitSuccess) $ removePathForcibly dir >> die ("can't read the host key of agent-" ++ name)
-            writeFile (dir </> "known_hosts") (unwords (("agent-" ++ name) : take 2 (words pub)) ++ "\n")
+            when (kc /= ExitSuccess) $ removePathForcibly dir >> die ("can't read the host key of " ++ wl)
+            writeFile (dir </> "known_hosts") (unwords (wl : take 2 (words pub)) ++ "\n")
           hPutStrLn stderr ("yolo: set up " ++ name ++ " from Datum")
           -- Logging in needs one of this machine's keys among the session's.
           when checkKeys $ do
@@ -541,7 +565,7 @@ adoptDatum checkKeys name = do
            when (not (null mine) && not (any (`elem` theirs) mine)) $
              hPutStrLn stderr ("yolo: none of your agent's keys is authorized for " ++ name ++ "; logging in will fail")
           pure True
-        _ -> pure False
+        Nothing -> pure False
 
 datumNew :: Datum -> String -> String -> [String] -> IO ()
 datumNew d name harness opts0 = do
@@ -573,7 +597,9 @@ datumNew d name harness opts0 = do
       pure
       image
   dir <- sessionCreate name "datum" harness
+  let wl = "yolo-" ++ name
   writeFile (dir </> "class") (cls ++ "\n")
+  writeFile (dir </> "workload") (wl ++ "\n")
   recordDatumSession dir
 
   -- Session keys, readable only by this user.
@@ -582,9 +608,9 @@ datumNew d name harness opts0 = do
     B.writeFile (dir </> "iroh_secret") (secret <> BC.pack "\n")
     ticket <- endpointTicket (dRelay d) (BC.unpack secret)
     writeFile (dir </> "ticket") (ticket ++ "\n")
-    _ <- quiet "ssh-keygen" ["-q", "-t", "ed25519", "-N", "", "-C", "agent-" ++ name, "-f", dir </> "host_key"]
+    _ <- quiet "ssh-keygen" ["-q", "-t", "ed25519", "-N", "", "-C", wl, "-f", dir </> "host_key"]
     pub <- words <$> readFile (dir </> "host_key.pub")
-    writeFile (dir </> "known_hosts") (unwords (("agent-" ++ name) : take 2 pub) ++ "\n")
+    writeFile (dir </> "known_hosts") (unwords (wl : take 2 pub) ++ "\n")
     ks <- authorizedKeys key
     forM_ ks (writeFile (dir </> "authorized_keys"))
     -- A --key FILE.pub with its private key beside it is also the identity.
@@ -606,7 +632,7 @@ datumNew d name harness opts0 = do
       [ "apiVersion: v1"
       , "kind: Secret"
       , "metadata:"
-      , "  name: agent-" ++ name
+      , "  name: " ++ wl
       , "type: Opaque"
       , "stringData:"
       , "  IROH_SECRET: \"" ++ secretHex ++ "\""
@@ -635,7 +661,7 @@ datumNew d name harness opts0 = do
     [ "apiVersion: compute.datumapis.com/v1alpha"
     , "kind: Workload"
     , "metadata:"
-    , "  name: agent-" ++ name
+    , "  name: " ++ wl
     , "  labels:"
     , "    agent-sandbox: \"true\""
     , "    agent-harness: " ++ harness
@@ -659,7 +685,7 @@ datumNew d name harness opts0 = do
       ++ value "SESSION_NAME" name
       ++ value "JFS_MOUNT_OPTS" (show (dJfsOpts d))
       ++ value "ENDPOINT_DNS" ("_iroh." ++ zbase32 pubkey ++ ".dns.iroh.link")
-      ++ concatMap (fromSecret ("agent-" ++ name)) ["IROH_SECRET", "AUTHORIZED_KEYS_B64", "SSH_HOST_KEY_B64"]
+      ++ concatMap (fromSecret wl) ["IROH_SECRET", "AUTHORIZED_KEYS_B64", "SSH_HOST_KEY_B64"]
       -- One secretKeyRef per provider key (the unikernel class has no envFrom).
       ++ value "PROVIDER_KEYS" (show (unwords providerKeys))
       ++ concatMap (fromSecret (dProvidersSecret d)) providerKeys
@@ -674,7 +700,7 @@ datumNew d name harness opts0 = do
          , "      scaleSettings:"
          , "        minReplicas: 1"
          ]
-  hPutStrLn stderr ("created agent-" ++ name ++ " (" ++ harness ++ ": " ++ img ++ "); waiting for SSH...")
+  hPutStrLn stderr ("created " ++ wl ++ " (" ++ harness ++ ": " ++ img ++ "); waiting for SSH...")
   t0 <- getCurrentTime
   let wait = do
         (ssh, args) <- datumSsh d name ["-o", "ConnectTimeout=20", "-o", "BatchMode=yes", "true"]
@@ -695,6 +721,7 @@ datumSsh d name args = do
   hasTicket <- doesFileExist (dir </> "ticket")
   unless hasTicket $ die ("no local state for " ++ name)
   ticket <- readMeta (dir </> "ticket") ""
+  wl <- sessionWorkload dir name
   identity <- readFileMaybe (dir </> "identity")
   let split acc = \case
         "--" : r -> (acc, r)
@@ -708,11 +735,11 @@ datumSsh d name args = do
     ( "ssh"
     , [ "-o", "ProxyCommand=dumbpipe connect " ++ ticket ++ " 2>/dev/null"
       , "-o", "UserKnownHostsFile=" ++ dir </> "known_hosts"
-      , "-o", "HostKeyAlias=agent-" ++ name
+      , "-o", "HostKeyAlias=" ++ wl
       , "-o", "StrictHostKeyChecking=yes"
       , "-o", "ServerAliveInterval=30"
       ]
-        ++ idOpts ++ fwd ++ opts ++ [dUser d ++ "@agent-" ++ name] ++ cmd
+        ++ idOpts ++ fwd ++ opts ++ [dUser d ++ "@" ++ wl] ++ cmd
     )
 
 datumRm :: Datum -> String -> IO ()
@@ -726,9 +753,10 @@ datumRm d name = do
     quiet ssh args >>= \case
       ExitSuccess -> hPutStrLn stderr "workspaces saved"
       _ -> hPutStrLn stderr ("yolo: could not save workspaces of " ++ name)
+  wl <- sessionWorkload dir name
   forM_ ["workload", "secret"] $ \kind -> do
     -- The outcome: stdout's last line ("... deleted"), else the error.
-    (_, out, err) <- readProcessWithExitCode "datumctl" ["delete", kind, "agent-" ++ name] ""
+    (_, out, err) <- readProcessWithExitCode "datumctl" ["delete", kind, wl] ""
     mapM_ putStrLn (lastLine out <|> lastLine err)
   removePathForcibly dir
 

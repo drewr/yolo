@@ -25,7 +25,7 @@ the session authorizes.
 
 | | docker | datum |
 | - | - | - |
-| Runs on | this machine, container `yolo-NAME` | Datum Compute, `us-east-1`; unikernel class, or `--class general-purpose` |
+| Runs on | this machine, container `yolo-NAME` | Datum Compute, workload `yolo-NAME`, `us-east-1`; unikernel class, or `--class general-purpose` |
 | Attach | `docker exec` | SSH over iroh, host key pinned; no inbound ports |
 | HOME | `~/.local/share/yolo/home` on the host, shared by docker sessions | a JuiceFS home shared by all Datum sessions |
 | Workspaces | `-v HOST:CONTAINER` at `new` | `ws clone/open/save/close` (repos in RAM, saved to the shared home) |
