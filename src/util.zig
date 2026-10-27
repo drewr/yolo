@@ -73,6 +73,7 @@ pub fn splitWords(allocator: mem.Allocator, s: []const u8) !std.ArrayList([]cons
 /// spaces (`table` in the Haskell).
 pub fn renderTable(allocator: mem.Allocator, rows: []const []const []const u8) ![]u8 {
     var widths: std.ArrayList(usize) = .empty;
+    defer widths.deinit(allocator);
     for (rows) |row| {
         for (row, 0..) |cell, i| {
             if (i == widths.items.len) {
@@ -92,6 +93,15 @@ pub fn renderTable(allocator: mem.Allocator, rows: []const []const []const u8) !
         try out.append(allocator, '\n');
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// One row of `yolo ls`'s session table: the Haskell's printf "%-20s %-8s
+/// %-9s %-16s %s".
+pub fn printTableRow(name: []const u8, backend: []const u8, harness: []const u8, class: []const u8, state: []const u8) void {
+    var buf: [512]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io_global, &buf);
+    w.interface.print("{s: <20} {s: <8} {s: <9} {s: <16} {s}\n", .{ name, backend, harness, class, state }) catch {};
+    w.interface.flush() catch {};
 }
 
 /// kubectl-style age from a duration in seconds: 45s, 12m, 3h, 2d.
@@ -152,7 +162,9 @@ pub const Ctx = struct {
     gpa: mem.Allocator,
     /// Lives for the whole run: everything yolo allocates goes here.
     arena: mem.Allocator,
-    env: *const std.process.Environ.Map,
+    /// Mutable so `useDatumSession` can set DATUM_SESSION for children (as the
+    /// Haskell's `setEnv` did).
+    env: *std.process.Environ.Map,
 
     pub fn opt(self: Ctx, name: []const u8, default: []const u8) []const u8 {
         return optFrom(self.env, name, default);
@@ -164,6 +176,11 @@ pub const Ctx = struct {
 
     pub fn envNonEmpty(self: Ctx, key: []const u8) ?[]const u8 {
         return envNonEmptyFrom(self.env, key);
+    }
+
+    /// Set a variable for this process's children (`setEnv`).
+    pub fn setEnv(self: Ctx, key: []const u8, value: []const u8) void {
+        self.env.put(key, value) catch dief("can't set {s}", .{key});
     }
 };
 
@@ -412,6 +429,18 @@ pub const Result = struct {
     stderr: []u8,
 };
 
+
+/// `argv` with argv[0] resolved through PATH: std.process.spawn and replace
+/// don't search PATH (and the Haskell's readProcess did).
+fn resolve(ctx: Ctx, argv: []const []const u8) []const []const u8 {
+    if (argv.len == 0 or mem.indexOfScalar(u8, argv[0], '/') != null) return argv;
+    const found = findExecutable(ctx, argv[0]) orelse return argv;
+    const out = ctx.arena.alloc([]const u8, argv.len) catch return argv;
+    out[0] = found;
+    for (argv[1..], 1..) |a, i| out[i] = a;
+    return out;
+}
+
 /// Run `argv` with its output captured (`readProcessWithExitCode`), draining
 /// both pipes while it runs. With a deadline the child is killed when it runs
 /// out of time (`.timed_out`, code 124): enough for commands like `ssh-add -L`
@@ -421,7 +450,8 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
     timeout_ms: ?i64 = null,
 }) !Result {
     var child = try std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -493,7 +523,8 @@ fn readUntilEnd(
 /// 127 when the program is missing (`quiet`).
 pub fn quiet(ctx: Ctx, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -510,7 +541,8 @@ pub fn quiet(ctx: Ctx, argv: []const []const u8) u8 {
 /// time (the Haskell's `timeout N`).
 pub fn quietUntil(ctx: Ctx, argv: []const []const u8, seconds: i64) ?u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -542,7 +574,8 @@ fn exited(pid: std.posix.pid_t) ?u8 {
 /// Run `argv` with the terminal inherited, and take its exit code.
 pub fn inherit(ctx: Ctx, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -557,7 +590,7 @@ pub fn inherit(ctx: Ctx, argv: []const []const u8) u8 {
 /// Replace this process with `argv` (execve), so its exit code becomes ours:
 /// the Haskell's `executeFile`.
 pub fn replace(ctx: Ctx, argv: []const []const u8) noreturn {
-    const e = std.process.replace(ctx.io, .{ .argv = argv });
+    const e = std.process.replace(ctx.io, .{ .argv = resolve(ctx, argv), .environ_map = ctx.env });
     dief("could not run {s}: {t}", .{ argv[0], e });
 }
 
@@ -565,7 +598,8 @@ pub fn replace(ctx: Ctx, argv: []const []const u8) noreturn {
 /// `runLogged`, which waits and ignores stdin's contents).
 pub fn logged(ctx: Ctx, log: std.Io.File, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .inherit,
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
@@ -581,7 +615,8 @@ pub fn logged(ctx: Ctx, log: std.Io.File, argv: []const []const u8) u8 {
 /// the child (for the SSH-agent relay and the BuildKit tunnel).
 pub fn spawnBackground(ctx: Ctx, argv: []const []const u8) ?std.process.Child {
     return std.process.spawn(ctx.io, .{
-        .argv = argv,
+        .argv = resolve(ctx, argv),
+        .environ_map = ctx.env,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -599,19 +634,17 @@ pub fn canConnect(ctx: Ctx, tcp_port: u16) bool {
 /// Decode standard base64 (with padding) into a fresh allocation.
 pub fn b64decode(allocator: mem.Allocator, source: []const u8) ![]u8 {
     const dec = &std.base64.standard.Decoder;
-    const size = try std.base64.calcSizeForSlice(dec, source);
+    const size = try dec.calcSizeForSlice(source);
     const out = try allocator.alloc(u8, size);
-    try std.base64.decode(dec, out, source);
+    try dec.decode(out, source);
     return out[0..];
 }
 
 /// Encode to standard base64 (with padding) into a fresh allocation.
 pub fn b64encode(allocator: mem.Allocator, source: []const u8) ![]u8 {
     const enc = &std.base64.standard.Encoder;
-    const size = std.base64.calcSize(enc, source.len);
-    const out = try allocator.alloc(u8, size);
-    const n = std.base64.encode(enc, out, source);
-    return out[0..n];
+    const out = try allocator.alloc(u8, enc.calcSize(source.len));
+    return out[0..enc.encode(out, source).len];
 }
 
 /// Fill `buf` with random bytes from the OS (`getRandomBytes`).
@@ -688,8 +721,8 @@ fn daysFromCivil(y: i64, m: i64, d: i64) i64 {
     const yy = if (m <= 2) y - 1 else y;
     const era = @divTrunc(yy, 400);
     const yoe = @rem(yy, 400); // [0, 399]
-    const doy = (153 * (if (m > 2) m - 3 else m + 9) + 2) / 5 + d - 1;
-    const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const doy = @divTrunc(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
     return era * 146097 + doe - 719468;
 }
 
@@ -698,10 +731,7 @@ fn daysFromCivil(y: i64, m: i64, d: i64) i64 {
 pub fn age(ctx: Ctx, created: []const u8) []const u8 {
     const t = parseRfc3339(created) orelse return "-";
     const secs = std.Io.Timestamp.durationTo(t, std.Io.Clock.real.now(ctx.io)).toSeconds();
-    if (secs < 120) return std.fmt.allocPrint(ctx.arena, "{d}s", .{secs}) catch "-";
-    if (secs < 7200) return std.fmt.allocPrint(ctx.arena, "{d}m", .{@divTrunc(secs, 60)}) catch "-";
-    if (secs < 172800) return std.fmt.allocPrint(ctx.arena, "{d}h", .{@divTrunc(secs, 3600)}) catch "-";
-    return std.fmt.allocPrint(ctx.arena, "{d}d", .{@divTrunc(secs, 86400)}) catch "-";
+    return ageSeconds(ctx.arena, secs) catch "-";
 }
 
 /// Parse a decimal port, dying like a failed read (`fromMaybe` on bad input).

@@ -106,9 +106,9 @@ pub fn create(ctx: Ctx, name: []const u8, backend: []const u8, harness: []const 
     util.createDirPath(ctx, d) catch |e| util.dief("can't create {s}: {t}", .{ d, e });
     std.Io.Dir.cwd().setFilePermissions(ctx.io, d, @enumFromInt(0o700), .{}) catch {};
     const backendFile = util.join(ctx, &.{ d, "backend" });
-    util.writeFileOrDie(ctx, backendFile, util.join(ctx, &.{ backend, "\n" }));
+    util.writeFileOrDie(ctx, backendFile, std.fmt.allocPrint(ctx.arena, "{s}\n", .{backend}) catch "");
     const harnessFile = util.join(ctx, &.{ d, "harness" });
-    util.writeFileOrDie(ctx, harnessFile, util.join(ctx, &.{ harness, "\n" }));
+    util.writeFileOrDie(ctx, harnessFile, std.fmt.allocPrint(ctx.arena, "{s}\n", .{harness}) catch "");
     return d;
 }
 
@@ -119,7 +119,11 @@ pub fn sessionBackend(ctx: Ctx, name: []const u8) []const u8 {
     const backendFile = util.join(ctx, &.{ d, "backend" });
     if (util.fileExists(ctx, backendFile)) return util.readMeta(ctx, backendFile, "?");
     const datum = @import("datum.zig");
-    if (datum.adopt(ctx, true, name)) return "datum";
+    const adopted = datum.adopt(ctx, true, name) catch |e| switch (e) {
+        error.NotOnDatum => util.dief("no session {s} (yolo ls)", .{name}),
+        error.CanNotAdopt => util.die(datum.adopt_message),
+    };
+    if (adopted) return "datum";
     util.dief("no session {s} (yolo ls)", .{name});
 }
 
@@ -149,7 +153,7 @@ pub fn migrateAgentSandboxState(ctx: Ctx) void {
 /// leaves it alone (`recordDatumSession`).
 pub fn recordDatumSession(ctx: Ctx, d: []const u8) void {
     const login = ctx.envNonEmpty("DATUM_SESSION") orelse return;
-    util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "datum_session" }), util.join(ctx, &.{ login, "\n" }));
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "datum_session" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{login}) catch "");
 }
 
 /// The session's workload (and Secret) name, as recorded in its local state;

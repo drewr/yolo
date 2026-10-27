@@ -3,7 +3,7 @@
 //! URL, and the public keys a session authorizes.
 //!
 //! The derivations are byte-identical to the Haskell yolo's (which used
-//! crypton): they are pinned by the golden vectors in tests/golden/.
+//! crypton): they are pinned by the golden vectors in src/golden/.
 
 const std = @import("std");
 const util = @import("util.zig");
@@ -19,6 +19,7 @@ pub const base32_alphabet = "abcdefghijklmnopqrstuvwxyz234567";
 pub const KeyError = error{
     BadSecret,
     RelayTooLong,
+    OutOfMemory,
 };
 
 /// The iroh endpoint's public key from its 32-byte Ed25519 secret.
@@ -102,7 +103,6 @@ pub fn endpointTicket(allocator: std.mem.Allocator, relay: []const u8, hex: []co
 /// HostKeyAlias, then the key type and its base64.
 pub fn knownHostsLine(allocator: std.mem.Allocator, workload: []const u8, pubkey_line: []const u8) ![]u8 {
     var it = std.mem.tokenizeAny(u8, pubkey_line, " \t\n\r");
-    _ = it.next() orelse return error.BadPublicKey;
     const kind = it.next() orelse return error.BadPublicKey;
     const key = it.next() orelse return error.BadPublicKey;
     return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ workload, kind, key });

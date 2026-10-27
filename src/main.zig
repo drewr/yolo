@@ -117,7 +117,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var threaded: std.Io.Threaded = .init_single_threaded;
+    // The Io owns the threads and buffers behind every file, socket and child
+    // process: give it a real allocator (failing ones break spawn).
+    var threaded: std.Io.Threaded = .init(arena, .{});
     defer threaded.deinit();
     const io = threaded.io();
     util.io_global = io;
@@ -251,16 +253,15 @@ fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
     for (names) |n| {
         if (util.dirExists(ctx, util.join(ctx, &.{ st, n }))) dirs.append(ctx.arena, n) catch {};
     }
-    // Render the session table with aligned columns.
-    var rows: std.ArrayList([]const []const u8) = .empty;
+    // The fixed-width table the Haskell prints (printf "%-20s %-8s ...").
     var backends: std.ArrayList([]const u8) = .empty;
-    rows.append(ctx.arena, &.{ "NAME", "BACKEND", "HARNESS", "CLASS", "STATE" }) catch {};
+    util.printTableRow("NAME", "BACKEND", "HARNESS", "CLASS", "STATE");
     for (dirs.items) |n| {
         const b = util.readMeta(ctx, util.join(ctx, &.{ st, n, "backend" }), "?");
         const h = util.readMeta(ctx, util.join(ctx, &.{ st, n, "harness" }), "?");
         const c = util.readMeta(ctx, util.join(ctx, &.{ st, n, "class" }), "-");
         const s = util.readMeta(ctx, util.join(ctx, &.{ st, n, "state" }), "-");
-        rows.append(ctx.arena, &.{ n, b, h, c, s }) catch {};
+        util.printTableRow(n, b, h, c, s);
         // record unique non-? non-datum backends
         var seen = false;
         if (!std.mem.eql(u8, b, "?") and !std.mem.eql(u8, b, "datum")) {
@@ -270,17 +271,13 @@ fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
             if (!seen) backends.append(ctx.arena, b) catch {};
         }
     }
-    const table = util.renderTable(ctx.arena, rows.items) catch "";
-    util.say(table);
     for (backends.items) |b| {
-        util.say("");
-        util.say(std.fmt.allocPrint(ctx.arena, "== {s}", .{b}) catch "");
+        // Each backend's own listing, introduced by "== NAME" (the datum
+        // backend prints its own heading).
         const be = loadBackend(ctx, root, b);
         _ = Backend.ls(ctx, be, full);
     }
-    if (!has_datumctl) {
-        util.errPrint("yolo: datumctl isn't in PATH, so the datum sessions can't be checked", .{});
-    }
+    if (!has_datumctl) util.warn("datumctl isn't in PATH, so the datum sessions can't be checked", .{});
     if (items) |it| datum.datumTable(ctx, full, it);
     return 0;
 }
@@ -321,4 +318,6 @@ test {
     _ = util;
     _ = keys;
     _ = session;
+    _ = infra;
+    _ = @import("golden_test.zig");
 }
