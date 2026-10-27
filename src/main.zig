@@ -15,14 +15,71 @@ const builtin = @import("builtin");
 const options = @import("options");
 
 const util = @import("util.zig");
-const keys = @import("keys.zig");
+const json = @import("json.zig");
 const session = @import("session.zig");
+const keys = @import("keys.zig");
 const docker = @import("docker.zig");
 const datum = @import("datum.zig");
 const infra = @import("infra.zig");
 const images = @import("images.zig");
 
 const Ctx = util.Ctx;
+
+/// A functional backend: the five session operations, closed over its config.
+/// A new backend is a new arm here plus its name in loadBackend.
+pub const Backend = union(enum) {
+    docker: docker.Docker,
+    datum: datum.Datum,
+
+    pub fn new(ctx: Ctx, self: Backend, name: []const u8, harness: []const u8, opts: []const []const u8) u8 {
+        return switch (self) {
+            .docker => |d| docker.dockerNew(ctx, d, name, harness, opts),
+            .datum => |d| datum.datumNew(ctx, d, name, harness, opts),
+        };
+    }
+
+    pub fn attach(ctx: Ctx, self: Backend, name: []const u8, args: []const []const u8) u8 {
+        return switch (self) {
+            .docker => |d| docker.dockerAttach(ctx, d, name, args),
+            .datum => |d| datum.datumAttach(ctx, d, name, args),
+        };
+    }
+
+    pub fn ls(ctx: Ctx, self: Backend, full: bool) u8 {
+        return switch (self) {
+            .docker => docker.dockerLs(ctx),
+            .datum => |d| datum.datumLs(ctx, d, full),
+        };
+    }
+
+    pub fn logs(ctx: Ctx, self: Backend, name: []const u8, args: []const []const u8) u8 {
+        return switch (self) {
+            .docker => |d| docker.dockerLogs(ctx, d, name, args),
+            .datum => |d| datum.datumLogs(ctx, d, name, args),
+        };
+    }
+
+    pub fn rm(ctx: Ctx, self: Backend, name: []const u8) u8 {
+        return switch (self) {
+            .docker => |d| docker.dockerRm(ctx, d, name),
+            .datum => |d| datum.datumRm(ctx, d, name),
+        };
+    }
+};
+
+/// The backend named on the command line (`loadBackend`).
+pub fn loadBackend(ctx: Ctx, root: []const u8, which: []const u8) Backend {
+    if (std.mem.eql(u8, which, "docker")) util.die("docker backend not ported yet");
+    if (std.mem.eql(u8, which, "datum")) return .{ .datum = datum.config(ctx, root) };
+    util.dief("unknown backend '{s}' (docker or datum)", .{which});
+}
+
+/// The backend a session was made with, read from its `backend` file;
+/// sessions made on another machine are adopted from Datum (`sessionBackend`).
+pub fn sessionBackend(ctx: Ctx, root: []const u8, name: []const u8) Backend {
+    const which = session.sessionBackend(ctx, name);
+    return loadBackend(ctx, root, which);
+}
 
 pub const usage =
     \\yolo: run coding agents in named, isolated sessions, locally (docker or
@@ -55,9 +112,6 @@ pub const usage =
     \\
 ;
 
-/// main returns the exit code so the same entry point works for the binary
-/// (std.process.Init) and the test runner (Init.Minimal, where only the
-/// imported tests matter).
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -78,7 +132,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }, args);
 }
 
-/// Dispatch the command line; returns the process's exit code.
 pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {
     const root = yoloRoot(ctx);
     const argv: []const []const u8 = args;
@@ -99,12 +152,12 @@ pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {
     if (rest.len == 1 and std.mem.eql(u8, first, "sync-pins")) return images.syncPins(ctx, root);
     if (rest.len > 0 and std.mem.eql(u8, first, "infra")) return infra.cmd(ctx, root, rest[1..]);
     if (rest.len == 1 and is_version) {
-        util.say("{s}", .{versionLine(ctx, root)});
+        util.say(std.fmt.allocPrint(ctx.arena, "{s}", .{versionLine(ctx, root)}) catch "");
         return 0;
     }
     if (rest.len == 1 and is_help) {
-        util.say("{s}", .{usage});
-        util.say("\nVersion: {s}", .{versionLine(ctx, root)});
+        util.say(std.fmt.allocPrint(ctx.arena, "{s}", .{usage}) catch "");
+        util.say(std.fmt.allocPrint(ctx.arena, "\nVersion: {s}", .{versionLine(ctx, root)}) catch "");
         return 0;
     }
     util.errPrint("{s}", .{usage});
@@ -119,8 +172,6 @@ fn isVersion(a: []const u8) bool {
     return std.mem.eql(u8, a, "version") or std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V");
 }
 
-/// The commit and date the flake built this yolo from (empty for a plain
-/// `zig build`), else the checkout's.
 pub fn versionLine(ctx: Ctx, root: []const u8) []const u8 {
     if (options.version.len != 0)
         return std.fmt.allocPrint(ctx.arena, "yolo {s} ({s}, compiled)", .{ options.version, options.date }) catch "yolo ?";
@@ -131,15 +182,10 @@ pub fn versionLine(ctx: Ctx, root: []const u8) []const u8 {
     return std.fmt.allocPrint(ctx.arena, "yolo {s} (script, {s})", .{ util.trim(r.stdout), root }) catch "yolo ?";
 }
 
-/// The repository: $YOLO_ROOT (the compiled yolo's wrapper defaults it to the
-/// flake's source), else the build root compiled in (`zig build run` in a
-/// checkout).
 pub fn yoloRoot(ctx: Ctx) []const u8 {
     return ctx.envNonEmpty("YOLO_ROOT") orelse options.root;
 }
 
-/// Commands that rewrite image/ (pins, flake.lock) need a checkout, not the
-/// read-only copy a compiled yolo carries.
 pub fn needCheckout(root: []const u8, what: []const u8) void {
     if (std.mem.startsWith(u8, root, "/nix/store/"))
         util.dief("{s} updates image/ in the repository; run it from a yolo checkout or set YOLO_ROOT to one", .{what});
@@ -150,45 +196,125 @@ pub fn needCheckout(root: []const u8, what: []const u8) void {
 // ---------------------------------------------------------------------------
 
 fn cmdNew(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
-    _ = ctx;
-    _ = root;
-    _ = rest;
-    util.die("not ported yet");
+    if (rest.len == 0) util.die("usage: yolo new NAME [--backend docker|datum] [--agent HARNESS] [options]");
+    const name = rest[0];
+    var backend = ctx.opt("BACKEND", "docker");
+    var harness = ctx.opt("AGENT", "claude");
+    var i: usize = 1;
+    var extra: std.ArrayList([]const u8) = .empty;
+    while (i < rest.len) {
+        if (std.mem.eql(u8, rest[i], "--backend") and i + 1 < rest.len) {
+            backend = rest[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, rest[i], "--agent") and i + 1 < rest.len) {
+            harness = rest[i + 1];
+            i += 2;
+        } else {
+            extra.append(ctx.arena, rest[i]) catch unreachable;
+            i += 1;
+        }
+    }
+    session.checkHarness(harness);
+    _ = session.dir(ctx, name);
+    const b = loadBackend(ctx, root, backend);
+    return Backend.new(ctx, b, name, harness, extra.items);
 }
 
 fn cmdAttach(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
-    _ = ctx;
-    _ = root;
-    _ = rest;
-    util.die("not ported yet");
+    if (rest.len == 0) util.die("usage: yolo attach NAME [args...]");
+    const name = rest[0];
+    const b = sessionBackend(ctx, root, name);
+    return Backend.attach(ctx, b, name, rest[1..]);
 }
 
 fn cmdLogs(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
-    _ = ctx;
-    _ = root;
-    _ = rest;
-    util.die("not ported yet");
+    if (rest.len == 0) util.die("usage: yolo logs NAME [args...]");
+    const name = rest[0];
+    const b = sessionBackend(ctx, root, name);
+    return Backend.logs(ctx, b, name, rest[1..]);
 }
 
 fn cmdRm(ctx: Ctx, root: []const u8, name: []const u8) u8 {
-    _ = ctx;
-    _ = root;
-    _ = name;
-    util.die("not ported yet");
+    const b = sessionBackend(ctx, root, name);
+    return Backend.rm(ctx, b, name);
 }
 
 fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
-    _ = ctx;
-    _ = root;
-    _ = full;
-    util.die("not ported yet");
+    // Datum is the source of truth for datum sessions: bring the local state
+    // in line with it first, wherever each session was made.
+    const has_datumctl = util.findExecutable(ctx, "datumctl") != null;
+    var items: ?[]const json.Value = null;
+    if (has_datumctl) items = datum.datumSync(ctx);
+    const st = session.state(ctx);
+    const names = util.listDir(ctx, st);
+    var dirs: std.ArrayList([]const u8) = .empty;
+    for (names) |n| {
+        if (util.dirExists(ctx, util.join(ctx, &.{ st, n }))) dirs.append(ctx.arena, n) catch {};
+    }
+    // Render the session table with aligned columns.
+    var rows: std.ArrayList([]const []const u8) = .empty;
+    var backends: std.ArrayList([]const u8) = .empty;
+    rows.append(ctx.arena, &.{ "NAME", "BACKEND", "HARNESS", "CLASS", "STATE" }) catch {};
+    for (dirs.items) |n| {
+        const b = util.readMeta(ctx, util.join(ctx, &.{ st, n, "backend" }), "?");
+        const h = util.readMeta(ctx, util.join(ctx, &.{ st, n, "harness" }), "?");
+        const c = util.readMeta(ctx, util.join(ctx, &.{ st, n, "class" }), "-");
+        const s = util.readMeta(ctx, util.join(ctx, &.{ st, n, "state" }), "-");
+        rows.append(ctx.arena, &.{ n, b, h, c, s }) catch {};
+        // record unique non-? non-datum backends
+        var seen = false;
+        if (!std.mem.eql(u8, b, "?") and !std.mem.eql(u8, b, "datum")) {
+            for (backends.items) |x| {
+                if (std.mem.eql(u8, x, b)) seen = true;
+            }
+            if (!seen) backends.append(ctx.arena, b) catch {};
+        }
+    }
+    const table = util.renderTable(ctx.arena, rows.items) catch "";
+    util.say(table);
+    for (backends.items) |b| {
+        util.say("");
+        util.say(std.fmt.allocPrint(ctx.arena, "== {s}", .{b}) catch "");
+        const be = loadBackend(ctx, root, b);
+        _ = Backend.ls(ctx, be, full);
+    }
+    if (!has_datumctl) {
+        util.errPrint("yolo: datumctl isn't in PATH, so the datum sessions can't be checked", .{});
+    }
+    if (items) |it| datum.datumTable(ctx, full, it);
+    return 0;
 }
 
 fn cmdBuild(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
-    _ = ctx;
-    _ = root;
-    _ = rest;
-    util.die("not ported yet");
+    var backend = ctx.opt("BACKEND", "docker");
+    var cls: ?[]const u8 = null;
+    var hs: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < rest.len) {
+        if (std.mem.eql(u8, rest[i], "--backend") and i + 1 < rest.len) {
+            backend = rest[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, rest[i], "--class") and i + 1 < rest.len) {
+            cls = rest[i + 1];
+            i += 2;
+        } else {
+            hs.append(ctx.arena, rest[i]) catch unreachable;
+            i += 1;
+        }
+    }
+    for (hs.items) |h| session.checkHarness(h);
+    if (hs.items.len == 0) util.die("usage: yolo build HARNESS... [--backend docker|datum] [--class CLASS]");
+    if (std.mem.eql(u8, backend, "datum")) {
+        const c = cls orelse "unikernel";
+        return datum.buildDatum(ctx, root, c, hs.items);
+    }
+    if (std.mem.eql(u8, backend, "docker")) {
+        if (cls != null) util.die("--class is for the datum backend");
+        const d = docker.config(ctx);
+        for (hs.items) |h| _ = docker.dockerBuild(ctx, root, d, h);
+        return 0;
+    }
+    util.dief("unknown backend '{s}'", .{backend});
 }
 
 test {

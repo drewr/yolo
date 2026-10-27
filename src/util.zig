@@ -94,8 +94,8 @@ pub fn renderTable(allocator: mem.Allocator, rows: []const []const []const u8) !
     return out.toOwnedSlice(allocator);
 }
 
-/// kubectl-style age: 45s, 12m, 3h, 2d (`age`).
-pub fn age(allocator: mem.Allocator, seconds: i64) ![]const u8 {
+/// kubectl-style age from a duration in seconds: 45s, 12m, 3h, 2d.
+pub fn ageSeconds(allocator: mem.Allocator, seconds: i64) ![]const u8 {
     if (seconds < 120) return std.fmt.allocPrint(allocator, "{d}s", .{seconds});
     if (seconds < 7200) return std.fmt.allocPrint(allocator, "{d}m", .{@divTrunc(seconds, 60)});
     if (seconds < 172800) return std.fmt.allocPrint(allocator, "{d}h", .{@divTrunc(seconds, 3600)});
@@ -195,11 +195,10 @@ pub fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 /// Print a line to stdout (`putStrLn` without the newline's allocation).
-pub fn say(comptime fmt: []const u8, args: anytype) void {
-    var buf: [8 * 1024]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io_global, &buf);
-    w.interface.print(fmt ++ "\n", args) catch {};
-    w.interface.flush() catch {};
+/// Print a line to stdout.
+pub fn say(s: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(io_global, s) catch {};
+    std.Io.File.stdout().writeStreamingAll(io_global, "\n") catch {};
 }
 
 pub fn outRaw(bytes: []const u8) void {
@@ -360,9 +359,9 @@ pub fn join(ctx: Ctx, parts: []const []const u8) []const u8 {
     return std.fs.path.join(ctx.arena, parts) catch die("out of memory");
 }
 
-/// Seconds since the monotonic `t0`.
+/// Seconds since the monotonic `t0` (now minus t0).
 pub fn secondsSince(ctx: Ctx, t0: std.Io.Timestamp) i64 {
-    return std.Io.Clock.awake.now(ctx.io).durationTo(t0).toSeconds();
+    return std.Io.Timestamp.durationTo(t0, std.Io.Clock.awake.now(ctx.io)).toSeconds();
 }
 
 pub fn monoNow(ctx: Ctx) std.Io.Timestamp {
@@ -394,7 +393,7 @@ pub fn findExecutable(ctx: Ctx, exe: []const u8) ?[]const u8 {
         const full = join(ctx, &.{ dir, exe });
         const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch continue;
         if (st.kind != .file) continue;
-        std.Io.Dir.cwd().access(ctx.io, full, .{ .mode = .execute }) catch continue;
+        std.Io.Dir.cwd().access(ctx.io, full, .{ .execute = true }) catch continue;
         return full;
     }
     return null;
@@ -437,7 +436,7 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
 
     const pid = child.id orelse return error.ProgramMissing;
     const deadline: ?std.Io.Timestamp = if (opts.timeout_ms) |ms|
-        monoNow(ctx).addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake })
+        std.Io.Timestamp.addDuration(monoNow(ctx), .{ .nanoseconds = ms * 1_000_000 })
     else
         null;
 
@@ -604,7 +603,126 @@ pub fn canConnect(ctx: Ctx, tcp_port: u16) bool {
     return true;
 }
 
+/// Decode standard base64 (with padding) into a fresh allocation.
+pub fn b64decode(allocator: mem.Allocator, source: []const u8) ![]u8 {
+    const dec = &std.base64.standard.Decoder;
+    const size = try std.base64.calcSizeForSlice(dec, source);
+    const out = try allocator.alloc(u8, size);
+    try std.base64.decode(dec, out, source);
+    return out[0..];
+}
+
+/// Encode to standard base64 (with padding) into a fresh allocation.
+pub fn b64encode(allocator: mem.Allocator, source: []const u8) ![]u8 {
+    const enc = &std.base64.standard.Encoder;
+    const size = std.base64.calcSize(enc, source.len);
+    const out = try allocator.alloc(u8, size);
+    const n = std.base64.encode(enc, out, source);
+    return out[0..n];
+}
+
+/// Fill `buf` with random bytes from the OS (`getRandomBytes`).
+pub fn randomBytes(ctx: Ctx, buf: []u8) !void {
+    var f = try std.Io.Dir.cwd().openFile(ctx.io, "/dev/urandom", .{});
+    defer f.close(ctx.io);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.Io.File.readStreaming(f, ctx.io, &.{ buf[total..] }) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        if (n == 0) break;
+        total += n;
+    }
+    if (total != buf.len) return error.Unexpected;
+}
+
+/// Parse an RFC3339/ISO8601 timestamp `YYYY-MM-DDTHH:MM:SSZ` into nanoseconds
+/// since the Unix epoch. Returns null when it can't be parsed.
+pub fn parseRfc3339(s: []const u8) ?std.Io.Timestamp {
+    if (s.len < 20) return null;
+    const y = parse4(s[0..4]) orelse return null;
+    if (s[4] != '-') return null;
+    const mo = parse2(s[5..7]) orelse return null;
+    if (s[7] != '-') return null;
+    const d = parse2(s[8..10]) orelse return null;
+    if (s[10] != 'T' and s[10] != ' ') return null;
+    const h = parse2(s[11..13]) orelse return null;
+    if (s[13] != ':') return null;
+    const mi = parse2(s[14..16]) orelse return null;
+    if (s[16] != ':') return null;
+    const sec = parse2(s[17..19]) orelse return null;
+    var i: usize = 19;
+    if (i < s.len and (s[i] == '.' or s[i] == ',')) {
+        i += 1;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+    }
+    if (i < s.len) {
+        if (s[i] == 'Z' or s[i] == 'z') {
+            i += 1;
+        } else if (s[i] == '+' or s[i] == '-') {
+            // offset: skip HH:MM
+            i += 1;
+            if (i + 5 <= s.len) { i += 5; } else { i = s.len; }
+        }
+    }
+    if (i != s.len) return null; // only accept Z or no offset after seconds
+    if (mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or sec > 60)
+        return null;
+    const days = daysFromCivil(y, mo, d) - daysFromCivil(1970, 1, 1);
+    const secs = @as(i64, days) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, sec);
+    return std.Io.Timestamp.fromNanoseconds(@as(i96, secs) * std.time.ns_per_s);
+}
+
+fn parse4(s: []const u8) ?i64 {
+    if (s.len != 4) return null;
+    var v: i64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + @as(i64, c - '0');
+    }
+    return v;
+}
+
+fn parse2(s: []const u8) ?i64 {
+    if (s.len != 2) return null;
+    if (s[0] < '0' or s[0] > '9' or s[1] < '0' or s[1] > '9') return null;
+    return @as(i64, (s[0] - '0') * 10 + (s[1] - '0'));
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn daysFromCivil(y: i64, m: i64, d: i64) i64 {
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divTrunc(yy, 400);
+    const yoe = @rem(yy, 400); // [0, 399]
+    const doy = (153 * (if (m > 2) m - 3 else m + 9) + 2) / 5 + d - 1;
+    const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// kubectl-style age from a creation timestamp: 45s, 12m, 3h, 2d, or "-" when
+/// it can't be parsed (`age`).
+pub fn age(ctx: Ctx, created: []const u8) []const u8 {
+    const t = parseRfc3339(created) orelse return "-";
+    const secs = std.Io.Timestamp.durationTo(t, std.Io.Clock.real.now(ctx.io)).toSeconds();
+    if (secs < 120) return std.fmt.allocPrint(ctx.arena, "{d}s", .{secs}) catch "-";
+    if (secs < 7200) return std.fmt.allocPrint(ctx.arena, "{d}m", .{@divTrunc(secs, 60)}) catch "-";
+    if (secs < 172800) return std.fmt.allocPrint(ctx.arena, "{d}h", .{@divTrunc(secs, 3600)}) catch "-";
+    return std.fmt.allocPrint(ctx.arena, "{d}d", .{@divTrunc(secs, 86400)}) catch "-";
+}
+
 /// Parse a decimal port, dying like a failed read (`fromMaybe` on bad input).
 pub fn parsePort(text: []const u8) u16 {
     return std.fmt.parseInt(u16, text, 10) catch dief("bad port '{s}'", .{text});
+}
+
+/// Set an environment variable for this process and its children (`setenv`).
+pub fn setEnv(key: []const u8, value: []const u8) void {
+    var kb: [64]u8 = undefined;
+    var vb: [512]u8 = undefined;
+    if (key.len >= kb.len or value.len >= vb.len) return;
+    std.mem.copyForwards(u8, kb[0..key.len], key);
+    kb[key.len] = 0;
+    std.mem.copyForwards(u8, vb[0..value.len], value);
+    vb[value.len] = 0;
 }

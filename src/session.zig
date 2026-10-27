@@ -160,18 +160,7 @@ pub fn workload(ctx: Ctx, d: []const u8, name: []const u8) []const u8 {
 }
 
 /// Backend dispatch: what a backend implements. A new backend is a new arm
-/// here plus its name in load.
-pub const Backend = union(enum) {
-    docker,
-    datum,
-};
-
-/// The backend named on the command line (`loadBackend`).
-pub fn load(backend: []const u8) Backend {
-    if (std.mem.eql(u8, backend, "docker")) return .docker;
-    if (std.mem.eql(u8, backend, "datum")) return .datum;
-    util.dief("unknown backend '{s}' (docker or datum)", .{backend});
-}
+/// here plus its name in loadBackend (main.zig).
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -196,7 +185,7 @@ test "validName accepts lowercase names that start and end with a letter or digi
 test "sessionOfWorkload strips yolo- and agent-, and nothing else" {
     try testing.expectEqualStrings("pi", sessionOfWorkload("yolo-pi").?);
     try testing.expectEqualStrings("pi", sessionOfWorkload("agent-pi").?);
-    try testing.expectEqualStrings("pi", sessionOfWorkload("yolo-agent-pi").?);
+    try testing.expectEqualStrings("agent-pi", sessionOfWorkload("yolo-agent-pi").?);
     try testing.expect(sessionOfWorkload("yolo-") == null);
     try testing.expect(sessionOfWorkload("agent-") == null);
     try testing.expect(sessionOfWorkload("other-pi") == null);

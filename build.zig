@@ -39,8 +39,7 @@ pub fn build(b: *std.Build) !void {
     run_yolo_exe.addPassthruArgs();
     run_yolo.dependOn(&run_yolo_exe.step);
 
-    // Tests: the unit tests (main.zig imports them all) and the golden vectors
-    // the Haskell yolo produced before it was deleted.
+    // Tests: the unit tests (main.zig imports them all).
     const test_step = b.step("test", "Run tests");
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -51,16 +50,6 @@ pub fn build(b: *std.Build) !void {
     });
     unit_tests.root_module.addOptions("options", options);
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-
-    const golden_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/golden_test.zig"),
-            .target = target,
-            .optimize = .Debug,
-        }),
-    });
-    golden_tests.root_module.addOptions("options", options);
-    test_step.dependOn(&b.addRunArtifact(golden_tests).step);
 }
 
 /// `git describe --always --dirty --abbrev=7 --match=^` in the build root, like

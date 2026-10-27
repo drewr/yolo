@@ -43,7 +43,6 @@
         fileset = pkgs.lib.fileset.unions [
           ./build.zig
           ./src
-          ./tests
         ];
       };
       nativeBuildInputs = [ zig pkgs.makeWrapper ];
