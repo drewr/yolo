@@ -434,7 +434,7 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
     child.stdin.?.close(ctx.io);
     child.stdin = null;
 
-    const pid = child.id orelse return error.ProgramMissing;
+    _ = child.id orelse return error.ProgramMissing;
     const deadline: ?std.Io.Timestamp = if (opts.timeout_ms) |ms|
         std.Io.Timestamp.addDuration(monoNow(ctx), .{ .nanoseconds = ms * 1_000_000 })
     else
@@ -445,14 +445,14 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
     var err_buf: [16 * 1024]u8 = undefined;
     var err_reader = child.stderr.?.reader(ctx.io, &err_buf);
 
-    const out = readUntilEnd(ctx, &out_reader.interface, pid, deadline) catch |e| switch (e) {
+    const out = readUntilEnd(ctx, &out_reader.interface, deadline) catch |e| switch (e) {
         error.TimedOut => {
             child.kill(ctx.io);
             return .{ .term = .timed_out, .code = 124, .stdout = "", .stderr = "" };
         },
         else => return e,
     };
-    const err = readUntilEnd(ctx, &err_reader.interface, pid, deadline) catch |e| switch (e) {
+    const err = readUntilEnd(ctx, &err_reader.interface, deadline) catch |e| switch (e) {
         error.TimedOut => {
             child.kill(ctx.io);
             return .{ .term = .timed_out, .code = 124, .stdout = "", .stderr = "" };
@@ -473,21 +473,14 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
 fn readUntilEnd(
     ctx: Ctx,
     reader: *std.Io.Reader,
-    pid: std.posix.pid_t,
     deadline: ?std.Io.Timestamp,
 ) error{ TimedOut, OutOfMemory }![]u8 {
     var list: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     while (true) {
-        const vecs: [1][]u8 = .{&buf};
-        const n = reader.readVec(&vecs) catch |e| switch (e) {
-            error.EndOfStream => return list.toOwnedSlice(ctx.arena),
-            else => {
-                // A closed pipe (or an error on it) means the child is gone;
-                // any waitpid below still reports its code.
-                if (exited(pid) != null) return list.toOwnedSlice(ctx.arena);
-                return e;
-            },
+        var arr: [1][]u8 = .{&buf};
+        const n = reader.readVec(&arr) catch |e| switch (e) {
+            error.EndOfStream, error.ReadFailed => return list.toOwnedSlice(ctx.arena),
         };
         try list.appendSlice(ctx.arena, buf[0..n]);
         if (deadline) |d| {
