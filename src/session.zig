@@ -104,7 +104,7 @@ pub fn create(ctx: Ctx, name: []const u8, backend: []const u8, harness: []const 
     const d = dir(ctx, name);
     if (util.exists(ctx, d)) util.dief("session {s} exists ({s}); yolo rm {s} first", .{ name, d, name });
     util.createDirPath(ctx, d) catch |e| util.dief("can't create {s}: {t}", .{ d, e });
-    std.Io.Dir.cwd().setFilePermissions(ctx.io, d, @enumFromInt(0o700), .{}) catch {};
+    std.Io.Dir.cwd().setFilePermissions(ctx.io, d, @fromBackingInt(@intCast(0o700)), .{}) catch {};
     const backendFile = util.join(ctx, &.{ d, "backend" });
     util.writeFileOrDie(ctx, backendFile, std.fmt.allocPrint(ctx.arena, "{s}\n", .{backend}) catch "");
     const harnessFile = util.join(ctx, &.{ d, "harness" });

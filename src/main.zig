@@ -28,19 +28,20 @@ const Ctx = util.Ctx;
 /// A functional backend: the five session operations, closed over its config.
 /// A new backend is a new arm here plus its name in loadBackend.
 pub const Backend = union(enum) {
-    docker: docker.Docker,
+    /// The runtime a new session gets; later commands read the recorded one.
+    docker: docker.Runtime,
     datum: datum.Datum,
 
-    pub fn new(ctx: Ctx, self: Backend, name: []const u8, harness: []const u8, opts: []const []const u8) u8 {
+    pub fn new(ctx: Ctx, self: Backend, root: []const u8, name: []const u8, harness: []const u8, opts: []const []const u8) u8 {
         return switch (self) {
-            .docker => |d| docker.dockerNew(ctx, d, name, harness, opts),
+            .docker => |r| docker.dockerNew(ctx, root, r, docker.config(ctx, r), name, harness, opts),
             .datum => |d| datum.datumNew(ctx, d, name, harness, opts),
         };
     }
 
     pub fn attach(ctx: Ctx, self: Backend, name: []const u8, args: []const []const u8) u8 {
         return switch (self) {
-            .docker => |d| docker.dockerAttach(ctx, d, name, args),
+            .docker => |r| docker.dockerAttach(ctx, docker.config(ctx, r), name, args),
             .datum => |d| datum.datumAttach(ctx, d, name, args),
         };
     }
@@ -54,14 +55,14 @@ pub const Backend = union(enum) {
 
     pub fn logs(ctx: Ctx, self: Backend, name: []const u8, args: []const []const u8) u8 {
         return switch (self) {
-            .docker => |d| docker.dockerLogs(ctx, d, name, args),
+            .docker => |r| docker.dockerLogs(ctx, docker.config(ctx, r), name, args),
             .datum => |d| datum.datumLogs(ctx, d, name, args),
         };
     }
 
     pub fn rm(ctx: Ctx, self: Backend, name: []const u8) u8 {
         return switch (self) {
-            .docker => |d| docker.dockerRm(ctx, d, name),
+            .docker => docker.dockerRm(ctx, name),
             .datum => |d| datum.datumRm(ctx, d, name),
         };
     }
@@ -69,7 +70,7 @@ pub const Backend = union(enum) {
 
 /// The backend named on the command line (`loadBackend`).
 pub fn loadBackend(ctx: Ctx, root: []const u8, which: []const u8) Backend {
-    if (std.mem.eql(u8, which, "docker")) util.die("docker backend not ported yet");
+    if (std.mem.eql(u8, which, "docker")) return .{ .docker = docker.containerRuntime(ctx) };
     if (std.mem.eql(u8, which, "datum")) return .{ .datum = datum.config(ctx, root) };
     util.dief("unknown backend '{s}' (docker or datum)", .{which});
 }
@@ -219,7 +220,7 @@ fn cmdNew(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
     session.checkHarness(harness);
     _ = session.dir(ctx, name);
     const b = loadBackend(ctx, root, backend);
-    return Backend.new(ctx, b, name, harness, extra.items);
+    return Backend.new(ctx, b, root, name, harness, extra.items);
 }
 
 fn cmdAttach(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
@@ -307,9 +308,7 @@ fn cmdBuild(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
     }
     if (std.mem.eql(u8, backend, "docker")) {
         if (cls != null) util.die("--class is for the datum backend");
-        const d = docker.config(ctx);
-        for (hs.items) |h| _ = docker.dockerBuild(ctx, root, d, h);
-        return 0;
+        return docker.buildAll(ctx, root, hs.items);
     }
     util.dief("unknown backend '{s}'", .{backend});
 }

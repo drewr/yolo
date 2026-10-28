@@ -209,3 +209,64 @@ test "ssh args: no arguments leaves the command empty" {
     try testing.expectEqual(@as(usize, 0), split.opts.len);
     try testing.expectEqual(@as(usize, 0), split.cmd.len);
 }
+
+// ---------------------------------------------------------------------------
+// docker: the runtime record and attach's command
+// ---------------------------------------------------------------------------
+
+test "docker: runtime file round trip" {
+    const docker = @import("docker.zig");
+    const a = testing.allocator;
+    const rt = docker.Runtime{ .exe = "/usr/bin/docker", .vm = false, .context = null };
+    const text = try docker.runtimeFile(a, rt);
+    defer a.free(text);
+    try testing.expectEqualStrings("/usr/bin/docker\n-\n-\n", text);
+    const back = docker.parseRuntime(text).?;
+    try testing.expectEqualStrings("/usr/bin/docker", back.exe);
+    try testing.expect(!back.vm);
+    try testing.expect(back.context == null);
+}
+
+test "docker: runtime file keeps the vm flag and context" {
+    const docker = @import("docker.zig");
+    const a = testing.allocator;
+    const rt = docker.Runtime{ .exe = "/nix/store/x/bin/docker", .vm = true, .context = "colima" };
+    const text = try docker.runtimeFile(a, rt);
+    defer a.free(text);
+    const back = docker.parseRuntime(text).?;
+    try testing.expect(back.vm);
+    try testing.expectEqualStrings("colima", back.context.?);
+}
+
+test "docker: a malformed runtime file is ignored" {
+    const docker = @import("docker.zig");
+    // Only an empty executable or too few lines is a malformed file; a
+    // trailing newline is fine (the Haskell's `lines` drops it).
+    try testing.expect(docker.parseRuntime("docker\nvm\n").?.vm);
+    try testing.expect(docker.parseRuntime("\n-\n-\n") == null);
+    try testing.expect(docker.parseRuntime("") == null);
+}
+
+test "docker: runtime equality" {
+    const docker = @import("docker.zig");
+    const a = docker.Runtime{ .exe = "docker", .vm = false, .context = null };
+    const b = docker.Runtime{ .exe = "docker", .vm = false, .context = null };
+    const c = docker.Runtime{ .exe = "docker", .vm = false, .context = "colima" };
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eql(c));
+}
+
+test "docker: attach runs a login shell, or the words as one command" {
+    const docker = @import("docker.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const login = try docker.attachCommand(a, &.{});
+    try testing.expectEqual(@as(usize, 2), login.len);
+    try testing.expectEqualStrings("zsh", login[0]);
+    try testing.expectEqualStrings("-l", login[1]);
+    const cmd = try docker.attachCommand(a, &.{ "echo", "hi there", "|", "wc" });
+    try testing.expectEqual(@as(usize, 3), cmd.len);
+    try testing.expectEqualStrings("-lc", cmd[1]);
+    try testing.expectEqualStrings("echo hi there | wc", cmd[2]);
+}

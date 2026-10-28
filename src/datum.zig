@@ -262,8 +262,10 @@ pub fn datumSsh(
     out.appendSlice(ctx.arena, &.{ known, "-o" }) catch util.die("out of memory");
     out.appendSlice(ctx.arena, &.{
         std.fmt.allocPrint(ctx.arena, "HostKeyAlias={s}", .{wl}) catch "",
-        "-o", "StrictHostKeyChecking=yes",
-        "-o", "ServerAliveInterval=30",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ServerAliveInterval=30",
     }) catch util.die("out of memory");
     if (identity) |i| {
         out.appendSlice(ctx.arena, &.{ "-i", i, "-o", "IdentitiesOnly=yes" }) catch util.die("out of memory");
@@ -443,10 +445,10 @@ pub fn datumTable(ctx: Ctx, full: bool, items: []const json.Value) void {
         var locations: std.ArrayList([]const u8) = .empty;
         var placement_names: std.ArrayList([]const u8) = .empty;
         for (placements) |p| {
-            const pn = json.str(&.{ "name" }, p);
+            const pn = json.str(&.{"name"}, p);
             if (!contains(placement_names.items, pn)) placement_names.append(ctx.arena, pn) catch {};
-            for (json.list(&.{ "locations" }, p)) |l| {
-                const ln = json.str(&.{ "name" }, l);
+            for (json.list(&.{"locations"}, p)) |l| {
+                const ln = json.str(&.{"name"}, l);
                 if (!contains(locations.items, ln)) locations.append(ctx.arena, ln) catch {};
             }
         }
@@ -454,8 +456,8 @@ pub fn datumTable(ctx: Ctx, full: bool, items: []const json.Value) void {
             const conds = json.list(&.{ "status", "conditions" }, w);
             var any = false;
             for (conds) |c| {
-                if (mem.eql(u8, json.str(&.{ "type" }, c), "Available")) {
-                    if (mem.eql(u8, json.str(&.{ "status" }, c), "True")) any = true;
+                if (mem.eql(u8, json.str(&.{"type"}, c), "Available")) {
+                    if (mem.eql(u8, json.str(&.{"status"}, c), "True")) any = true;
                 }
             }
             break :blk if (any) "Available" else "Unavailable";
@@ -468,7 +470,7 @@ pub fn datumTable(ctx: Ctx, full: bool, items: []const json.Value) void {
         const img0 = blk: {
             const containers = json.list(&.{ "spec", "template", "spec", "runtime", "sandbox", "containers" }, w);
             if (containers.len == 0) break :blk "";
-            break :blk json.str(&.{ "image" }, containers[0]);
+            break :blk json.str(&.{"image"}, containers[0]);
         };
         const img = if (full) img0 else util.shortImage(ctx.arena, img0) catch img0;
         const created = json.str(&.{ "metadata", "creationTimestamp" }, w);

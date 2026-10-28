@@ -218,6 +218,13 @@ pub fn say(s: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io_global, "\n") catch {};
 }
 
+/// Print a formatted line to stdout.
+pub fn sayf(comptime fmt: []const u8, args: anytype) void {
+    var buf: [8 * 1024]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    say(line);
+}
+
 pub fn outRaw(bytes: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io_global, bytes) catch {};
 }
@@ -318,7 +325,7 @@ pub fn symlink(ctx: Ctx, target: []const u8, link: []const u8) !void {
 }
 
 pub fn copyFile(ctx: Ctx, from: []const u8, to: []const u8) !void {
-    try std.Io.Dir.cwd().copyFile(ctx.io, from, std.Io.Dir.cwd(), to, .{});
+    try std.Io.Dir.cwd().copyFile(from, std.Io.Dir.cwd(), to, ctx.io, .{});
 }
 
 /// Directory entry names, sorted; empty when the directory can't be read.
@@ -429,7 +436,6 @@ pub const Result = struct {
     stderr: []u8,
 };
 
-
 /// `argv` with argv[0] resolved through PATH: std.process.spawn and replace
 /// don't search PATH (and the Haskell's readProcess did).
 fn resolve(ctx: Ctx, argv: []const []const u8) []const []const u8 {
@@ -450,8 +456,8 @@ pub fn capture(ctx: Ctx, argv: []const []const u8, opts: struct {
     timeout_ms: ?i64 = null,
 }) !Result {
     var child = try std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -523,8 +529,8 @@ fn readUntilEnd(
 /// 127 when the program is missing (`quiet`).
 pub fn quiet(ctx: Ctx, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -541,8 +547,8 @@ pub fn quiet(ctx: Ctx, argv: []const []const u8) u8 {
 /// time (the Haskell's `timeout N`).
 pub fn quietUntil(ctx: Ctx, argv: []const []const u8, seconds: i64) ?u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -574,8 +580,8 @@ fn exited(pid: std.posix.pid_t) ?u8 {
 /// Run `argv` with the terminal inherited, and take its exit code.
 pub fn inherit(ctx: Ctx, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -598,8 +604,8 @@ pub fn replace(ctx: Ctx, argv: []const []const u8) noreturn {
 /// `runLogged`, which waits and ignores stdin's contents).
 pub fn logged(ctx: Ctx, log: std.Io.File, argv: []const []const u8) u8 {
     var child = std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .inherit,
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
@@ -615,8 +621,8 @@ pub fn logged(ctx: Ctx, log: std.Io.File, argv: []const []const u8) u8 {
 /// the child (for the SSH-agent relay and the BuildKit tunnel).
 pub fn spawnBackground(ctx: Ctx, argv: []const []const u8) ?std.process.Child {
     return std.process.spawn(ctx.io, .{
-        .argv = resolve(ctx, argv),
         .environ_map = ctx.env,
+        .argv = resolve(ctx, argv),
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -653,7 +659,7 @@ pub fn randomBytes(ctx: Ctx, buf: []u8) !void {
     defer f.close(ctx.io);
     var total: usize = 0;
     while (total < buf.len) {
-        const n = std.Io.File.readStreaming(f, ctx.io, &.{ buf[total..] }) catch |e| switch (e) {
+        const n = std.Io.File.readStreaming(f, ctx.io, &.{buf[total..]}) catch |e| switch (e) {
             error.EndOfStream => break,
             else => return e,
         };
@@ -689,7 +695,11 @@ pub fn parseRfc3339(s: []const u8) ?std.Io.Timestamp {
         } else if (s[i] == '+' or s[i] == '-') {
             // offset: skip HH:MM
             i += 1;
-            if (i + 5 <= s.len) { i += 5; } else { i = s.len; }
+            if (i + 5 <= s.len) {
+                i += 5;
+            } else {
+                i = s.len;
+            }
         }
     }
     if (i != s.len) return null; // only accept Z or no offset after seconds
