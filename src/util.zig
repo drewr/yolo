@@ -544,7 +544,9 @@ pub fn quiet(ctx: Ctx, argv: []const []const u8) u8 {
 }
 
 /// Run `argv` quietly, killing it after `seconds`: `null` when it ran out of
-/// time (the Haskell's `timeout N`).
+/// time (the Haskell's `timeout N`). The child is reaped here (waitpid), and
+/// `Child.wait` is never called afterwards: it would find the pid already
+/// gone and report an error instead of the real exit code.
 pub fn quietUntil(ctx: Ctx, argv: []const []const u8, seconds: i64) ?u8 {
     var child = std.process.spawn(ctx.io, .{
         .environ_map = ctx.env,
@@ -555,26 +557,36 @@ pub fn quietUntil(ctx: Ctx, argv: []const []const u8, seconds: i64) ?u8 {
     }) catch return 127;
     defer child.kill(ctx.io);
     const pid = child.id orelse return 1;
-    const deadline = monoNow(ctx).addDuration(.{ .raw = .fromSeconds(seconds), .clock = .awake });
+    const deadline = monoNow(ctx).addDuration(.fromSeconds(seconds));
     while (true) {
-        if (exited(pid)) |code| return code;
+        switch (pollExited(pid)) {
+            .code => |code| return code,
+            .gone => return 1,
+            .running => {},
+        }
         if (monoNow(ctx).compare(.gte, deadline)) {
-            child.kill(ctx.io);
-            child.wait(ctx.io) catch {};
+            // SIGKILL the pid directly and reap it, so the poll above and
+            // `Child.kill`'s state stay consistent.
+            _ = std.os.linux.kill(pid, std.os.linux.SIG.KILL);
+            _ = pollExited(pid);
             return null;
         }
         sleep(ctx, 50);
     }
 }
 
-fn exited(pid: std.posix.pid_t) ?u8 {
+const Waited = union(enum) { running, gone, code: u8 };
+
+/// waitpid(WNOHANG) without Child's bookkeeping: tells "still running" from
+/// "reaped, here is the code" from "already gone" (ECHILD).
+fn pollExited(pid: std.posix.pid_t) Waited {
     var status: u32 = 0;
     const rc = std.os.linux.waitpid(pid, @ptrCast(&status), std.os.linux.W.NOHANG);
     const signed: isize = @bitCast(rc);
-    if (signed == 0) return null; // still running
-    if (signed < 0) return 1; // ECHILD: someone else reaped it
-    if (std.os.linux.W.IFEXITED(status)) return std.os.linux.W.EXITSTATUS(status);
-    return 1;
+    if (signed == 0) return .running;
+    if (signed < 0) return .gone;
+    if (std.os.linux.W.IFEXITED(status)) return .{ .code = std.os.linux.W.EXITSTATUS(status) };
+    return .{ .code = 1 };
 }
 
 /// Run `argv` with the terminal inherited, and take its exit code.

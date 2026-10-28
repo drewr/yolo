@@ -318,5 +318,7 @@ test {
     _ = keys;
     _ = session;
     _ = infra;
+    _ = images;
+    _ = docker;
     _ = @import("golden_test.zig");
 }
