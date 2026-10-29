@@ -99,9 +99,8 @@ pub fn renderTable(allocator: mem.Allocator, rows: []const []const []const u8) !
 /// %-9s %-16s %s".
 pub fn printTableRow(name: []const u8, backend: []const u8, harness: []const u8, class: []const u8, state: []const u8) void {
     var buf: [512]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io_global, &buf);
-    w.interface.print("{s: <20} {s: <8} {s: <9} {s: <16} {s}\n", .{ name, backend, harness, class, state }) catch {};
-    w.interface.flush() catch {};
+    const line = std.fmt.bufPrint(&buf, "{s: <20} {s: <8} {s: <9} {s: <16} {s}\n", .{ name, backend, harness, class, state }) catch return;
+    outRaw(line);
 }
 
 /// kubectl-style age from a duration in seconds: 45s, 12m, 3h, 2d.
@@ -184,15 +183,15 @@ pub const Ctx = struct {
     }
 };
 
-fn stderrWriter(buf: []u8) std.Io.File.Writer {
-    return std.Io.File.stderr().writer(io_global, buf);
-}
-
+/// Print formatted text to stderr. Uses `writeStreamingAll` rather than a
+/// `File.Writer`: a writer over `stdout`/`stderr` writes at the position it
+/// captured, so one writer per line would rewrite the previous line when the
+/// stream is a file.
 pub fn errPrint(comptime fmt: []const u8, args: anytype) void {
-    var buf: [8 * 1024]u8 = undefined;
-    var w = stderrWriter(&buf);
-    w.interface.print(fmt, args) catch {};
-    w.interface.flush() catch {};
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const text = std.fmt.allocPrint(arena.allocator(), fmt, args) catch return;
+    std.Io.File.stderr().writeStreamingAll(io_global, text) catch {};
 }
 
 /// Print `yolo: MESSAGE` to stderr and exit 1.

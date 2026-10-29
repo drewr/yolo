@@ -159,7 +159,9 @@ pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {
         return 0;
     }
     if (rest.len == 1 and is_help) {
-        util.say(std.fmt.allocPrint(ctx.arena, "{s}", .{usage}) catch "");
+        // `usage` ends with a newline; the blank line before Version is the
+        // Haskell's `\nVersion: ...`, not an extra line after the usage text.
+        util.outRaw(usage);
         util.say(std.fmt.allocPrint(ctx.arena, "\nVersion: {s}", .{versionLine(ctx, root)}) catch "");
         return 0;
     }
@@ -256,6 +258,7 @@ fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
     }
     // The fixed-width table the Haskell prints (printf "%-20s %-8s ...").
     var backends: std.ArrayList([]const u8) = .empty;
+    var has_datum = false;
     util.printTableRow("NAME", "BACKEND", "HARNESS", "CLASS", "STATE");
     for (dirs.items) |n| {
         const b = util.readMeta(ctx, util.join(ctx, &.{ st, n, "backend" }), "?");
@@ -263,7 +266,8 @@ fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
         const c = util.readMeta(ctx, util.join(ctx, &.{ st, n, "class" }), "-");
         const s = util.readMeta(ctx, util.join(ctx, &.{ st, n, "state" }), "-");
         util.printTableRow(n, b, h, c, s);
-        // record unique non-? non-datum backends
+        if (std.mem.eql(u8, b, "datum")) has_datum = true;
+        // Record unique non-? non-datum backends (the datum table comes last).
         var seen = false;
         if (!std.mem.eql(u8, b, "?") and !std.mem.eql(u8, b, "datum")) {
             for (backends.items) |x| {
@@ -273,14 +277,22 @@ fn cmdLs(ctx: Ctx, root: []const u8, full: bool) u8 {
         }
     }
     for (backends.items) |b| {
-        // Each backend's own listing, introduced by "== NAME" (the datum
-        // backend prints its own heading).
-        const be = loadBackend(ctx, root, b);
-        _ = Backend.ls(ctx, be, full);
+        // Each backend's own listing, introduced by a blank line and "== NAME".
+        util.sayf("\n== {s}", .{b});
+        _ = lsBackend(ctx, root, b, full);
     }
-    if (!has_datumctl) util.warn("datumctl isn't in PATH, so the datum sessions can't be checked", .{});
+    if (has_datum and !has_datumctl) util.warn("datumctl isn't in PATH, so the datum sessions can't be checked", .{});
     if (items) |it| datum.datumTable(ctx, full, it);
     return 0;
+}
+
+/// List one backend's sessions for `ls`. Unlike `loadBackend`, this must not
+/// need a working runtime: the docker backend lists what each session
+/// recorded and reports a runtime it can't find, as the Haskell does.
+fn lsBackend(ctx: Ctx, root: []const u8, which: []const u8, full: bool) u8 {
+    if (std.mem.eql(u8, which, "docker")) return docker.dockerLs(ctx);
+    if (std.mem.eql(u8, which, "datum")) return datum.datumLs(ctx, datum.config(ctx, root), full);
+    util.dief("unknown backend '{s}' (docker or datum)", .{which});
 }
 
 fn cmdBuild(ctx: Ctx, root: []const u8, rest: []const []const u8) u8 {
