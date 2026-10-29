@@ -17,50 +17,49 @@ Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0-beta.2/
 
 Common types: `feat`, `fix`, `chore`, `docs`, `refactor`, `ci`
 
-## Language: Haskell, run as Nix scripts
+## Language: Zig
 
-Write new host-side tooling in Haskell, in the style of `yolo` and
-its `flake.nix` (after drewr/birdhaus `run.hs`):
+The CLI is Zig, built with `zigutils`' `zig-dev` pin (the flake's
+`packages.<system>.zig-dev`), so the compiler is bumped in one place. Write new
+host-side tooling in Zig, in the style of the modules in `src/` (after
+drewr/zigutils):
 
-- An executable file with a `nix-shell` shebang that runs it with `runghc`:
-
-  ```haskell
-  #!/usr/bin/env nix-shell
-  #! nix-shell -i runghc -I nixpkgs=https://github.com/NixOS/nixpkgs/archive/<rev>.tar.gz
-  #! nix-shell -p "haskellPackages.ghcWithPackages (pkgs: with pkgs; [ aeson ... ])"
-  #! nix-shell -p dumbpipe ...
-  ```
-
-- Pin nixpkgs with `-I` to the rev in `image/flake.lock`, so GHC and the
-  libraries come from cache.nixos.org and don't change under you. Bump all
-  scripts' pins together, along with `flake.nix`'s nixpkgs.
-- `flake.nix` compiles `yolo` (`nix build`): keep its Haskell package list and
-  tools the same as the shebang's. The binary finds the repository through
-  `YOLO_ROOT`, which its wrapper defaults to the flake's source; commands that
-  write to `image/` refuse to run against that read-only copy.
-- Tools from nixpkgs go in the shebang's `-p`. Tools that aren't in nixpkgs or
-  must be the host's own (datumctl, docker/podman, ssh, aws, nix, git) come
-  from PATH; say so in the header comment.
-- One self-contained file per tool: runghc can't find sibling modules from a
-  script run through a symlink. When a script needs its repository, take its
-  own path from Template Haskell (`location`), as `yoloRoot` does.
-- Plain `base`, `directory`, `process` and `filepath` for most things; argument
-  parsing by hand where commands pass arguments through (like `yolo attach`).
-  Use `aeson` for JSON instead of jq, and Haskell instead of awk, sed or python.
-- Interactive commands (`attach`) inherit the terminal: `rawSystem`, or
-  `executeFile` to replace the process.
+- One module per concern under `src/` (`util`, `json`, `session`, `keys`,
+  `datum`, `docker`, `infra`, `images`), with `main.zig` holding dispatch, the
+  usage text and the `Backend` union. A new backend is a new arm of the union
+  plus its name in `loadBackend`.
+- In each file: pure `pub` functions first, then an `// IO boundary` divider,
+  then the IO. Tests are `test` blocks next to the code; golden vectors (from
+  the Haskell version this ports) are in `src/golden/vectors.txt`.
+- Hand-rolled argument parsing where commands pass arguments through (like
+  `yolo attach`). `std.process.spawn` for children, `std.Io.Dir` for files,
+  `std.Io.File.stdout()` for output. Prefer `std` to a third-party package; the
+  repo has no `build.zig.zon`.
+- `Ctx` (`util.zig`) carries the `io`, the allocators and the environment.
+  Use `util.say`/`sayf`/`errPrint` for output, `util.die` for errors, and
+  `util.capture`/`quiet`/`inherit`/`replace` for children.
+- Interactive commands (`attach`) inherit the terminal (`util.inherit`) or
+  replace the process (`util.replace`, execve).
+- `nix develop` gives the pinned `zig`; then `zig build` and
+  `./zig-out/bin/yolo`, or `zig build run -- ARGS`. The flake wrapper adds
+  `dumbpipe`, `socat` and `buildctl` to PATH and points `YOLO_ROOT` at its
+  read-only source; a bare `zig-out/bin/yolo` lacks those tools. Commands that
+  write to `image/` refuse the store copy.
+- Tools that aren't in nixpkgs or must be the host's own (datumctl,
+  docker/podman/colima, ssh, ssh-keygen, ssh-add, aws, nix, git) come from
+  PATH; say so in the module's header comment.
 
 Not everything moves: the scripts inside the image (`image/init.sh`, `ws`,
-`agent-providers`, `nix-zsh-env`) stay POSIX sh. The image has no GHC, init is
-PID 1 on a unikernel whose execve does no PATH search, and on that class the
-whole image lives in RAM.
+`agent-providers`, `nix-zsh-env`) stay POSIX sh. The image has no Zig
+toolchain, init is PID 1 on a unikernel whose execve does no PATH search, and
+on that class the whole image lives in RAM.
 
 ## Structure
 
-- `yolo`: the CLI. Sessions are directories under `$YOLO_STATE`; a `Backend`
-  record (`bNew`, `bAttach`, `bLs`, `bLogs`, `bRm`) per backend. A new backend
-  is a new `Backend` value plus its name in `loadBackend`. `yolo build` also
-  holds the Datum image builds and `yolo sync-pins`.
+- `src/`: the CLI. Sessions are directories under `$YOLO_STATE`; `main.zig`'s
+  `Backend` union (`new`, `attach`, `ls`, `logs`, `rm`) has an arm per backend,
+  and `loadBackend` maps a name to one. `images.zig` holds the Datum image
+  builds and `yolo sync-pins`.
 - `yolo infra BOX ...`: the EC2 build box and the JuiceFS metadata host;
   `yolo build --backend datum` starts the build box when BuildKit doesn't
   answer, and reads its ticket over SSM when none is saved.
@@ -75,19 +74,12 @@ whole image lives in RAM.
 
 ## Checks
 
-There are no tests. Before committing:
+Before committing:
 
-- `nix build` must succeed (it compiles `yolo` with `-O`).
-- Type-check each Haskell script with `-Wall`, using the shebang's packages,
-  and fix every warning:
-
-  ```sh
-  nix-shell -I nixpkgs=<the shebang's URL> -p "<the shebang's ghcWithPackages>" \
-    --run "ghc -Wall -fno-code -x hs yolo -outputdir \$(mktemp -d)"
-  ```
-
-  To call one function directly, use
-  `ghc -ignore-dot-ghci -x hs yolo -e 'EXPR'` in the same shell.
+- `nix build` must succeed: it builds `yolo` with `ReleaseSafe` and runs the
+  tests in its check phase.
+- `zig build test` (unit + golden) and `zig build -Doptimize=ReleaseSafe` must
+  succeed in `nix develop`, and `zig fmt --check src build.zig` must be clean.
 - Run what you changed for real (`yolo new`/`attach`/`rm` on each backend you
   touched).
 - shellcheck the in-image scripts:

@@ -72,29 +72,32 @@ nix flake update dotfiles --flake image   # follow newer dotfiles, then build
 
 | Path | What |
 | - | - |
-| `yolo` | the CLI, a Haskell script (sessions, both backends, image builds) |
-| `flake.nix` | the compiled `yolo` |
+| `src/` | the Zig CLI: `main.zig` dispatch, one module per backend and concern |
+| `build.zig`, `flake.nix` | the build; the flake pins `zigutils`' Zig and wraps the binary |
 | `image/` | image flake, Dockerfile, in-image scripts (init, `ws`, `agent-providers`), pinned Datum images |
 | `infra/buildbox/ec2`, `infra/meta/ec2` | EC2 build box and JuiceFS metadata host (NixOS configs; `yolo infra`) |
 | `docs/` | Datum details and the shared-home benchmarks |
 
 ## Requirements
 
-- **Nix.** `yolo` is a runghc script whose shebang
-  pulls GHC, their libraries, dumbpipe, socat and buildctl from a pinned
-  nixpkgs: `./yolo` works from a checkout, but every command pays about 3 s of
-  startup (30 s the first time). For everyday use, run the compiled one from
-  the flake, which starts in milliseconds:
+- **Nix.** `yolo` is built by the flake, with Zig pinned through `zigutils`:
 
   ```sh
-  nix profile install github:drewr/yolo   # or: nix build && ./result/bin/yolo
+  nix build                              # ./result/bin/yolo
+  nix profile install github:drewr/yolo  # on PATH
   ```
 
-  `yolo version` says which build you're running: the commit and date it was
-  compiled from (`-dirty` if from uncommitted changes), or for `./yolo` the
-  checkout's commit. The compiled yolo reads the pins and Dockerfile from the
-  source it was built from. `YOLO_ROOT=<checkout>` points it at a checkout instead; `yolo build
-  --backend datum` and `yolo sync-pins` need one, since they rewrite `image/`.
+  The wrapper adds `dumbpipe`, `socat` and `buildctl` to PATH and points
+  `YOLO_ROOT` at the source it was built from. `yolo version` says which build
+  you're running: the commit and date it was compiled from (`-dirty` if from
+  uncommitted changes). `YOLO_ROOT=<checkout>` points it at a checkout instead;
+  `yolo build --backend datum` and `yolo sync-pins` need one, since they rewrite
+  `image/`.
+- **Development:** `nix develop` gives the pinned `zig`, then `zig build` and
+  `./zig-out/bin/yolo` (or `zig build run -- ARGS`); `zig build test` runs the
+  unit and golden tests. A bare `zig-out/bin/yolo` has no
+  `dumbpipe`/`socat`/`buildctl` on PATH, so use `./result/bin/yolo` or
+  `nix develop` for Datum sessions and builds.
 - **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).
 - **datum backend:** `datumctl` signed in to Datum (production), `ssh`,
   `ssh-keygen` and `ssh-add`. Building Datum images needs the EC2 build box
