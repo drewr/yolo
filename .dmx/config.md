@@ -12,7 +12,7 @@ workflow:     sdlc
 ## Core Settings
 
 ticketing:           github-issues
-branch_base:         main         # integration — feature PRs merge here
+branch_base:         dmx-aws      # integration — feature PRs merge here
 production_branch:   main   # production — releases, hotfixes, tags
 
 ## GitHub
