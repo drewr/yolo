@@ -30,7 +30,8 @@ infra/            NixOS configs for the EC2 build box and JuiceFS metadata host
   `YOLO_MODE=datum` serves SSH over iroh and mounts the shared home;
   `YOLO_MODE=local` sets up the user and idles for `docker exec`.
 - **Wrap, don't rebuild:** the release binary is a flake wrapper that puts
-  `dumbpipe`, `socat`, `buildctl` on PATH and points `YOLO_ROOT` at its source.
+  `dumbpipe`, `socat`, `buildctl`, `crane` on PATH and points `YOLO_ROOT` at
+  its source.
 - Host-side modules say which tools come from outside (datumctl, docker,
   ssh, nix, git, ...); tools available in nixpkgs are assumed inside the flake.
 
@@ -38,6 +39,15 @@ infra/            NixOS configs for the EC2 build box and JuiceFS metadata host
 
 - `session.zig` is the shared core both backends build on: it maps a session
   name to its state directory and owns discovery/attach logic.
+- `session.zig` also owns the SSH command line (`SshTarget`/`sshArgs`) and the
+  ssh-style argument split, so every backend that reaches a session over SSH
+  shares one pinned-host-key/dumbpipe argv.
+- `keys.zig` owns the iroh material a session starts with
+  (`prepareIrohSession`: secret, ticket, host key, `known_hosts`) and the
+  `--key` identity rule (`recordIdentity`), so backends don't duplicate it.
+- `infra.zig` exposes its aws helpers by `(ctx, Profile, name)` — profile +
+  region carried explicitly — with `Box`-shaped wrappers for `yolo infra`;
+  any backend can reuse the security group, instance profile and SSM waits.
 - `docker.zig` and `datum.zig` are the two backend implementations; `datum.zig`
   depends on `keys.zig` (session keys), `json.zig` (API payloads) and
   `infra.zig` (build box / metadata host lifecycle via `yolo infra`).

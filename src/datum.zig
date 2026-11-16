@@ -143,36 +143,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     session.recordDatumSession(ctx, dir);
 
     // Session keys, readable only by this user.
-    const secret_hex = blk: {
-        var secret: [32]u8 = undefined;
-        ctx.io.randomSecure(&secret) catch |e| util.dief("can't get random bytes: {t}", .{e});
-        const hex = keys.hexSecret(ctx.arena, secret) catch util.die("out of memory");
-        util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "iroh_secret" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{hex}) catch "");
-        break :blk hex;
-    };
-    {
-        const ticket = keys.endpointTicket(ctx.arena, d.relay, secret_hex) catch |e| switch (e) {
-            error.RelayTooLong => util.die("relay URL too long"),
-            error.BadSecret => util.die("bad iroh secret"),
-            error.OutOfMemory => util.die("out of memory"),
-        };
-        util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "ticket" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{ticket}) catch "");
-    }
-    const host_key_result = util.quiet(ctx, &.{
-        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", wl, "-f", util.join(ctx, &.{ dir, "host_key" }),
-    }) == 0;
-    if (!host_key_result) {
-        util.removeTree(ctx, dir);
-        util.die("could not make the host key");
-    }
-    const pub_line = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "host_key.pub" })) orelse "";
-    {
-        const kh = keys.knownHostsLine(ctx.arena, wl, pub_line) catch |e| switch (e) {
-            error.BadPublicKey => util.die("ssh-keygen made no public key"),
-            else => util.die("out of memory"),
-        };
-        util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "known_hosts" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{kh}) catch "");
-    }
+    keys.prepareIrohSession(ctx, dir, wl, d.relay);
     const authorized = keys.authorizedKeys(ctx, key) catch |e| switch (e) {
         error.NoPublicKey => {
             util.removeTree(ctx, dir);
@@ -181,16 +152,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         else => util.die("out of memory"),
     };
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "authorized_keys" }), authorized);
-    // A --key FILE.pub with its private key beside it is also the identity.
-    if (key) |k| {
-        if (mem.endsWith(u8, k, ".pub") and k.len >= 4) {
-            const priv = k[0 .. k.len - 4];
-            if (util.fileExists(ctx, priv)) {
-                const real = util.realPath(ctx, priv) orelse priv;
-                util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "identity" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{real}) catch "");
-            }
-        }
-    }
+    keys.recordIdentity(ctx, dir, key);
     // The ticket is derived above; a session without one is useless.
     const ticket_ok = mem.startsWith(u8, util.readMeta(ctx, util.join(ctx, &.{ dir, "ticket" }), ""), "endpoint");
     if (!ticket_ok) {
@@ -254,63 +216,15 @@ pub fn datumSsh(
     identity: ?[]const u8,
     args: []const []const u8,
 ) []const []const u8 {
-    var out: std.ArrayList([]const u8) = .empty;
-    out.appendSlice(ctx.arena, &.{ "ssh", "-o" }) catch util.die("out of memory");
-    const proxy = std.fmt.allocPrint(ctx.arena, "ProxyCommand=dumbpipe connect {s} 2>/dev/null", .{ticket}) catch util.die("out of memory");
-    out.appendSlice(ctx.arena, &.{ proxy, "-o" }) catch util.die("out of memory");
-    const known = std.fmt.allocPrint(ctx.arena, "UserKnownHostsFile={s}/known_hosts", .{dir}) catch util.die("out of memory");
-    out.appendSlice(ctx.arena, &.{ known, "-o" }) catch util.die("out of memory");
-    out.appendSlice(ctx.arena, &.{
-        std.fmt.allocPrint(ctx.arena, "HostKeyAlias={s}", .{wl}) catch "",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ServerAliveInterval=30",
-    }) catch util.die("out of memory");
-    if (identity) |i| {
-        out.appendSlice(ctx.arena, &.{ "-i", i, "-o", "IdentitiesOnly=yes" }) catch util.die("out of memory");
-    }
-    if (d.forward_agent) out.appendSlice(ctx.arena, &.{ "-o", "ForwardAgent=yes" }) catch util.die("out of memory");
-    // Options up to --, or the first non-option; then the destination.
-    const split = splitSshArgs(ctx.arena, args);
-    out.appendSlice(ctx.arena, split.opts) catch util.die("out of memory");
-    out.append(ctx.arena, std.fmt.allocPrint(ctx.arena, "{s}@{s}", .{ d.user, wl }) catch "") catch util.die("out of memory");
-    out.appendSlice(ctx.arena, split.cmd) catch util.die("out of memory");
-    return out.items;
-}
-
-/// ssh-style argument split (`split` in the Haskell): -o/-L/-R/-D/-i take a
-/// value, `--` ends the options, and the first non-option starts the command.
-pub const SshArgs = struct {
-    opts: []const []const u8,
-    cmd: []const []const u8,
-};
-
-pub fn splitSshArgs(allocator: std.mem.Allocator, args: []const []const u8) SshArgs {
-    var opts: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (mem.eql(u8, a, "--")) return .{ .opts = opts.items, .cmd = args[i + 1 ..] };
-        if (isValueOption(a)) {
-            opts.appendSlice(allocator, &.{ a, if (i + 1 < args.len) args[i + 1] else "" }) catch {};
-            i += 1;
-            continue;
-        }
-        if (mem.startsWith(u8, a, "-")) {
-            opts.append(allocator, a) catch {};
-            continue;
-        }
-        return .{ .opts = opts.items, .cmd = args[i..] };
-    }
-    return .{ .opts = opts.items, .cmd = &.{} };
-}
-
-fn isValueOption(a: []const u8) bool {
-    for ([_][]const u8{ "-o", "-L", "-R", "-D", "-i" }) |o| {
-        if (mem.eql(u8, a, o)) return true;
-    }
-    return false;
+    return session.sshArgs(ctx, .{
+        .dir = dir,
+        .alias = wl,
+        .ticket = ticket,
+        .identity = identity,
+        .user = d.user,
+        .forward_agent = d.forward_agent,
+        .args = args,
+    });
 }
 
 // ---------------------------------------------------------------------------

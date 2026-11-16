@@ -198,3 +198,47 @@ pub fn publicKeyOf(ctx: Ctx, key_path: []const u8) ?[]const u8 {
     if (r.term != .exited or r.code != 0) return null;
     return util.trim(r.stdout);
 }
+
+/// The iroh secret, its ticket and the SSH host key a session starts with,
+/// written into its directory with the pinned `known_hosts` line. A session
+/// whose host key can't be made is removed before the process dies.
+pub fn prepareIrohSession(ctx: Ctx, dir: []const u8, alias: []const u8, relay: []const u8) void {
+    const secret_hex = blk: {
+        var secret: [32]u8 = undefined;
+        ctx.io.randomSecure(&secret) catch |e| util.dief("can't get random bytes: {t}", .{e});
+        const hex = hexSecret(ctx.arena, secret) catch util.die("out of memory");
+        util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "iroh_secret" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{hex}) catch "");
+        break :blk hex;
+    };
+    const ticket = endpointTicket(ctx.arena, relay, secret_hex) catch |e| switch (e) {
+        error.RelayTooLong => util.die("relay URL too long"),
+        error.BadSecret => util.die("bad iroh secret"),
+        error.OutOfMemory => util.die("out of memory"),
+    };
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "ticket" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{ticket}) catch "");
+
+    const host_key_ok = util.quiet(ctx, &.{
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", alias, "-f", util.join(ctx, &.{ dir, "host_key" }),
+    }) == 0;
+    if (!host_key_ok) {
+        util.removeTree(ctx, dir);
+        util.die("could not make the host key");
+    }
+    const pub_line = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "host_key.pub" })) orelse "";
+    const kh = knownHostsLine(ctx.arena, alias, pub_line) catch |e| switch (e) {
+        error.BadPublicKey => util.die("ssh-keygen made no public key"),
+        else => util.die("out of memory"),
+    };
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "known_hosts" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{kh}) catch "");
+}
+
+/// A `--key FILE.pub` whose private key sits beside it is also the identity:
+/// record the private key's path for `ssh -i`.
+pub fn recordIdentity(ctx: Ctx, dir: []const u8, key: ?[]const u8) void {
+    const k = key orelse return;
+    if (!std.mem.endsWith(u8, k, ".pub") or k.len < 4) return;
+    const priv = k[0 .. k.len - 4];
+    if (!util.fileExists(ctx, priv)) return;
+    const real = util.realPath(ctx, priv) orelse priv;
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "identity" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{real}) catch "");
+}

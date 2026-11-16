@@ -5,6 +5,9 @@
 //! pushed: the box fetches github:drewr/yolo/REV?dir=CONFIG#ATTR. Uses the aws
 //! CLI from PATH with $AWS_PROFILE (default datum-sandbox-admin); TYPE,
 //! DISK_GB and IPV6=1 override a box's defaults.
+//!
+//! The same helpers serve `yolo new --backend ec2` (ec2.zig), which picks its
+//! own profile and region at `new`; `Profile` carries that pair.
 
 const std = @import("std");
 const mem = std.mem;
@@ -122,12 +125,28 @@ pub fn userData(allocator: mem.Allocator, b: Box, rev: []const u8) ![]u8 {
     , .{ b.attr, rev, rev, b.config_dir, b.attr });
 }
 
-/// argv for the aws CLI, with the box's profile and region.
-pub fn awsArgs(allocator: mem.Allocator, b: Box, args: []const []const u8) ![]const []const u8 {
+/// argv for the aws CLI, with a profile and region.
+pub fn awsArgsFor(allocator: mem.Allocator, p: Profile, args: []const []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    try out.appendSlice(allocator, &.{ "aws", "--profile", b.profile, "--region", b.region });
+    try out.appendSlice(allocator, &.{ "aws", "--profile", p.profile, "--region", p.region });
     try out.appendSlice(allocator, args);
     return out.items;
+}
+
+/// argv for the aws CLI, with the box's profile and region.
+pub fn awsArgs(allocator: mem.Allocator, b: Box, args: []const []const u8) ![]const []const u8 {
+    return awsArgsFor(allocator, profileOf(b), args);
+}
+
+/// The AWS account and region a session (or a box) works in.
+pub const Profile = struct {
+    profile: []const u8,
+    region: []const u8,
+};
+
+/// A box's profile and region, for the profile-based helpers.
+pub fn profileOf(b: Box) Profile {
+    return .{ .profile = b.profile, .region = b.region };
 }
 
 pub const SsoExpired = enum {
@@ -158,17 +177,28 @@ pub fn boxConfig(ctx: Ctx, which: []const u8) Box {
     return b;
 }
 
-/// The aws CLI's trimmed stdout, with the box's profile and region; dies with
-/// its error, or with how to log in when the SSO session has expired (`aws`).
-fn aws(ctx: Ctx, b: Box, args: []const []const u8) []const u8 {
-    const argv = awsArgs(ctx.arena, b, args) catch util.die("out of memory");
-    const r = util.capture(ctx, argv, .{}) catch util.die("the aws CLI isn't in PATH");
+/// The aws CLI's raw result, with a profile and region; null only when the
+/// CLI isn't in PATH (`awsTry`). For `ls` and `rm`, which must not die.
+pub fn awsTry(ctx: Ctx, p: Profile, args: []const []const u8) ?util.Result {
+    const argv = awsArgsFor(ctx.arena, p, args) catch util.die("out of memory");
+    return util.capture(ctx, argv, .{}) catch null;
+}
+
+/// The aws CLI's trimmed stdout, with a profile and region; dies with its
+/// error, or with how to log in when the SSO session has expired (`awsFor`).
+pub fn awsFor(ctx: Ctx, p: Profile, args: []const []const u8) []const u8 {
+    const r = awsTry(ctx, p, args) orelse util.die("the aws CLI isn't in PATH");
     if (r.term != .exited or r.code != 0) {
         if (SsoExpired.detect(r.stderr) == .yes)
-            util.dief("AWS login needed for profile {s}: aws sso login --profile {s}", .{ b.profile, b.profile });
+            util.dief("AWS login needed for profile {s}: aws sso login --profile {s}", .{ p.profile, p.profile });
         util.dief("aws {s} {s}: {s}", .{ args[0], if (args.len > 1) args[1] else "", util.trim(r.stderr) });
     }
     return util.trim(r.stdout);
+}
+
+/// `awsFor` with the box's profile and region (`aws`).
+fn aws(ctx: Ctx, b: Box, args: []const []const u8) []const u8 {
+    return awsFor(ctx, profileOf(b), args);
 }
 
 pub fn cmd(ctx: Ctx, root: []const u8, args: []const []const u8) u8 {
@@ -297,18 +327,7 @@ fn startBox(ctx: Ctx, b: Box) void {
 fn boxTicket(ctx: Ctx, b: Box) []const u8 {
     const i = instanceId(ctx, b);
     // SSM's agent registers a while after EC2 reports the instance running.
-    const t0 = util.monoNow(ctx);
-    while (true) {
-        const st = aws(ctx, b, &.{
-            "ssm",                                                                      "describe-instance-information", "--filters",
-            std.fmt.allocPrint(ctx.arena, "Key=InstanceIds,Values={s}", .{i}) catch "", "--query",                       "InstanceInformationList[0].PingStatus",
-            "--output",                                                                 "text",
-        });
-        if (mem.eql(u8, st, "Online")) break;
-        if (util.secondsSince(ctx, t0) >= 300)
-            util.dief("{s} isn't reachable over SSM after 5 min (SSM status: {s})", .{ b.name, st });
-        util.sleep(ctx, 5000);
-    }
+    waitSsmOnline(ctx, profileOf(b), i, b.name);
     const cmd_id = aws(ctx, b, &.{
         "ssm",          "send-command",                                                                     "--instance-ids", i,                   "--document-name", "AWS-RunShellScript",
         "--parameters", std.fmt.allocPrint(ctx.arena, "commands=[\"cat {s}\"]", .{b.ticket_file}) catch "", "--query",        "Command.CommandId", "--output",        "text",
@@ -318,6 +337,24 @@ fn boxTicket(ctx: Ctx, b: Box) []const u8 {
         "ssm",     "get-command-invocation", "--command-id", cmd_id, "--instance-id", i,
         "--query", "StandardOutputContent",  "--output",     "text",
     });
+}
+
+/// Wait until the SSM agent reports `instance` online, up to 5 minutes
+/// (`waitSsmOnline`). `what` names the thing in the failure, for a session or
+/// a box.
+pub fn waitSsmOnline(ctx: Ctx, p: Profile, instance: []const u8, what: []const u8) void {
+    const t0 = util.monoNow(ctx);
+    while (true) {
+        const st = awsFor(ctx, p, &.{
+            "ssm",                                                                             "describe-instance-information", "--filters",
+            std.fmt.allocPrint(ctx.arena, "Key=InstanceIds,Values={s}", .{instance}) catch "", "--query",                       "InstanceInformationList[0].PingStatus",
+            "--output",                                                                        "text",
+        });
+        if (mem.eql(u8, st, "Online")) break;
+        if (util.secondsSince(ctx, t0) >= 300)
+            util.dief("{s} isn't reachable over SSM after 5 min (SSM status: {s})", .{ what, st });
+        util.sleep(ctx, 5000);
+    }
 }
 
 fn ticketFile(ctx: Ctx) []const u8 {
@@ -501,29 +538,29 @@ fn git(ctx: Ctx, root: []const u8, a: []const []const u8) []const u8 {
 }
 
 /// No ingress rules: everything reaches the box over iroh or SSM
-/// (`ensureSecurityGroup`).
-fn ensureSecurityGroup(ctx: Ctx, b: Box) []const u8 {
-    const sg = aws(ctx, b, &.{
+/// (`ensureSecurityGroupFor`).
+pub fn ensureSecurityGroupFor(ctx: Ctx, p: Profile, name: []const u8) []const u8 {
+    const sg = awsFor(ctx, p, &.{
         "ec2",
         "describe-security-groups",
         "--filters",
-        std.fmt.allocPrint(ctx.arena, "Name=group-name,Values={s}", .{b.name}) catch "",
+        std.fmt.allocPrint(ctx.arena, "Name=group-name,Values={s}", .{name}) catch "",
         "--query",
         "SecurityGroups[0].GroupId",
         "--output",
         "text",
     });
     if (!mem.eql(u8, sg, "None")) return sg;
-    const vpc = defaultVpc(ctx, b);
-    return aws(ctx, b, &.{
+    const vpc = defaultVpcFor(ctx, p);
+    return awsFor(ctx, p, &.{
         "ec2",
         "create-security-group",
         "--group-name",
-        b.name,
+        name,
         "--vpc-id",
         vpc,
         "--description",
-        std.fmt.allocPrint(ctx.arena, "{s}, no inbound", .{b.name}) catch "",
+        std.fmt.allocPrint(ctx.arena, "{s}, no inbound", .{name}) catch "",
         "--query",
         "GroupId",
         "--output",
@@ -531,25 +568,40 @@ fn ensureSecurityGroup(ctx: Ctx, b: Box) []const u8 {
     });
 }
 
+/// `ensureSecurityGroupFor` with the box's profile and region.
+fn ensureSecurityGroup(ctx: Ctx, b: Box) []const u8 {
+    return ensureSecurityGroupFor(ctx, profileOf(b), b.name);
+}
+
 /// An instance profile that SSM can manage (for the ticket; no SSH needed).
-fn ensureInstanceProfile(ctx: Ctx, b: Box) void {
-    const probe = awsArgs(ctx.arena, b, &.{ "iam", "get-instance-profile", "--instance-profile-name", b.name }) catch return;
+pub fn ensureInstanceProfileFor(ctx: Ctx, p: Profile, name: []const u8) void {
+    const probe = awsArgsFor(ctx.arena, p, &.{ "iam", "get-instance-profile", "--instance-profile-name", name }) catch return;
     if (util.quiet(ctx, probe) == 0) return;
-    _ = aws(ctx, b, &.{
-        "iam",                                                                                                                                                 "create-role", "--role-name", b.name, "--assume-role-policy-document",
+    _ = awsFor(ctx, p, &.{
+        "iam",                                                                                                                                                 "create-role", "--role-name", name, "--assume-role-policy-document",
         "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}",
     });
-    _ = aws(ctx, b, &.{ "iam", "attach-role-policy", "--role-name", b.name, "--policy-arn", "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" });
-    _ = aws(ctx, b, &.{ "iam", "create-instance-profile", "--instance-profile-name", b.name });
-    _ = aws(ctx, b, &.{ "iam", "add-role-to-instance-profile", "--instance-profile-name", b.name, "--role-name", b.name });
+    _ = awsFor(ctx, p, &.{ "iam", "attach-role-policy", "--role-name", name, "--policy-arn", "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" });
+    _ = awsFor(ctx, p, &.{ "iam", "create-instance-profile", "--instance-profile-name", name });
+    _ = awsFor(ctx, p, &.{ "iam", "add-role-to-instance-profile", "--instance-profile-name", name, "--role-name", name });
     util.sleep(ctx, 10_000); // instance profiles take a moment to become usable
 }
 
-fn defaultVpc(ctx: Ctx, b: Box) []const u8 {
-    return aws(ctx, b, &.{
+/// `ensureInstanceProfileFor` with the box's profile and region.
+fn ensureInstanceProfile(ctx: Ctx, b: Box) void {
+    ensureInstanceProfileFor(ctx, profileOf(b), b.name);
+}
+
+pub fn defaultVpcFor(ctx: Ctx, p: Profile) []const u8 {
+    return awsFor(ctx, p, &.{
         "ec2",     "describe-vpcs", "--filters", "Name=is-default,Values=true",
         "--query", "Vpcs[0].VpcId", "--output",  "text",
     });
+}
+
+/// `defaultVpcFor` with the box's profile and region.
+fn defaultVpc(ctx: Ctx, b: Box) []const u8 {
+    return defaultVpcFor(ctx, profileOf(b));
 }
 
 /// Public IPv6 for the default VPC, once: an Amazon-provided block, a /64 per

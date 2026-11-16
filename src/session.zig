@@ -65,6 +65,52 @@ pub fn defaultWorkload(allocator: std.mem.Allocator, name: []const u8) ![]const 
     return std.fmt.allocPrint(allocator, "agent-{s}", .{name});
 }
 
+/// ssh-style argument split (`split` in the Haskell): -o/-L/-R/-D/-i take a
+/// value, `--` ends the options, and the first non-option starts the command.
+pub const SshArgs = struct {
+    opts: []const []const u8,
+    cmd: []const []const u8,
+};
+
+pub fn splitSshArgs(allocator: std.mem.Allocator, args: []const []const u8) SshArgs {
+    var opts: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--")) return .{ .opts = opts.items, .cmd = args[i + 1 ..] };
+        if (isValueOption(a)) {
+            opts.appendSlice(allocator, &.{ a, if (i + 1 < args.len) args[i + 1] else "" }) catch {};
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-")) {
+            opts.append(allocator, a) catch {};
+            continue;
+        }
+        return .{ .opts = opts.items, .cmd = args[i..] };
+    }
+    return .{ .opts = opts.items, .cmd = &.{} };
+}
+
+fn isValueOption(a: []const u8) bool {
+    for ([_][]const u8{ "-o", "-L", "-R", "-D", "-i" }) |o| {
+        if (std.mem.eql(u8, a, o)) return true;
+    }
+    return false;
+}
+
+/// Where a session's SSH goes: the pinned host key in its `known_hosts`, the
+/// iroh ticket behind a dumbpipe ProxyCommand, and who logs in.
+pub const SshTarget = struct {
+    dir: []const u8, // holds known_hosts
+    alias: []const u8, // HostKeyAlias and known_hosts name (yolo-NAME)
+    ticket: []const u8, // dumbpipe ticket for ProxyCommand
+    identity: ?[]const u8, // -i, or null for the ssh-agent's keys
+    user: []const u8,
+    forward_agent: bool,
+    args: []const []const u8, // ssh-style args from the command line
+};
+
 // ---------------------------------------------------------------------------
 // IO boundary — everything below does IO
 // ---------------------------------------------------------------------------
@@ -161,6 +207,34 @@ pub fn recordDatumSession(ctx: Ctx, d: []const u8) void {
 pub fn workload(ctx: Ctx, d: []const u8, name: []const u8) []const u8 {
     const fallback = defaultWorkload(ctx.arena, name) catch util.die("out of memory");
     return util.readMeta(ctx, util.join(ctx, &.{ d, "workload" }), fallback);
+}
+
+/// The ssh command line for a session (options first, then the command):
+/// dumbpipe carries the connection over iroh, and the host key is pinned.
+pub fn sshArgs(ctx: Ctx, t: SshTarget) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    out.appendSlice(ctx.arena, &.{ "ssh", "-o" }) catch util.die("out of memory");
+    const proxy = std.fmt.allocPrint(ctx.arena, "ProxyCommand=dumbpipe connect {s} 2>/dev/null", .{t.ticket}) catch util.die("out of memory");
+    out.appendSlice(ctx.arena, &.{ proxy, "-o" }) catch util.die("out of memory");
+    const known = std.fmt.allocPrint(ctx.arena, "UserKnownHostsFile={s}/known_hosts", .{t.dir}) catch util.die("out of memory");
+    out.appendSlice(ctx.arena, &.{ known, "-o" }) catch util.die("out of memory");
+    out.appendSlice(ctx.arena, &.{
+        std.fmt.allocPrint(ctx.arena, "HostKeyAlias={s}", .{t.alias}) catch "",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ServerAliveInterval=30",
+    }) catch util.die("out of memory");
+    if (t.identity) |i| {
+        out.appendSlice(ctx.arena, &.{ "-i", i, "-o", "IdentitiesOnly=yes" }) catch util.die("out of memory");
+    }
+    if (t.forward_agent) out.appendSlice(ctx.arena, &.{ "-o", "ForwardAgent=yes" }) catch util.die("out of memory");
+    // Options up to --, or the first non-option; then the destination.
+    const split = splitSshArgs(ctx.arena, t.args);
+    out.appendSlice(ctx.arena, split.opts) catch util.die("out of memory");
+    out.append(ctx.arena, std.fmt.allocPrint(ctx.arena, "{s}@{s}", .{ t.user, t.alias }) catch "") catch util.die("out of memory");
+    out.appendSlice(ctx.arena, split.cmd) catch util.die("out of memory");
+    return out.items;
 }
 
 /// Backend dispatch: what a backend implements. A new backend is a new arm

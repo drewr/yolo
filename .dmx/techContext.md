@@ -23,7 +23,7 @@
 - Host tools used via PATH, not vendored: `datumctl`, `docker`/`podman`/
   `colima`, `ssh`, `ssh-keygen`, `ssh-add`, `aws`, `nix`, `git`.
 - Session-side plumbing: `iroh` (SSH transport), `socat`, `buildctl`
-  (BuildKit), `dumbpipe`.
+  (BuildKit), `dumbpipe`, `crane` (registry-to-registry image copies).
 
 ## Dev setup
 
@@ -38,6 +38,11 @@ nix build                  # the wrapped release binary: ./result/bin/yolo
 - A bare `zig-out/bin/yolo` lacks `dumbpipe`/`socat`/`buildctl`; use nix for
   anything Datum. Commands that write to `image/` refuse the flake's read-only
   store copy — set `YOLO_ROOT=<checkout>` or run from a checkout.
+- `zig fmt --check src build.zig` is part of the gate. `zig fmt` re-aligns the
+  multi-line `aws` argv string arrays in `infra.zig`, so run it after touching
+  them or the check fails.
+- A new entry in the flake wrapper's `tools` is verified cheaply:
+  `nix build`, then `grep <tool> result/bin/yolo` shows it on the wrapper's PATH.
 
 ## Constraints
 

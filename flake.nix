@@ -7,7 +7,7 @@
   #
   # Development: nix develop, then `zig build run -- ARGS` (YOLO_ROOT points
   # at the checkout while developing).
-  description = "yolo: coding agents in named, isolated sessions (docker/podman or Datum Compute)";
+  description = "yolo: coding agents in named, isolated sessions (docker/podman, Datum Compute or AWS EC2)";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/02c087f3fe673c9e317f206a627cb6b910336dbe";
@@ -24,11 +24,11 @@
 
     mkYolo = pkgs: system: let
       zig = zigutils.packages.${system}.zig-dev;
-      # dumbpipe, socat and buildctl come from nixpkgs on PATH; datumctl,
-      # docker/podman/colima, ssh, ssh-keygen, ssh-add, aws, git and nix are
-      # the host's own.
+      # dumbpipe, socat, buildctl and crane come from nixpkgs on PATH;
+      # datumctl, docker/podman/colima, ssh, ssh-keygen, ssh-add, aws, git and
+      # nix are the host's own.
       tools = builtins.filter (p: pkgs.lib.meta.availableOn pkgs.stdenv.hostPlatform p)
-        (with pkgs; [ dumbpipe socat buildkit ]);
+        (with pkgs; [ dumbpipe socat buildkit crane ]);
       # Compiled into `yolo version`: the commit (-dirty for uncommitted
       # changes) and its date.
       rev = self.shortRev or self.dirtyShortRev or "unknown";

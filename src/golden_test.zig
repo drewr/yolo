@@ -174,12 +174,12 @@ test "session name rule" {
 // ---------------------------------------------------------------------------
 
 test "ssh args: value options stay options" {
-    const datum = @import("datum.zig");
+    const session = @import("session.zig");
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const args = [_][]const u8{ "-o", "IdentitiesOnly=yes", "-L", "1:2", "echo", "-o", "x" };
-    const split = datum.splitSshArgs(a, &args);
+    const split = session.splitSshArgs(a, &args);
     try testing.expectEqual(@as(usize, 4), split.opts.len);
     try testing.expectEqualStrings("-o", split.opts[0]);
     try testing.expectEqualStrings("IdentitiesOnly=yes", split.opts[1]);
@@ -190,12 +190,12 @@ test "ssh args: value options stay options" {
 }
 
 test "ssh args: -- starts the command" {
-    const datum = @import("datum.zig");
+    const session = @import("session.zig");
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const args = [_][]const u8{ "-q", "--", "-o", "true" };
-    const split = datum.splitSshArgs(a, &args);
+    const split = session.splitSshArgs(a, &args);
     try testing.expectEqual(@as(usize, 1), split.opts.len);
     try testing.expectEqualStrings("-q", split.opts[0]);
     try testing.expectEqual(@as(usize, 2), split.cmd.len);
@@ -204,8 +204,8 @@ test "ssh args: -- starts the command" {
 }
 
 test "ssh args: no arguments leaves the command empty" {
-    const datum = @import("datum.zig");
-    const split = datum.splitSshArgs(testing.allocator, &.{});
+    const session = @import("session.zig");
+    const split = session.splitSshArgs(testing.allocator, &.{});
     try testing.expectEqual(@as(usize, 0), split.opts.len);
     try testing.expectEqual(@as(usize, 0), split.cmd.len);
 }
