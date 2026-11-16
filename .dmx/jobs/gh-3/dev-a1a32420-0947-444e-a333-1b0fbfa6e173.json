@@ -2,23 +2,25 @@
   "loop_name": "dev",
   "job_id": "gh-3",
   "task_id": "a1a32420-0947-444e-a333-1b0fbfa6e173",
-  "status": "running",
-  "current_skill_index": 1,
+  "status": "paused",
+  "current_skill_index": 2,
   "skills": [
     "implement-next-phase",
     "commit"
   ],
   "skills_completed": [
-    "implement-next-phase"
+    "implement-next-phase",
+    "commit"
   ],
   "skill_outputs": {
-    "implement-next-phase": "Phase 1 (shared foundations) complete, all 6 tasks ticked. infra.zig: Profile/profileOf/awsArgsFor/awsTry/awsFor, *For provisioners with Box delegates, waitSsmOnline extracted from boxTicket. session.zig: SshTarget/sshArgs/splitSshArgs moved in verbatim. datum.zig: datumSsh now a one-line session.sshArgs wrapper, moved types deleted, 3 golden ssh-args tests repointed. keys.zig: prepareIrohSession (secret, ticket, host key, known_hosts, dir cleanup + same die texts) and recordIdentity for --key. flake.nix: crane added to tools, description mentions EC2. Gates pass: zig build test, zig fmt --check, ReleaseSafe, nix build; yolo help unchanged; crane present in result/bin/yolo PATH. Two repo-wide learnings appended to activeContext.md (zig fmt realigns infra.zig argv arrays; check the wrapper PATH for new tools)."
+    "implement-next-phase": "Phase 1 (shared foundations) complete, all 6 tasks ticked. infra.zig: Profile/profileOf/awsArgsFor/awsTry/awsFor, *For provisioners with Box delegates, waitSsmOnline extracted from boxTicket. session.zig: SshTarget/sshArgs/splitSshArgs moved in verbatim. datum.zig: datumSsh now a one-line session.sshArgs wrapper, moved types deleted, 3 golden ssh-args tests repointed. keys.zig: prepareIrohSession (secret, ticket, host key, known_hosts, dir cleanup + same die texts) and recordIdentity for --key. flake.nix: crane added to tools, description mentions EC2. Gates pass: zig build test, zig fmt --check, ReleaseSafe, nix build; yolo help unchanged; crane present in result/bin/yolo PATH. Two repo-wide learnings appended to activeContext.md (zig fmt realigns infra.zig argv arrays; check the wrapper PATH for new tools).",
+    "commit": "Committed Phase 1 as 4fbdb3b on feature-gh-3-add-ec2-backend-running-harness-images: 'feat: extract the SSH, key and aws helpers the ec2 backend will share' (14 files, +499/-148). Light memory-bank pass: promoted the two repo-wide learnings from activeContext.md into techContext.md (zig fmt realigns infra.zig argv arrays; verify flake tools via grep result/bin/yolo) and systemPatterns.md (crane on the wrapper PATH; session.zig owns the ssh argv, keys.zig the iroh session material, infra.zig the Profile-based aws helpers), added crane to the dependency list, and logged the commit in Session Notes. Used 'Refs #3' instead of the skill's 'Closes #3' because the ticket has 4 phases left. Working tree clean, no AI attribution trailers, not pushed."
   },
   "validator_results": [],
   "outcome": null,
   "iteration_count": 0,
   "timestamp": "2026-11-09T20:13:53.114610+00:00",
-  "updated_at": "2026-11-13T18:51:35.155073+00:00",
+  "updated_at": "2026-11-16T21:12:53.678239+00:00",
   "validation_started_at": null,
   "finish_message": null
 }
