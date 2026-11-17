@@ -6,6 +6,7 @@
 //! crypton): they are pinned by the golden vectors in src/golden/.
 
 const std = @import("std");
+const testing = std.testing;
 const util = @import("util.zig");
 const Ctx = util.Ctx;
 
@@ -108,6 +109,20 @@ pub fn knownHostsLine(allocator: std.mem.Allocator, workload: []const u8, pubkey
     return std.fmt.allocPrint(allocator, "{s} {s} {s}", .{ workload, kind, key });
 }
 
+/// Whether `kind` is an OpenSSH public key type: ssh-ed25519, ssh-rsa,
+/// ecdsa-sha2-nistp256 and friends, or a security key (sk-ssh-..., sk-ecdsa-...).
+pub fn isKeyType(kind: []const u8) bool {
+    return std.mem.startsWith(u8, kind, "ssh-") or
+        std.mem.startsWith(u8, kind, "ecdsa-") or
+        std.mem.startsWith(u8, kind, "sk-");
+}
+
+/// The first whitespace-separated field of a line: the key type of a public key line.
+fn firstField(line: []const u8) []const u8 {
+    var it = std.mem.tokenizeAny(u8, line, " \t\r");
+    return it.next() orelse "";
+}
+
 /// The public keys in an `ssh-add -L` or `authorized_keys` listing: the key
 /// material (second field) of every line that looks like an SSH key.
 pub fn keyMaterial(allocator: std.mem.Allocator, listing: []const u8) ![]const []const u8 {
@@ -116,7 +131,7 @@ pub fn keyMaterial(allocator: std.mem.Allocator, listing: []const u8) ![]const [
     while (lines.next()) |line| {
         var it = std.mem.tokenizeAny(u8, line, " \t\r");
         const kind = it.next() orelse continue;
-        if (!std.mem.startsWith(u8, kind, "ssh-") and !std.mem.startsWith(u8, kind, "ecdsa-") and !std.mem.startsWith(u8, kind, "sk-")) continue;
+        if (!isKeyType(kind)) continue;
         const material = it.next() orelse continue;
         try out.append(allocator, material);
     }
@@ -171,7 +186,7 @@ pub fn authorizedKeys(ctx: Ctx, file: ?[]const u8) AuthError![]const u8 {
 fn hasSshKey(text: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "ssh-")) return true;
+        if (isKeyType(firstField(line))) return true;
     }
     return false;
 }
@@ -183,7 +198,7 @@ pub fn agentKeys(ctx: Ctx) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, r.stdout, '\n');
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "ssh-")) continue;
+        if (!isKeyType(firstField(line))) continue;
         out.appendSlice(ctx.arena, line) catch return "";
         out.append(ctx.arena, '\n') catch return "";
     }
@@ -197,4 +212,15 @@ pub fn publicKeyOf(ctx: Ctx, key_path: []const u8) ?[]const u8 {
     const r = util.capture(ctx, &.{ "ssh-keygen", "-y", "-f", key_path }, .{}) catch return null;
     if (r.term != .exited or r.code != 0) return null;
     return util.trim(r.stdout);
+}
+
+test "every OpenSSH key type counts as a public key" {
+    try testing.expect(isKeyType("ssh-ed25519"));
+    try testing.expect(isKeyType("ssh-rsa"));
+    try testing.expect(isKeyType("ecdsa-sha2-nistp256"));
+    try testing.expect(isKeyType("sk-ssh-ed25519@openssh.com"));
+    try testing.expect(!isKeyType("The"));
+    try testing.expect(!isKeyType(""));
+    try testing.expect(hasSshKey("ecdsa-sha2-nistp256 AAAA user@host\n"));
+    try testing.expect(!hasSshKey("The agent has no identities.\n"));
 }
