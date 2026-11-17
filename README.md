@@ -187,7 +187,7 @@ backup fails with a message saying so.
   `image/`.
 - **Development:** `nix develop` gives the pinned `zig`, then `zig build` and
   `./zig-out/bin/yolo` (or `zig build run -- ARGS`); `zig build test` runs the
-  unit and golden tests. A bare `zig-out/bin/yolo` has no
+  unit and compatibility-vector tests. A bare `zig-out/bin/yolo` has no
   `dumbpipe`/`socat`/`buildctl` on PATH, so use `./result/bin/yolo` or
   `nix develop` for Datum sessions and builds.
 - **docker backend:** Docker or Podman, on x86_64 or aarch64 (Apple Silicon).

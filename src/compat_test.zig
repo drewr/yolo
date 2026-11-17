@@ -1,7 +1,13 @@
-//! Golden vectors produced by the Haskell yolo (8ec99da) before it was
-//! deleted: the iroh ticket and z-base-32 label from 20 random secrets,
-//! shortImage, age, subnet64 and the table renderer. Byte-identical output is
-//! a compatibility invariant (docs/zig-port-plan.md).
+//! Compatibility vectors: characterization tests recorded from the Haskell
+//! yolo (8ec99da) before it was deleted. They run on every `zig build test`
+//! and in `nix build`'s check phase. Byte-identical output is a compatibility
+//! invariant (docs/zig-port-plan.md); each section must stay so because:
+//! - secrets (iroh ticket and z-base-32 label, from 20 random secrets): yolo
+//!   re-derives the ticket from each session's saved `iroh_secret` on every
+//!   attach, so any difference makes existing Datum sessions unreachable.
+//! - shortImage, age, table: what `yolo ls` prints; scripts may parse it.
+//! - subnet64: the IPv6 /64 carving `yolo infra` uses for EC2 networking; an
+//!   off-by-one puts resources in the wrong subnet.
 
 const std = @import("std");
 const testing = std.testing;
@@ -10,7 +16,7 @@ const keys = @import("keys.zig");
 const util = @import("util.zig");
 const infra = @import("infra.zig");
 
-const vectors = @embedFile("golden/vectors.txt");
+const vectors = @embedFile("compat/vectors.txt");
 
 /// Split the file into sections keyed by their "# name" line.
 fn section(comptime name: []const u8) []const u8 {
@@ -38,7 +44,7 @@ fn linesOf(allocator: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     return out.items;
 }
 
-test "golden: iroh ticket and z-base-32 label from the Haskell" {
+test "compat: iroh ticket and z-base-32 label from the Haskell" {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -59,7 +65,7 @@ test "golden: iroh ticket and z-base-32 label from the Haskell" {
     }
 }
 
-test "golden: shortImage" {
+test "compat: shortImage" {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -73,7 +79,7 @@ test "golden: shortImage" {
     }
 }
 
-test "golden: age" {
+test "compat: age" {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -85,7 +91,7 @@ test "golden: age" {
     }
 }
 
-test "golden: subnet64" {
+test "compat: subnet64" {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -103,7 +109,7 @@ test "golden: subnet64" {
     }
 }
 
-test "golden: table" {
+test "compat: table" {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

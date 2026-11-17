@@ -40,8 +40,9 @@ drewr/zigutils):
   usage text and the `Backend` union. A new backend is a new arm of the union
   plus its name in `loadBackend`.
 - In each file: pure `pub` functions first, then an `// IO boundary` divider,
-  then the IO. Tests are `test` blocks next to the code; golden vectors (from
-  the Haskell version this ports) are in `src/golden/vectors.txt`.
+  then the IO. Tests are `test` blocks next to the code; compatibility
+  vectors (from the Haskell version this ports) are in
+  `src/compat/vectors.txt`.
 - Hand-rolled argument parsing where commands pass arguments through (like
   `yolo attach`). `std.process.spawn` for children, `std.Io.Dir` for files,
   `std.Io.File.stdout()` for output. Prefer `std` to a third-party package; the
@@ -89,8 +90,9 @@ Before committing:
 
 - `nix build` must succeed: it builds `yolo` with `ReleaseSafe` and runs the
   tests in its check phase.
-- `zig build test` (unit + golden) and `zig build -Doptimize=ReleaseSafe` must
-  succeed in `nix develop`, and `zig fmt --check src build.zig` must be clean.
+- `zig build test` (unit + compatibility vectors) and
+  `zig build -Doptimize=ReleaseSafe` must succeed in `nix develop`, and
+  `zig fmt --check src build.zig` must be clean.
 - Run what you changed for real (`yolo new`/`attach`/`rm` on each backend you
   touched).
 - shellcheck the in-image scripts:

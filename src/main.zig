@@ -337,5 +337,5 @@ test {
     _ = infra;
     _ = images;
     _ = docker;
-    _ = @import("golden_test.zig");
+    _ = @import("compat_test.zig");
 }

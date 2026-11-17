@@ -3,7 +3,7 @@
 //! URL, and the public keys a session authorizes.
 //!
 //! The derivations are byte-identical to the Haskell yolo's (which used
-//! crypton): they are pinned by the golden vectors in src/golden/.
+//! crypton): they are pinned by the compatibility vectors in src/compat/.
 
 const std = @import("std");
 const testing = std.testing;
