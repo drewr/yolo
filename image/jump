@@ -1,0 +1,409 @@
+#!/bin/sh
+# The jump image's helper. Only the jump image has it.
+#
+#   jump setup   run as root by init.sh, after the login user and
+#                /etc/agent/env exist; needs U, UID_ and GID_ from init.sh
+#   jump login   the forced command of every authorized key (init.sh writes it);
+#                runs as the login user. The client's command picks:
+#                  (none)       the shared tmux session "main"
+#                  attach NAME  the tmux session NAME
+#                  load         add the private key on stdin to the
+#                               persistent agent (ssh BOX load < KEY)
+#                  connect DEST ssh -A DEST in a tmux session named for it
+#                  register NAME  an ssh Host entry for a yolo sandbox or any
+#                               host, from its connection details on stdin
+#                               (yolo jump BOX connect does both)
+#                  anything else, run by sh
+#
+# Agents: setup starts, as the login user and supervised,
+#   - a persistent ssh-agent at $RUN/persist.sock. Keys are pushed into it by
+#     the client and live only in that process's memory; a restart of the box
+#     or the agent empties it, and the client reloads them.
+#   - ssh-agent-mux at $RUN/mux.sock over that agent and a fixed pool of
+#     forwarded-agent slots $RUN/fwd/0..SLOTS-1. The mux doesn't expand globs,
+#     so the slots are listed one by one.
+#   - a separate ssh-agent at $RUN/thismachine.sock for this machine's own
+#     key, used only by ssh on this machine (IdentityAgent), never forwarded.
+#     It is outside the mux on purpose: the mux opens a new upstream
+#     connection per request, so a key added with a destination restriction
+#     (ssh-add -h) can't sign through it. Direct, the agent enforces it.
+# login links the client's forwarded agent into a free slot and exports the
+# mux socket as SSH_AUTH_SOCK for everything the login starts, tmux panes
+# included, so a pane keeps working after the device that started it
+# disconnects: it falls back to the persistent agent's keys. The slot is
+# released on exit; a slot whose socket is gone counts as free, so a login
+# that dies uncleanly doesn't leak one. When the pool is full the login still
+# succeeds, just without that device's agent. SSH_AUTH_SOCK is not set in
+# /etc/agent/env: a shell startup file that sourced it would overwrite the
+# client's forwarded socket before login could see it.
+#
+# JUMP_RUN and JUMP_ENV are overridable for tests only.
+RUN=${JUMP_RUN:-/run/yolo}
+SLOTS=16
+# The box's Secret and ConfigMap, mounted by the workload (yolo-BOX-jump and
+# yolo-BOX in the box's Datum project); BOX is SESSION_NAME.
+SECRET=${JUMP_SECRET:-/etc/jump/secret}
+CONFIG=${JUMP_CONFIG:-/etc/jump/config}
+
+setup() {
+  export PATH=/bin
+  : "${U:?}" "${UID_:?}" "${GID_:?}"
+  # The box's own iroh key is the SSH listener's alone. Everything started here
+  # (agents, tmux, held connections) must not inherit it: a dumbpipe connect
+  # with the listener's key knocks the listener off the relay, and the box
+  # becomes unreachable.
+  unset IROH_SECRET
+  as_user() { /bin/su "$U" -s /bin/sh -c "$1"; }
+  # A supervised ssh-agent at $RUN/SOCK, as the user. Each start runs ONSTART
+  # (if given) in the background, e.g. to put the stored keys back.
+  agent() { # SOCK LABEL [ONSTART]
+    (
+      while :; do
+        rm -f "$RUN/$1"
+        [ -n "${3:-}" ] && "$3" &
+        as_user "exec /bin/ssh-agent -D -a $RUN/$1 >/dev/null"
+        echo "[jump] $2 exited rc=$?; restarting"
+        sleep 2
+      done
+    ) &
+  }
+
+  # No core files from the agent or anything else holding keys.
+  # shellcheck disable=SC3045  # busybox sh has it
+  ulimit -c 0 2>/dev/null
+
+  # Sockets, config and anything key-shaped under $RUN stay in memory, also on
+  # a runtime class whose root filesystem is a disk.
+  if ! awk -v d="$RUN" '$2 == d && $3 == "tmpfs" { f = 1 } END { exit !f }' /proc/mounts; then
+    mkdir -p "$RUN" && mount -t tmpfs -o mode=0700,size=64m tmpfs "$RUN" \
+      || echo "[jump] WARNING: $RUN is not in memory (tmpfs mount failed)"
+  fi
+  mkdir -p "$RUN/fwd"
+  chown -R "$UID_:$GID_" "$RUN"
+  chmod 700 "$RUN"
+
+  {
+    echo "listen_path = \"$RUN/mux.sock\""
+    echo 'log_level = "error"'
+    printf 'agent_sock_paths = ["%s/persist.sock"' "$RUN"
+    i=0
+    while [ "$i" -lt "$SLOTS" ]; do
+      printf ', "%s/fwd/%s"' "$RUN" "$i"
+      i=$((i + 1))
+    done
+    echo ']'
+  } > "$RUN/mux.toml"
+  chown "$UID_:$GID_" "$RUN/mux.toml"
+
+  # Datum, as the box's own service account (credentials from its Secret):
+  # what lets `load` and `connect` persist and the box come back on its own.
+  if [ -r "$SECRET/datum-credentials.json" ]; then
+    # datumctl keeps the session (with the key) in ~/.datumctl without a
+    # system keyring: keep it on the $RUN tmpfs.
+    # shellcheck disable=SC2016  # $HOME is the user's, in their shell
+    as_user "mkdir -p -m 700 $RUN/datumctl && rm -rf \"\$HOME/.datumctl\" && ln -s $RUN/datumctl \"\$HOME/.datumctl\""
+    # The mounted file is root's; the user's copy lives on the tmpfs only for
+    # the login (datumctl keeps what it needs in ~/.datumctl, also there).
+    c=$RUN/datumctl/sa.json
+    install -m 600 -o "$UID_" -g "$GID_" "$SECRET/datum-credentials.json" "$c"
+    if as_user "/bin/datumctl login --credentials $c >/dev/null"; then
+      echo "[jump] datum: logged in as the box's service account"
+    else
+      echo "[jump] datum: service account login FAILED; load and connect won't persist"
+    fi
+    rm -f "$c"
+  fi
+
+  agent persist.sock "persistent agent" restore_keys
+  agent thismachine.sock "this machine's agent"
+  (
+    while :; do
+      # The mux removes its socket only on a clean exit; a stale one makes
+      # every restart fail with "Address already in use".
+      rm -f "$RUN/mux.sock"
+      as_user "exec /bin/ssh-agent-mux -c $RUN/mux.toml"
+      echo "[jump] ssh-agent-mux exited rc=$?; restarting"
+      sleep 2
+    done
+  ) &
+
+  echo "[jump] agent mux on $RUN/mux.sock ($SLOTS forwarded-agent slots)"
+  restore_connections &
+}
+
+# The keys in the box's Secret (ssh-key-*, written by `load`) into the
+# persistent agent, whenever that agent starts. Runs as root: the mounted
+# Secret is readable only by root, and root may use the user's agent.
+restore_keys() {
+  i=0
+  until [ -S "$RUN/persist.sock" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
+  n=0
+  for f in "$SECRET"/ssh-key-*; do
+    [ -r "$f" ] || continue
+    if SSH_AUTH_SOCK=$RUN/persist.sock ssh-add -q "$f" 2>/dev/null; then n=$((n + 1))
+    else echo "[jump] could not load ${f##*/}"; fi
+  done
+  echo "[jump] persistent agent: $n stored key(s) loaded"
+}
+
+# Every connection in the box's ConfigMap (conn.NAME, written by `register`):
+# its ssh Host entry, then a tmux session holding it, as at `connect`.
+restore_connections() {
+  for f in "$CONFIG"/conn.*; do
+    [ -r "$f" ] || continue
+    name=${f##*/conn.}
+    dest=$(sed -n 's/^dest=//p' "$f")
+    as_user "JUMP_RUN=$RUN /bin/sh /bin/jump register-local $name" < "$f" >/dev/null \
+      && as_user "JUMP_RUN=$RUN /bin/sh /bin/jump hold $dest" \
+      && echo "[jump] reconnecting $name ($dest)"
+  done
+}
+
+login() {
+  POOL=$RUN/fwd
+  FWD=${SSH_AUTH_SOCK:-}       # dropbear's forwarded agent, if the client sent one
+  # Never link the mux to itself: it would ask itself for keys forever. This is
+  # what happens if a login shell's startup files already pointed SSH_AUTH_SOCK
+  # at the mux before this ran.
+  case $FWD in "$RUN"/*) FWD= ;; esac
+  SLOT=
+  # shellcheck disable=SC1090  # the session environment written by init.sh
+  [ -r "${JUMP_ENV:-/etc/agent/env}" ] && . "${JUMP_ENV:-/etc/agent/env}"
+  # The one agent everything this login starts (tmux panes, yolo, ssh) uses.
+  SSH_AUTH_SOCK=$RUN/mux.sock
+  export SSH_AUTH_SOCK
+
+  if [ -n "$FWD" ] && ! claim; then
+    echo "jump: forwarded-agent pool is full; this login uses the persistent agent only" >&2
+  fi
+  trap release EXIT
+  trap 'exit 1' HUP INT TERM
+
+  # Not exec, so the EXIT trap releases the slot.
+  case ${SSH_ORIGINAL_COMMAND:-} in
+    '')        tmux new-session -A -s main ;;
+    "attach "*) tmux new-session -A -s "${SSH_ORIGINAL_COMMAND#attach }" ;;
+    load)      load ;;
+    "connect "*)  connect "${SSH_ORIGINAL_COMMAND#connect }" ;;
+    "register "*) register "${SSH_ORIGINAL_COMMAND#register }" ;;
+    *)         /bin/sh -c "$SSH_ORIGINAL_COMMAND" ;;
+  esac
+  exit $?
+}
+
+# A merge patch (JSON in FILE) of the box's own Secret or ConfigMap in its
+# Datum project, as the box's service account.
+persist() { # KIND NAME FILE
+  if [ -z "${SESSION_NAME:-}" ] || [ -z "${DATUM_PROJECT:-}" ]; then
+    echo "jump: SESSION_NAME or DATUM_PROJECT unset; not stored in Datum" >&2; return 1
+  fi
+  /bin/datumctl patch "$1" "$2" --project "$DATUM_PROJECT" --type merge --patch-file "$3" >/dev/null
+}
+
+# `ssh BOX load < KEY`: add the private key on stdin to the persistent agent,
+# and store it in the box's Secret (ssh-key-FINGERPRINT), from which the agent
+# is refilled whenever it or the box restarts. On the box it passes only
+# through this shell's memory and a patch file on the $RUN tmpfs.
+# A key with a passphrase can't be loaded this way (no terminal to ask on).
+load() {
+  k=$(cat)
+  if ! printf '%s\n' "$k" | SSH_AUTH_SOCK=$RUN/persist.sock ssh-add -q - 2>/dev/null; then
+    echo "jump load: ssh-add refused the key (a passphrase, or not a private key?)" >&2
+    return 1
+  fi
+  # ssh-keygen -l reads a private key only from a file: one on the tmpfs,
+  # removed at once.
+  kf=$RUN/.key.$$
+  (umask 077; printf '%s\n' "$k" > "$kf")
+  fp=$(ssh-keygen -l -f "$kf" | awk '{print $2}')
+  rm -f "$kf"
+  name=ssh-key-$(printf %s "${fp#SHA256:}" | tr '+/' '-_' | tr -d '=')
+  f=$RUN/.patch.$$
+  (umask 077; printf '%s\n' "$k" | base64 -w0 | jq -Rn --arg n "$name" '{data: {($n): input}}' > "$f")
+  if persist secret "yolo-$SESSION_NAME-jump" "$f"; then
+    echo "jump load: stored in Datum as $name (yolo-$SESSION_NAME-jump)"
+  else
+    echo "jump load: in the agent, but NOT stored; it's gone after a restart" >&2
+  fi
+  rm -f "$f"
+  SSH_AUTH_SOCK=$RUN/persist.sock ssh-add -l
+}
+
+# The tmux session name for a destination: tmux names can't hold . or :.
+session_for() { printf %s "$1" | tr '.:@' '___'; }
+
+valid_dest() {
+  case $1 in
+    ''|-*|*[!A-Za-z0-9@._:%+-]*) echo "jump: bad destination '$1'" >&2; return 2 ;;
+  esac
+}
+
+# `hold DEST`: a detached tmux session (named for DEST) running hold_loop, so
+# the connection outlives every login. Holding an already-held DEST is a no-op.
+hold() {
+  valid_dest "$1" || return
+  s=$(session_for "$1")
+  tmux has-session -t "=$s" 2>/dev/null && return 0
+  tmux new-session -d -s "$s" env "JUMP_RUN=$RUN" /bin/sh /bin/jump hold-loop "$1"
+}
+
+# ssh to DEST, forwarding the mux, and reconnect whenever it drops: after the
+# host reboots, after the network goes, after this box restarts (setup re-holds
+# every recorded connection). Keepalives notice a dead peer in about 30s; retries
+# back off from 5s to 60s, and a connection that lasted a minute starts over at
+# 5s. The forwarded agent is named explicitly: an IdentityAgent for DEST must
+# never be what's forwarded. On DEST, ~/.ssh/agent.sock follows the current
+# connection's agent, so what runs there keeps a working agent across reconnects.
+hold_loop() {
+  d=5
+  while :; do
+    t0=$(date +%s)
+    # shellcheck disable=SC2016  # expanded on DEST
+    ssh -t -o "IdentityAgent=$RUN/mux.sock" -o "ForwardAgent=$RUN/mux.sock" \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ConnectTimeout=20 "$1" \
+      'mkdir -p ~/.ssh && ln -sfn "$SSH_AUTH_SOCK" ~/.ssh/agent.sock; exec "${SHELL:-/bin/sh}" -l'
+    rc=$?
+    [ $(($(date +%s) - t0)) -ge 60 ] && d=5
+    echo "[jump] connection to $1 ended (rc=$rc); reconnecting in ${d}s, C-c to stop"
+    sleep "$d"
+    d=$((d * 2)); [ "$d" -gt 60 ] && d=60
+  done
+}
+
+# `connect DEST`: hold DEST, then attach to that session. Running it again
+# reattaches; detaching (or the device going away) leaves it held.
+connect() {
+  hold "$1" && tmux attach-session -t "=$(session_for "$1")"
+}
+
+# `register NAME`, with a host's connection details on stdin (all public;
+# yolo jump BOX connect sends them), one key=value per line:
+#   dest=        what to hold: USER@NAME, or NAME
+#   alias=       the name its host key is pinned under (HostKeyAlias)
+#   hostname=    to reach it directly (DNS name or IP), and port= if not 22
+#   ticket=      or to reach it over iroh (a yolo sandbox, or a host running
+#                dumbpipe listen-tcp)
+#   known_hosts= its host key, "ALIAS TYPE KEY" (repeatable)
+#   accept_new=1 no host key given: take the one the host offers now, once
+# Writes its ssh Host entry (register_local) and records the details, with
+# the host key resolved, as conn.NAME in the box's ConfigMap, from which the
+# box re-registers and re-holds it after a restart.
+register() {
+  payload=$(cat)
+  if printf '%s\n' "$payload" | grep -qx 'accept_new=1' && ! printf '%s\n' "$payload" | grep -q '^known_hosts='; then
+    payload=$(printf '%s\n' "$payload" | accept_new) || return
+  fi
+  printf '%s\n' "$payload" | register_local "$1" || return
+  f=$RUN/.patch.$$
+  printf '%s\n' "$payload" | jq -Rs --arg n "conn.$1" '{data: {($n): .}}' > "$f"
+  if persist configmap "yolo-$SESSION_NAME" "$f"; then
+    echo "jump register: recorded conn.$1 in yolo-$SESSION_NAME"
+  else
+    echo "jump register: NOT recorded; $1 won't reconnect after a restart" >&2
+  fi
+  rm -f "$f"
+}
+
+# Trust on first use: the payload on stdin, minus accept_new, plus the host
+# keys the host offers now (ssh-keyscan), under its alias.
+accept_new() {
+  p=$(cat)
+  get() { printf '%s\n' "$p" | sed -n "s/^$1=//p" | head -1; }
+  h=$(get hostname) port=$(get port) a=$(get alias)
+  [ -n "$h" ] || { echo "jump register: accept_new needs hostname=" >&2; return 2; }
+  keys=$(ssh-keyscan -T 10 -p "${port:-22}" -- "$h" 2>/dev/null | awk -v a="$a" '!/^#/ && NF >= 3 { print "known_hosts=" a " " $2 " " $3 }')
+  [ -n "$keys" ] || { echo "jump register: no host key from $h" >&2; return 1; }
+  echo "jump register: trusting $h's host key on first use:" >&2
+  printf '%s\n' "$keys" | sed 's/^known_hosts=[^ ]* /  /' >&2
+  printf '%s\n' "$p" | grep -vx 'accept_new=1'
+  printf '%s\n' "$keys"
+}
+
+# An ssh Host entry NAME, from the details on stdin (see register), with its
+# host key pinned. Entries live in ~/.ssh/yolo/, included from ~/.ssh/config.
+register_local() {
+  case $1 in ''|-*|*[!A-Za-z0-9._-]*) echo "jump register: bad name '$1'" >&2; return 2 ;; esac
+  ticket='' alias='' host='' port='' kh=''
+  while IFS= read -r line; do
+    case $line in
+      ticket=*) ticket=${line#ticket=} ;;
+      alias=*) alias=${line#alias=} ;;
+      hostname=*) host=${line#hostname=} ;;
+      port=*) port=${line#port=} ;;
+      known_hosts=*) kh="$kh${line#known_hosts=}
+" ;;
+    esac
+  done
+  case $alias in ''|-*|*[!A-Za-z0-9._-]*) echo "jump register: bad alias" >&2; return 2 ;; esac
+  case $ticket in *[!a-z0-9]*) echo "jump register: bad ticket" >&2; return 2 ;; esac
+  case $host in -*|*[!A-Za-z0-9.:-]*) echo "jump register: bad hostname" >&2; return 2 ;; esac
+  case $port in *[!0-9]*) echo "jump register: bad port" >&2; return 2 ;; esac
+  if [ -z "$ticket" ] && [ -z "$host" ]; then echo "jump register: need ticket= or hostname=" >&2; return 2; fi
+  [ -n "$kh" ] || { echo "jump register: no host key (known_hosts=)" >&2; return 2; }
+  if printf '%s' "$kh" | grep -v "^$alias [a-z0-9@.-]* [A-Za-z0-9+/=]*\$" | grep -q .; then
+    echo "jump register: a known_hosts line isn't 'ALIAS TYPE KEY' for $alias" >&2; return 2
+  fi
+  d=$HOME/.ssh/yolo
+  mkdir -p "$d" && chmod 700 "$HOME/.ssh" "$d"
+  printf '%s' "$kh" > "$d/known_hosts.$1"
+  {
+    echo "Host $1"
+    if [ -n "$ticket" ]; then
+      echo "  HostName $alias"
+      # Never with the box's own iroh key (see setup).
+      echo "  ProxyCommand /bin/env -u IROH_SECRET /bin/dumbpipe connect $ticket 2>/dev/null"
+    else
+      echo "  HostName $host"
+      [ -n "$port" ] && echo "  Port $port"
+    fi
+    echo "  HostKeyAlias $alias"
+    echo "  UserKnownHostsFile $d/known_hosts.$1"
+    echo "  StrictHostKeyChecking yes"
+  } > "$d/$1.conf"
+  # Include must come before any Host block to apply everywhere.
+  inc='Include ~/.ssh/yolo/*.conf'
+  if ! grep -qxF "$inc" "$HOME/.ssh/config" 2>/dev/null; then
+    { echo "$inc"; cat "$HOME/.ssh/config" 2>/dev/null; } > "$HOME/.ssh/config.new"
+    mv "$HOME/.ssh/config.new" "$HOME/.ssh/config"
+  fi
+  chmod 600 "$HOME/.ssh/config"
+  echo "registered $1 (${ticket:+iroh}${host:+$host${port:+:$port}})"
+}
+
+claim() {
+  n=0
+  # mkdir is the lock: it is atomic. A lock left by a login that was killed
+  # inside this function is reclaimed after 5s.
+  until mkdir "$POOL/.lock" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 50 ]; then rmdir "$POOL/.lock" 2>/dev/null; n=0; fi
+    sleep 0.1
+  done
+  i=0
+  while [ "$i" -lt "$SLOTS" ]; do
+    l=$POOL/$i
+    if [ ! -e "$l" ]; then     # absent, or a link to a socket that is gone
+      rm -f "$l"
+      if ln -s "$FWD" "$l" 2>/dev/null; then SLOT=$l; break; fi
+    fi
+    i=$((i + 1))
+  done
+  rmdir "$POOL/.lock" 2>/dev/null
+  [ -n "$SLOT" ]
+}
+
+# shellcheck disable=SC2329  # runs as the EXIT trap
+release() {
+  [ -n "$SLOT" ] && [ "$(readlink "$SLOT" 2>/dev/null)" = "$FWD" ] && rm -f "$SLOT"
+  return 0
+}
+
+case ${1:-} in
+  setup) setup ;;
+  login) login ;;
+  # Used by setup to restore saved connections, as the login user.
+  register-local) register_local "${2:-}" ;;
+  hold) hold "${2:-}" ;;
+  hold-loop) hold_loop "${2:?}" ;;
+  *) echo "usage: jump setup|login" >&2; exit 2 ;;
+esac

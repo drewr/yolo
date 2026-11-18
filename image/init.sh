@@ -12,6 +12,11 @@
 #     /etc/agent/claude seed a home that has none. A private key mounted at
 #     /run/yolo-key/id is loaded into an agent at /run/yolo-ssh/agent.sock.
 #
+# The `jump` image (harness jump; datum mode) is a long-lived jump box: no nix,
+# shared home or provider config. Every login runs `jump login` (a forced command
+# on each authorized key), and `jump setup` starts the in-memory ssh-agent and
+# ssh-agent-mux that all logins share.
+#
 # Environment (datum), from the per-session Secret written by yolo:
 #   IROH_SECRET          iroh endpoint secret key; the client derives the ticket
 #   AUTHORIZED_KEYS_B64  base64 authorized_keys (for the user and root)
@@ -35,6 +40,8 @@ export PATH=/bin
 export HOME=/root
 log() { echo "[agent] $*"; }
 MODE=${YOLO_MODE:-datum}
+JUMP=0
+[ "$(cat /etc/agent/harness 2>/dev/null)" = jump ] && JUMP=1
 
 # Nix normalizes permissions in store outputs, so the image's modes for /tmp
 # and /root don't survive; set them here.
@@ -67,20 +74,23 @@ if [ "$MODE" = local ] && [ -n "$HOST_UID" ] && [ -n "$HOST_GID" ]; then
   sed -i "s/^$U:x:$old_uid:$old_uid:/$U:x:$HOST_UID:$HOST_GID:/" /etc/passwd
   sed -i "s/^$U:x:$old_uid:/$U:x:$HOST_GID:/" /etc/group
 fi
+# jump: plain bash. The dotfiles' zsh config re-picks SSH_AUTH_SOCK at every
+# shell start, which fights the mux that owns it here.
+[ $JUMP = 1 ] && sed -i "/^$U:/s|:/bin/zsh\$|:/bin/bash|" /etc/passwd
 UID_=$(/bin/id -u "$U")
 GID_=$(/bin/id -g "$U")
 as_user() { /bin/su "$U" -s /bin/sh -c "$1"; }
 
 # nix: register the store paths shipped in the image (the store database lives
 # on the RAM overlay and starts empty), then run the daemon the user talks to.
-if [ -s /etc/agent/nix-registration ] && [ ! -e /nix/var/nix/db/db.sqlite ]; then
+if [ $JUMP = 0 ] && [ -s /etc/agent/nix-registration ] && [ ! -e /nix/var/nix/db/db.sqlite ]; then
   if /bin/nix-store --load-db < /etc/agent/nix-registration 2>/tmp/nix-load-db.log; then
     log "nix: registered $(grep -c '^/nix/store/' /etc/agent/nix-registration) store paths"
   else
     log "nix: load-db FAILED: $(tail -2 /tmp/nix-load-db.log | tr '\n' ' ')"
   fi
 fi
-/bin/nix-daemon > /tmp/nix-daemon.log 2>&1 &
+[ $JUMP = 0 ] && /bin/nix-daemon > /tmp/nix-daemon.log 2>&1 &
 
 # Unprivileged ICMP, so iputils ping works for the login user.
 # (Read-only under docker, which already allows it in containers.)
@@ -97,6 +107,9 @@ if [ "$MODE" = datum ]; then
   # user, so the session's keys stay out of the shared home.
   mkdir -p /etc/agent/ssh /etc/dropbear
   echo "$AUTHORIZED_KEYS_B64" | /bin/base64 -d > /etc/agent/ssh/authorized_keys
+  # jump: every key logs in through `jump login` (slot for the forwarded agent,
+  # then the shared tmux or the client's command). Comments and blanks stay.
+  [ $JUMP = 1 ] && sed -i '/^[[:space:]]*\(#\|$\)/!s|^|command="/bin/jump login" |' /etc/agent/ssh/authorized_keys
   chmod 0644 /etc/agent/ssh/authorized_keys
   umask 077
   echo "$SSH_HOST_KEY_B64" | /bin/base64 -d > /run/host_key
@@ -178,6 +191,7 @@ mkdir -p /work && chown "$UID_:$GID_" /work
 } > /etc/agent/env
 chown "root:$GID_" /etc/agent/env && chmod 0640 /etc/agent/env
 unset AUTHORIZED_KEYS_B64 SSH_HOST_KEY_B64
+[ $JUMP = 1 ] && U=$U UID_=$UID_ GID_=$GID_ /bin/sh /bin/jump setup
 for k in $PROVIDER_KEYS; do case $k in ''|[0-9]*|*[!A-Za-z0-9_]*) ;; *) unset "$k" ;; esac; done
 
 # ws open/clone print the RAM path of the workspace; land the shell there.
@@ -201,7 +215,7 @@ export YOLO_MODE="$MODE"
 # shellcheck disable=SC2016  # runs in the user's shell
 as_user '
   cd "$HOME" || exit 0
-  if [ -d /etc/agent/zsh ]; then
+  if [ -d /etc/agent/zsh ] && [ "$(cat /etc/agent/harness)" != jump ]; then
     for f in zshrc zshenv zprofile; do [ -e ".$f" ] || [ -L ".$f" ] || ln -s "/etc/agent/zsh/$f" ".$f"; done
     [ -e .zsh.d ] || [ -L .zsh.d ] || ln -s /etc/agent/zsh/zsh.d .zsh.d
   fi
@@ -253,7 +267,7 @@ fi
 
 # opencode and pi provider config for the registry providers whose key is set
 # (needs the keys and the network, so it runs in the background).
-as_user '. /etc/agent/env && /bin/agent-providers sync' >/dev/null 2>&1 &
+[ $JUMP = 0 ] && as_user '. /etc/agent/env && /bin/agent-providers sync' >/dev/null 2>&1 &
 # Repos live in RAM under /work and persist to ~/work via ws (agent/ws).
 [ $SHARED = 1 ] && as_user 'exec /bin/ws autosave' &
 

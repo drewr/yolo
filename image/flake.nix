@@ -29,9 +29,12 @@
     # none; yolo overrides it with $YOLO_DOTFILES (--override-input dotfiles
     # github:OWNER/dotfiles). Not a relative path: Lix can't fetch those.
     dotfiles = { url = "github:drewr/yolo"; flake = false; };
+    # The yolo CLI, for the jump image, which launches sandboxes itself. Pinned
+    # in flake.lock; bump it (`nix flake update yolo`) when the CLI changes.
+    yolo.url = "github:drewr/yolo";
   };
 
-  outputs = { self, nixpkgs, llm-agents, dotfiles }:
+  outputs = { self, nixpkgs, llm-agents, dotfiles, yolo }:
   let
     # x86_64-linux for Datum Compute and Intel hosts; aarch64-linux for the
     # docker backend on Apple Silicon (podman machine / Docker Desktop VMs).
@@ -70,6 +73,28 @@
         buildInputs = [ pkgs.stdenv.cc.cc.lib ];
         installPhase = "install -Dm755 rtk $out/bin/rtk";
       };
+      # datumctl, for the jump image: the upstream release binary (a static Go
+      # executable, so no patchelf). Not in nixpkgs.
+      datumctlSrc = {
+        x86_64-linux = {
+          asset = "datumctl_Linux_x86_64.tar.gz";
+          hash = "sha256-gUHR7pi8Cj8X6StYCG6CurI7jXkMPsUqaO8GG6mhmYI=";
+        };
+        aarch64-linux = {
+          asset = "datumctl_Linux_arm64.tar.gz";
+          hash = "sha256-EmwpTsWxcQvEwZxorZxpwjx+cxRA2TNG4RWpSqjMxtE=";
+        };
+      }.${system};
+      datumctl = pkgs.stdenv.mkDerivation {
+        pname = "datumctl";
+        version = "0.24.0";
+        src = pkgs.fetchurl {
+          url = "https://github.com/datum-cloud/datumctl/releases/download/v0.24.0/${datumctlSrc.asset}";
+          inherit (datumctlSrc) hash;
+        };
+        sourceRoot = ".";
+        installPhase = "install -Dm755 datumctl $out/bin/datumctl";
+      };
       agents = llm-agents.packages.${system};
       # The same harnesses the dotfiles install (d/.config/home-manager/flake.nix),
       # from the same pinned llm-agents rev; opencode2 is also exposed as opencode.
@@ -88,6 +113,17 @@
       };
       busybox = pkgs.pkgsStatic.busybox;
       base = [ rtk ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync ]);
+      # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in an
+      # ssh-agent behind ssh-agent-mux, shares tmux sessions between devices, and
+      # runs yolo and datumctl to launch Datum sandboxes.
+      # The jump image's helper (`jump setup`, `jump login`), in that image only.
+      jumpScript = pkgs.runCommand "jump" { } ''
+        mkdir -p $out/bin
+        cp ${./jump} $out/bin/jump
+        chmod 0555 $out/bin/jump
+      '';
+      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript ]
+        ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear dumbpipe tmux ssh-agent-mux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).
       locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" ]; };
@@ -123,9 +159,8 @@
         }];
       });
 
-      mkRootfs = name: harness: let
+      mkRootfs = name: tools: let
         # Linked into /bin ahead of busybox applets of the same name.
-        tools = [ harness ] ++ base;
         closure = pkgs.closureInfo { rootPaths = tools ++ [ pkgs.cacert locales ]; };
       in pkgs.runCommand "agent-rootfs-${name}" { } ''
         R=$out
@@ -178,7 +213,8 @@
         chmod 0700 $R/root
         chmod 1777 $R/tmp
       '';
-    in builtins.mapAttrs mkRootfs harnesses;
+    in builtins.mapAttrs (name: harness: mkRootfs name ([ harness ] ++ base)) harnesses
+       // { jump = mkRootfs "jump" jumpTools; };
   in {
     packages = nixpkgs.lib.genAttrs systems perSystem;
     # For `yolo sync-pins`: the locked dotfiles source.

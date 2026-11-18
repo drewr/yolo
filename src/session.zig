@@ -6,7 +6,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const Ctx = util.Ctx;
 
-pub const harnesses = [_][]const u8{ "claude", "gemini", "codex", "opencode", "pi" };
+pub const harnesses = [_][]const u8{ "claude", "gemini", "codex", "opencode", "pi", "jump" };
 
 pub const classes = [_][]const u8{ "unikernel", "general-purpose" };
 
@@ -35,7 +35,7 @@ pub fn validName(name: []const u8) bool {
 }
 
 pub fn checkHarness(h: []const u8) void {
-    if (!isHarness(h)) util.dief("unknown harness '{s}' (have: claude gemini codex opencode pi)", .{h});
+    if (!isHarness(h)) util.dief("unknown harness '{s}' (have: claude gemini codex opencode pi jump)", .{h});
 }
 
 pub fn isHarness(h: []const u8) bool {

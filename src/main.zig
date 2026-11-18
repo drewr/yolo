@@ -22,6 +22,7 @@ const docker = @import("docker.zig");
 const datum = @import("datum.zig");
 const infra = @import("infra.zig");
 const images = @import("images.zig");
+const jump = @import("jump.zig");
 
 const Ctx = util.Ctx;
 
@@ -101,6 +102,9 @@ pub const usage =
     \\  yolo infra buildbox|meta CMD      the EC2 build box and the shared home's metadata host:
     \\                                    launch [REV] | ticket | ipv6 | start | stop | status | terminate,
     \\                                    and for the build box, tunnel [PORT]
+    \\  yolo jump BOX connect [--accept-new] [USER@]HOST[:PORT]
+    \\                                    from jump box BOX, hold ssh -A to HOST (a host or one
+    \\                                    of your sessions), reconnecting; attach to it
     \\
     \\The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
     \\remembers its own. Backend options for `new`:
@@ -159,6 +163,7 @@ pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {
     if (rest.len > 0 and std.mem.eql(u8, first, "build")) return cmdBuild(ctx, root, rest[1..]);
     if (rest.len == 1 and std.mem.eql(u8, first, "sync-pins")) return images.syncPins(ctx, root);
     if (rest.len > 0 and std.mem.eql(u8, first, "infra")) return infra.cmd(ctx, root, rest[1..]);
+    if (rest.len > 0 and std.mem.eql(u8, first, "jump")) return jump.cmd(ctx, root, rest[1..]);
     if (rest.len == 1 and is_version) {
         util.say(std.fmt.allocPrint(ctx.arena, "{s}", .{versionLine(ctx, root)}) catch "");
         return 0;
@@ -337,5 +342,6 @@ test {
     _ = infra;
     _ = images;
     _ = docker;
+    _ = jump;
     _ = @import("compat_test.zig");
 }

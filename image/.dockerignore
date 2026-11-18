@@ -8,3 +8,4 @@
 !nix-zsh-env
 !ssh_known_hosts
 !claude
+!jump
