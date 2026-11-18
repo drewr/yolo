@@ -142,12 +142,12 @@ tokenizer URL may be `http://127.0.0.1:8080` or `http://[::1]:8080`).
 - The proxy reaches hosts it splices directly with Happy Eyeballs (RFC 8305):
   IPv6 first, the next address after 250 ms or at once if an attempt fails,
   10 s per attempt.
-- Tokenizer limitation: stock tokenizer splits its dial address at the first
-  `:`, so it cannot dial an IPv6 literal upstream (`[2001:db8::1]:443`); the
-  broker admits and forwards such a request correctly and tokenizer answers with
-  its own error. A DNS name that resolves to IPv6 works, since tokenizer
-  resolves and dials every family. IPv6 CONNECT targets are otherwise supported
-  end to end up to tokenizer.
+- IPv6 literal upstreams (`[2001:db8::1]:443`) need a patched tokenizer: stock
+  tokenizer splits its dial address at the first `:` and mishandles an IPv6
+  literal on port 80 or 443. `nix/tokenizer-ipv6.patch` fixes that and is
+  applied to the tokenizer this flake builds, pending the same fix upstream. A
+  tokenizer built without it still works for DNS names (which may resolve to
+  IPv6) and IPv4 literals.
 
 The sandbox must trust `ca.pem` from the store. Mind the trust variables of
 each client (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, ...).
@@ -270,8 +270,8 @@ no code change.
 
 - HTTP/1.1 only. HTTP/2 is not offered (ALPN is `http/1.1`); websockets and
   other upgrades are not relayed. Clients that need h2 fall back to 1.1.
-- IPv6 literal upstreams cannot be dialed by stock tokenizer (see "IPv4 and
-  IPv6"); DNS names and IPv4 literals work, and IPv6 works everywhere else.
+- IPv6 literal upstreams need the patched tokenizer built by this flake (see
+  "IPv4 and IPv6").
 - Tokenizer is dialed per request; there is no connection reuse.
 - A secret's JSON is whatever tokenizer accepts. Processors that return
   sealed tokens in responses (OAuth) are not handled by the broker.

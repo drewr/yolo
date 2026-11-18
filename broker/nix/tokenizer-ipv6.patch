@@ -1,0 +1,139 @@
+Subject: [PATCH] Parse dial addresses with net.SplitHostPort
+
+dialFunc split the address at the first colon, which cuts an IPv6 literal
+such as [2001:db8::1]:80 inside the address. The port then never matched
+"80" or "443", so a literal on port 80 was dialed with TLS on port 80
+instead of 443, and a literal on port 443 was not refused. Use
+net.SplitHostPort and net.JoinHostPort. A missing port still means 443.
+---
+ tokenizer.go      | 12 +++++--
+ tokenizer_test.go | 86 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/tokenizer.go b/tokenizer.go
+index 6698233..b929370 100644
+--- a/tokenizer.go
++++ b/tokenizer.go
+@@ -562,7 +562,15 @@ func dialFunc(badAddrs []string, allowPrivate bool) func(string, string) (net.Co
+ 			return nil, fmt.Errorf("%w: dialing network %s not supported", ErrBadRequest, network)
+ 		}
+ 
+-		hostname, port, _ := strings.Cut(addr, ":")
++		hostname, port, err := net.SplitHostPort(addr)
++		if err != nil {
++			// A missing port means the default one, as it always has.
++			var addrErr *net.AddrError
++			if !errors.As(err, &addrErr) || addrErr.Err != "missing port in address" {
++				return nil, fmt.Errorf("%w: bad dial address %q: %w", ErrBadRequest, addr, err)
++			}
++			hostname, port = strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
++		}
+ 		if hostname == "" {
+ 			return nil, fmt.Errorf("%w: attempt to dial without host: %q", ErrBadRequest, addr)
+ 		}
+@@ -572,7 +580,7 @@ func dialFunc(badAddrs []string, allowPrivate bool) func(string, string) (net.Co
+ 		case "80", "":
+ 			port = "443"
+ 		}
+-		addr = fmt.Sprintf("%s:%s", hostname, port)
++		addr = net.JoinHostPort(hostname, port)
+ 
+ 		return tls.DialWithDialer(&netDialer, network, addr, &tls.Config{RootCAs: UpstreamTrust})
+ 	}
+diff --git a/tokenizer_test.go b/tokenizer_test.go
+index 429fe2e..4168be8 100644
+--- a/tokenizer_test.go
++++ b/tokenizer_test.go
+@@ -841,3 +841,89 @@ func TestDialFuncDeniesInternalAddresses(t *testing.T) {
+ 	assert.Error(t, err)
+ 	assert.False(t, errors.Is(err, ErrBadRequest), "got %v", err)
+ }
++
++func TestDialFuncParsesAddresses(t *testing.T) {
++	refused := []struct {
++		name string
++		addr string
++		msg  string
++	}{
++		{"https port", "example.com:443", "proxied request must be HTTP"},
++		{"ipv6 literal https port", "[::1]:443", "proxied request must be HTTP"},
++		{"empty host", ":80", "without host"},
++		{"empty ipv6 host", "[]:80", "without host"},
++		{"empty address", "", "without host"},
++	}
++	for _, tc := range refused {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := dialFunc(nil, true)("tcp", tc.addr)
++			assert.True(t, errors.Is(err, ErrBadRequest), "got %v", err)
++			assert.Contains(t, err.Error(), tc.msg)
++		})
++	}
++
++	// Port 80, or no port, is dialed as 443 with the host intact. Nothing
++	// listens there, so the error names the address that was dialed.
++	for _, tc := range []struct{ addr, dialed string }{
++		{"127.0.0.1:80", "127.0.0.1:443"},
++		{"127.0.0.1", "127.0.0.1:443"},
++		{"127.0.0.1:", "127.0.0.1:443"},
++		{"[::1]:80", "[::1]:443"},
++		{"[::1]", "[::1]:443"},
++		{"[::1]:", "[::1]:443"},
++	} {
++		t.Run("default port "+tc.addr, func(t *testing.T) {
++			_, err := dialFunc(nil, true)("tcp", tc.addr)
++			assert.Error(t, err)
++			assert.False(t, errors.Is(err, ErrBadRequest), "got %v", err)
++			assert.Contains(t, err.Error(), tc.dialed)
++		})
++	}
++
++	// An unbracketed IPv6 literal is not an address with a port.
++	_, err := dialFunc(nil, true)("tcp", "::1")
++	assert.True(t, errors.Is(err, ErrBadRequest), "got %v", err)
++}
++
++func TestTokenizerIPv6Upstream(t *testing.T) {
++	l, err := net.Listen("tcp", "[::1]:0")
++	if err != nil {
++		t.Skipf("no IPv6 loopback: %v", err)
++	}
++	appServer := httptest.NewUnstartedServer(echo)
++	appServer.Listener.Close()
++	appServer.Listener = l
++	appServer.StartTLS()
++	defer appServer.Close()
++
++	// httptest's certificate is valid for ::1.
++	UpstreamTrust.AddCert(appServer.Certificate())
++
++	var (
++		pub, priv, _ = box.GenerateKey(rand.Reader)
++		sealKey      = hex.EncodeToString(pub[:])
++		openKey      = hex.EncodeToString(priv[:])
++	)
++	tkzServer := httptest.NewServer(NewTokenizer(openKey, AllowPrivateUpstreams()))
++	defer tkzServer.Close()
++
++	auth := "trustno1"
++	token := "supersecret"
++	secret, err := (&Secret{
++		AuthConfig:      NewBearerAuthConfig(auth),
++		ProcessorConfig: &InjectProcessorConfig{Token: token},
++		RequestValidators: []RequestValidator{
++			AllowHosts(appServer.Listener.Addr().String()),
++		},
++	}).Seal(sealKey)
++	assert.NoError(t, err)
++
++	client, err := Client(tkzServer.URL, WithAuth(auth), WithSecret(secret, nil))
++	assert.NoError(t, err)
++	req, err := http.NewRequest(http.MethodGet, "http://"+appServer.Listener.Addr().String()+"/foo", nil)
++	assert.NoError(t, err)
++	assert.Equal(t, &echoResponse{
++		Headers: http.Header{"Authorization": {"Bearer " + token}},
++		Body:    "",
++	}, doEcho(t, client, req))
++}
+-- 
+2.56.0
+

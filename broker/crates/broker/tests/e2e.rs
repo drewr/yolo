@@ -1231,22 +1231,19 @@ async fn ipv6_literal_targets_are_admitted_and_tunneled() {
 
     // The whole path through the proxy's IPv6 listener: CONNECT [::1]:port,
     // TLS against a leaf with an IPv6 SAN, a Host header with brackets. The
-    // broker must admit it and send tokenizer `[::1]:port`. (Stock tokenizer
-    // splits a dial address at its first ':' and cannot dial an IPv6 literal,
-    // so what comes back may be tokenizer's error, but never the broker's.)
+    // broker admits it, tokenizer (patched to dial IPv6 literals) reaches the
+    // upstream on [::1] and the upstream receives the injected credential.
     let mut t = open_tunnel(w.proxy_addr6(), "::1", port6, &w.broker_ca_pem())
         .await
         .unwrap();
     let r = t.get("::1", port6, "/lit", &[]).await;
-    for broker_says in [
-        "does not match",
-        "not permitted",
-        "bad host",
-        "unsupported",
-        "missing Host",
-    ] {
-        assert!(!r.body.contains(broker_says), "{}: {}", r.status, r.body);
-    }
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let echo = json_body(&r);
+    assert_eq!(echo["host"], format!("[::1]:{port6}"));
+    assert_eq!(
+        echo["authorization_sha256"],
+        sha256_hex(&format!("Bearer {TOKEN}"))
+    );
     let line = wait_for(
         &w.logs(),
         |l| l.contains("\"path\":\"/lit\""),

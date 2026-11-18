@@ -11,7 +11,9 @@
     systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
     forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-    # superfly/tokenizer, used unmodified as a separate process.
+    # superfly/tokenizer as a separate process, plus nix/tokenizer-ipv6.patch:
+    # stock tokenizer splits its dial address at the first ':' and mishandles
+    # IPv6 literal upstreams. Drop the patch once that is fixed upstream.
     mkTokenizer = pkgs: pkgs.buildGoModule {
       pname = "tokenizer";
       version = "0.0.1-0f51c9d";
@@ -21,9 +23,12 @@
         rev = "0f51c9d780d0edea243574c12e7ba43a15894595";
         hash = "sha256-DAWuQnpFplNxB7G+HIUiMCfYmfU59pwbVi6KTR4ZxSE=";
       };
+      patches = [ ./nix/tokenizer-ipv6.patch ];
       vendorHash = "sha256-L52HJC/h65I/QjaaGdwupHKJca+61tudQy5CINQuwPU=";
-      subPackages = [ "cmd/tokenizer" ];
-      doCheck = false;
+      # "." is the library package, built only so its tests (the patch's
+      # included) run in the check phase; the binary is cmd/tokenizer.
+      subPackages = [ "." "cmd/tokenizer" ];
+      doCheck = true;
       meta.mainProgram = "tokenizer";
     };
 
@@ -31,6 +36,7 @@
     # upstreams (see nix/tokenizer-test.go).
     mkTokenizerTest = pkgs: (mkTokenizer pkgs).overrideAttrs (old: {
       pname = "tokenizer-test";
+      doCheck = false; # tokenizer's own tests already ran in mkTokenizer
       subPackages = [ "cmd/tokenizer-test" ];
       postPatch = ''
         mkdir -p cmd/tokenizer-test
