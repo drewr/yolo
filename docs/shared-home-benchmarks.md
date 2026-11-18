@@ -8,7 +8,7 @@ including uncommitted changes) are shared live across sessions.
 
 | Piece | Where |
 | - | - |
-| JuiceFS volume `agent-home` (1.4.1) | data in S3 `agent-home-007091975061-use2` (us-east-2; private, versioned, SSE, 30-day noncurrent expiry) |
+| JuiceFS volume `agent-home` (1.4.1) | data in S3 `agent-home-ACCOUNT-use2` (us-east-2; private, versioned, SSE, 30-day noncurrent expiry) |
 | Metadata | Redis 8.10 on the EC2 build box (us-east-2), AOF `everysec`, password, loopback only. A **temporary** `systemd-run` unit, not yet in `configuration.nix` |
 | Metadata transport | its own dumbpipe endpoint on the box; sandboxes run `dumbpipe connect-tcp` to `127.0.0.1:6379` with a relay-carrying ticket |
 | Credentials | Datum Secret `agent-home`: `META_TICKET`, `META_URL`, plus an access key for IAM user `agent-home-juicefs` (policy: that bucket only) |
@@ -94,9 +94,9 @@ Staging findings (staging is not a dependency; sessions now target production):
 
 ## Round 3 (2026-10-19): production us-east-1, metadata host in AWS us-east-1
 
-Datum **production** (`api.datum.net`, project `drewr-y4nd1b`), `us-east-1`
+Datum **production** (`api.datum.net`, a project), `us-east-1`
 (IAD). Metadata moved to a permanent NixOS host in AWS us-east-1
-(`meta/ec2/`), and data to bucket `agent-home-007091975061-use1`
+(`meta/ec2/`), and data to bucket `agent-home-ACCOUNT-use1`
 (dual-stack endpoint). The us-east-2 bucket and the build box's ad hoc Redis
 were deleted.
 

@@ -3,9 +3,11 @@
 //! unikernel (default): `datumctl compute build` against the box's BuildKit,
 //! pinned in image/images. general-purpose: a standard linux/amd64 image via
 //! buildctl, pinned in image/images-general-purpose and pushed with your
-//! registry login (~/.docker/config.json). Pins llm-agents and nixpkgs to the
-//! dotfiles' revisions first (sync-pins). The box must be running; its ticket
-//! comes from $BUILDBOX_TICKET or ~/.local/state/agent-sandbox-build
+//! registry login (~/.docker/config.json). Images go to $YOLO_REGISTRY (no
+//! default). With $YOLO_DOTFILES (a flake reference to your dotfiles), the
+//! images carry their zsh config, and llm-agents and nixpkgs are pinned to
+//! their revisions first (sync-pins). The box must be running; its ticket
+//! comes from $YOLO_BUILDBOX_TICKET or ~/.local/state/agent-sandbox-build
 //! (yolo infra buildbox ticket). If BuildKit doesn't answer, the box is
 //! started (it stops itself after 30 idle minutes) and waited for.
 
@@ -145,17 +147,29 @@ pub fn lookupImage(ctx: Ctx, file: []const u8, harness: []const u8) ?[]const u8 
 }
 
 /// Pin image/flake.lock's llm-agents and nixpkgs to the revisions the
-/// dotfiles use (d/.config/home-manager/flake.lock in the locked `dotfiles`
-/// input), so the images carry the same harness versions and nixpkgs as a
-/// laptop with these dotfiles. To follow newer dotfiles: nix flake update
-/// dotfiles --flake image, then build (`syncPins`).
+/// dotfiles in $YOLO_DOTFILES use (d/.config/home-manager/flake.lock), so the
+/// images carry the same harness versions and nixpkgs as a laptop with these
+/// dotfiles. Without YOLO_DOTFILES the lock keeps its pins (`syncPins`).
 pub fn syncPins(ctx: Ctx, root: []const u8) u8 {
     main.needCheckout(root, "yolo sync-pins");
+    const dotfiles_src = ctx.opt("DOTFILES", "");
+    if (dotfiles_src.len == 0) {
+        util.say("sync-pins: skipped; YOLO_DOTFILES isn't set, so image/flake.lock keeps its pins");
+        return 0;
+    }
     const here = util.join(ctx, &.{ root, "image" });
     const nix = [_][]const u8{ "nix", "--extra-experimental-features", "nix-command flakes" };
     var eval: std.ArrayList([]const u8) = .empty;
     eval.appendSlice(ctx.arena, &nix) catch util.die("out of memory");
-    eval.appendSlice(ctx.arena, &.{ "eval", "--raw", std.fmt.allocPrint(ctx.arena, "{s}#lib.dotfiles", .{here}) catch "" }) catch util.die("out of memory");
+    eval.appendSlice(ctx.arena, &.{
+        "eval",
+        "--raw",
+        "--no-write-lock-file",
+        "--override-input",
+        "dotfiles",
+        dotfiles_src,
+        std.fmt.allocPrint(ctx.arena, "{s}#lib.dotfiles", .{here}) catch "",
+    }) catch util.die("out of memory");
     const r = util.capture(ctx, eval.items, .{}) catch util.die("the nix CLI isn't in PATH");
     if (r.term != .exited or r.code != 0) util.dief("sync-pins: {s}", .{util.trim(r.stderr)});
     const dotfiles = util.trim(r.stdout);
@@ -163,8 +177,11 @@ pub fn syncPins(ctx: Ctx, root: []const u8) u8 {
         util.die("sync-pins: can't read the dotfiles' flake.lock");
     const lock_path = util.join(ctx, &.{ here, "flake.lock" });
     const lock = util.readFileMaybe(ctx, lock_path) orelse util.die("sync-pins: can't read image/flake.lock");
-    const want_a = lockedRev(ctx.arena, dot_lock, "llm-agents") orelse "?";
-    const want_n = lockedRev(ctx.arena, dot_lock, "nixpkgs") orelse "?";
+    // Never lock to a missing rev: `github:nixos/nixpkgs/?` locks the latest.
+    const want_a = lockedRev(ctx.arena, dot_lock, "llm-agents") orelse
+        util.dief("sync-pins: no llm-agents in the dotfiles' flake.lock ({s})", .{dotfiles_src});
+    const want_n = lockedRev(ctx.arena, dot_lock, "nixpkgs") orelse
+        util.dief("sync-pins: no nixpkgs in the dotfiles' flake.lock ({s})", .{dotfiles_src});
     const have_a = lockedRev(ctx.arena, lock, "llm-agents") orelse "?";
     const have_n = lockedRev(ctx.arena, lock, "nixpkgs") orelse "?";
     if (mem.eql(u8, want_a, have_a) and mem.eql(u8, want_n, have_n)) {
@@ -197,9 +214,10 @@ pub fn buildDatum(ctx: Ctx, root: []const u8, cls: []const u8, hs: []const []con
         util.dief("unknown class '{s}' (unikernel or general-purpose)", .{cls});
     const images = imagesPath(ctx, root, cls);
     const state = util.join(ctx, &.{ util.stateHome(ctx), "agent-sandbox-build" });
-    const registry = ctx.envNonEmpty("AGENT_IMAGE_REGISTRY") orelse "ghcr.io/drewr";
+    const registry = ctx.optLegacy("REGISTRY", "AGENT_IMAGE_REGISTRY") orelse
+        util.die("set YOLO_REGISTRY to the registry images are pushed to, e.g. ghcr.io/NAME (in the environment or ~/.config/yolo/yolo.conf)");
     const b = infra.boxConfig(ctx, "buildbox");
-    const port = ctx.envNonEmpty("BUILDBOX_PORT") orelse "12340";
+    const port = ctx.optLegacy("BUILDBOX_PORT", "BUILDBOX_PORT") orelse "12340";
     util.createDirPath(ctx, util.join(ctx, &.{ state, "logs" })) catch |e|
         util.dief("can't create {s}: {t}", .{ state, e });
     _ = syncPins(ctx, root);
@@ -260,22 +278,31 @@ fn runBuilds(
             util.dief("can't write {s}: {t}", .{ log_path, e });
         defer log_file.close(ctx.io);
 
-        const code = if (mem.eql(u8, cls, "general-purpose"))
-            util.logged(ctx, log_file, &.{
-                "buildctl",                                                            "--addr",               buildkit,
-                "build",                                                               "--progress",           "plain",
-                "--frontend",                                                          "dockerfile.v0",        "--local",
-                util.join(ctx, &.{ "context=", ctx_dir }),                             "--local",              util.join(ctx, &.{ "dockerfile=", ctx_dir }),
-                "--opt",                                                               "platform=linux/amd64", "--opt",
-                std.fmt.allocPrint(ctx.arena, "build-arg:HARNESS={s}", .{h}) catch "", "--output",             std.fmt.allocPrint(ctx.arena, "type=image,name={s},push=true", .{image}) catch "",
-                "--metadata-file",                                                     meta_path,
-            })
-        else
-            util.logged(ctx, log_file, &.{
-                "datumctl",                                                  "compute", "build", "--analyze", "--push",
-                "--buildkit-host",                                           buildkit,  "-o",    image,       "--build-arg",
-                std.fmt.allocPrint(ctx.arena, "HARNESS={s}", .{h}) catch "", ctx_dir,
-            });
+        const gp = mem.eql(u8, cls, "general-purpose");
+        var argv: std.ArrayList([]const u8) = .empty;
+        if (gp) {
+            argv.appendSlice(ctx.arena, &.{
+                "buildctl",                                "--addr",               buildkit,
+                "build",                                   "--progress",           "plain",
+                "--frontend",                              "dockerfile.v0",        "--local",
+                util.join(ctx, &.{ "context=", ctx_dir }), "--local",              util.join(ctx, &.{ "dockerfile=", ctx_dir }),
+                "--opt",                                   "platform=linux/amd64",
+            }) catch util.die("out of memory");
+            for (buildArgs(ctx, h)) |a| {
+                argv.appendSlice(ctx.arena, &.{ "--opt", std.fmt.allocPrint(ctx.arena, "build-arg:{s}", .{a}) catch "" }) catch util.die("out of memory");
+            }
+            argv.appendSlice(ctx.arena, &.{
+                "--output",        std.fmt.allocPrint(ctx.arena, "type=image,name={s},push=true", .{image}) catch "",
+                "--metadata-file", meta_path,
+            }) catch util.die("out of memory");
+        } else {
+            argv.appendSlice(ctx.arena, &.{
+                "datumctl", "compute", "build", "--analyze", "--push", "--buildkit-host", buildkit, "-o", image,
+            }) catch util.die("out of memory");
+            for (buildArgs(ctx, h)) |a| argv.appendSlice(ctx.arena, &.{ "--build-arg", a }) catch util.die("out of memory");
+            argv.append(ctx.arena, ctx_dir) catch util.die("out of memory");
+        }
+        const code = util.logged(ctx, log_file, argv.items);
 
         const out = util.readFileMaybe(ctx, log_path) orelse "";
         const ref: ?[]const u8 = if (code != 0) null else if (mem.eql(u8, cls, "general-purpose")) blk: {
@@ -296,6 +323,18 @@ fn runBuilds(
         }
     }
     return failures;
+}
+
+/// The Dockerfile's build arguments for HARNESS: HARNESS=h, and DOTFILES=src
+/// when $YOLO_DOTFILES is set (the Dockerfile overrides the flake's dotfiles
+/// input with it).
+pub fn buildArgs(ctx: Ctx, h: []const u8) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    out.append(ctx.arena, std.fmt.allocPrint(ctx.arena, "HARNESS={s}", .{h}) catch util.die("out of memory")) catch util.die("out of memory");
+    const dotfiles = ctx.opt("DOTFILES", "");
+    if (dotfiles.len != 0)
+        out.append(ctx.arena, std.fmt.allocPrint(ctx.arena, "DOTFILES={s}", .{dotfiles}) catch util.die("out of memory")) catch util.die("out of memory");
+    return out.items;
 }
 
 /// The last log line mentioning "error", cut to 200 characters; "" if none
@@ -330,12 +369,12 @@ test "lastDigestRef takes the last pinned reference" {
     const a = arena_state.allocator();
     const out =
         \\
-        \\#4 exporting to image ref=ghcr.io/drewr/agent-claude@sha256:aaaa1111
-        \\#5 exporting to image ref=ghcr.io/drewr/agent-claude@sha256:bbbb2222 done
+        \\#4 exporting to image ref=ghcr.io/example/agent-claude@sha256:aaaa1111
+        \\#5 exporting to image ref=ghcr.io/example/agent-claude@sha256:bbbb2222 done
     ;
     try testing.expectEqualStrings(
-        "ghcr.io/drewr/agent-claude@sha256:bbbb2222",
-        lastDigestRef(a, "ghcr.io/drewr/agent-claude", out).?,
+        "ghcr.io/example/agent-claude@sha256:bbbb2222",
+        lastDigestRef(a, "ghcr.io/example/agent-claude", out).?,
     );
 }
 
@@ -344,7 +383,7 @@ test "lastDigestRef ignores other repos and plain hex" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const out = "ghcr.io/other/agent-claude@sha256:deadbeef\nnothing here\n";
-    try testing.expect(lastDigestRef(a, "ghcr.io/drewr/agent-claude", out) == null);
+    try testing.expect(lastDigestRef(a, "ghcr.io/example/agent-claude", out) == null);
     try testing.expect(lastDigestRef(a, "x", "") == null);
 }
 
@@ -352,19 +391,19 @@ test "pinImage writes a header, then replaces one harness's line" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const first = try pinImageText(a, null, "unikernel", "claude", "ghcr.io/drewr/agent-claude@sha256:aa");
+    const first = try pinImageText(a, null, "unikernel", "claude", "ghcr.io/example/agent-claude@sha256:aa");
     try testing.expectEqualStrings(
         \\# One pinned image per harness for the unikernel class (yolo build HARNESS --backend datum --class unikernel).
-        \\claude    ghcr.io/drewr/agent-claude@sha256:aa
+        \\claude    ghcr.io/example/agent-claude@sha256:aa
         \\
     , first);
 
-    const two = try pinImageText(a, first, "unikernel", "pi", "ghcr.io/drewr/agent-pi@sha256:bb");
-    const three = try pinImageText(a, two, "unikernel", "claude", "ghcr.io/drewr/agent-claude@sha256:cc");
+    const two = try pinImageText(a, first, "unikernel", "pi", "ghcr.io/example/agent-pi@sha256:bb");
+    const three = try pinImageText(a, two, "unikernel", "claude", "ghcr.io/example/agent-claude@sha256:cc");
     try testing.expectEqualStrings(
         \\# One pinned image per harness for the unikernel class (yolo build HARNESS --backend datum --class unikernel).
-        \\pi        ghcr.io/drewr/agent-pi@sha256:bb
-        \\claude    ghcr.io/drewr/agent-claude@sha256:cc
+        \\pi        ghcr.io/example/agent-pi@sha256:bb
+        \\claude    ghcr.io/example/agent-claude@sha256:cc
         \\
     , three);
 }

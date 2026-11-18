@@ -1,11 +1,12 @@
 {
-  # yolo session images: one image per harness from the dotfiles (claude-code,
-  # gemini-cli, codex, opencode, pi), each with the same login environment.
+  # yolo session images: one image per harness (claude-code, gemini-cli, codex,
+  # opencode, pi), each with the same login environment.
   # The datum backend runs the x86_64-linux images on Datum Compute, reached by
   # SSH over iroh; the docker backend runs the host's architecture
   # (x86_64-linux or aarch64-linux). Providers beyond each harness's native
-  # ones come from ./providers via agent-providers. llm-agents and nixpkgs
-  # follow the dotfiles' pins (`yolo sync-pins`, run by `yolo build`).
+  # ones come from ./providers via agent-providers. With YOLO_DOTFILES set,
+  # llm-agents and nixpkgs follow the dotfiles' pins (`yolo sync-pins`, run by
+  # `yolo build`).
   #
   # Every tool ships as its full nix closure at the original /nix/store paths:
   # no patchelf (it can corrupt Bun executables), and wrapBuddy's hardcoded
@@ -17,13 +18,17 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    # Same rev as the dotfiles (`yolo sync-pins`), but on llm-agents' own nixpkgs
-    # rather than following ours as the dotfiles do: the harness versions are
-    # the same, and only these builds are in cache.numtide.com.
+    # Same rev as the dotfiles when there are any (`yolo sync-pins`), but on
+    # llm-agents' own nixpkgs rather than following ours as the dotfiles do: the
+    # harness versions are the same, and only these builds are in
+    # cache.numtide.com.
     llm-agents.url = "github:numtide/llm-agents.nix";
-    # The dotfiles: their zsh config goes into every image, and sync-pins reads
-    # their flake.lock so llm-agents and nixpkgs match a laptop with them.
-    dotfiles = { url = "github:drewr/dotfiles"; flake = false; };
+    # Your dotfiles: their zsh config goes into every image, and sync-pins reads
+    # their flake.lock so llm-agents and nixpkgs match a laptop with them. The
+    # default is this repository, which has no zsh config, so the images get
+    # none; yolo overrides it with $YOLO_DOTFILES (--override-input dotfiles
+    # github:OWNER/dotfiles). Not a relative path: Lix can't fetch those.
+    dotfiles = { url = "github:drewr/yolo"; flake = false; };
   };
 
   outputs = { self, nixpkgs, llm-agents, dotfiles }:
@@ -33,7 +38,8 @@
     systems = [ "x86_64-linux" "aarch64-linux" ];
 
     # The login user (SSH lands here, not root), whose HOME is the shared home.
-    user = { name = "drewr"; uid = 1000; };
+    # A placeholder: init renames it at boot to $YOLO_USER (yolo passes it in).
+    user = { name = "agent"; uid = 1000; };
 
     perSystem = system: let
       pkgs = nixpkgs.legacyPackages.${system};
@@ -85,7 +91,9 @@
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).
       locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" ]; };
-      # The dotfiles' zsh config (zshrc, zshenv, zprofile, zsh.d).
+      # The dotfiles' zsh config (zshrc, zshenv, zprofile, zsh.d), when there
+      # are dotfiles with one.
+      hasZsh = builtins.all (f: builtins.pathExists "${dotfiles}/${f}") [ "zshrc" "zshenv" "zprofile" "zsh.d" ];
       dotfilesZsh = pkgs.runCommand "dotfiles-zsh" { } ''
         mkdir -p $out
         cp ${dotfiles}/zshrc ${dotfiles}/zshenv ${dotfiles}/zprofile $out/
@@ -102,7 +110,7 @@
         experimental-features = nix-command flakes
         build-users-group =
         sandbox = false
-        trusted-users = root ${user.name}
+        trusted-users = root @${user.name}
         flake-registry =
         substituters = https://cache.nixos.org
         trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
@@ -151,7 +159,7 @@
         cp ${nixRegistry} $R/etc/nix/registry.json
         # Static parts of the login environment; init adds the session's.
         echo 'export LOCALE_ARCHIVE=${locales}/lib/locale/locale-archive' > $R/etc/agent/env.static
-        cp -r ${dotfilesZsh} $R/etc/agent/zsh
+        ${pkgs.lib.optionalString hasZsh "cp -r ${dotfilesZsh} $R/etc/agent/zsh"}
         # Claude settings that seed a local (docker backend) home; see init.sh.
         cp -r ${./claude} $R/etc/agent/claude
         # zsh and bash login shells load the session environment (/etc/agent/env).

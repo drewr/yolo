@@ -12,9 +12,11 @@
 //!   connects the container to your current $SSH_AUTH_SOCK
 //!   (YOLO_FORWARD_AGENT=0 turns it off). Podman and colima on macOS can't
 //!   share sockets with the VM (VirtioFS), so there, or whenever
-//!   SSH_PRIVATE_KEY_FILE (a key path) or SSH_PRIVATE_KEY (base64 key) is set,
+//!   YOLO_SSH_PRIVATE_KEY_FILE (a key path) or YOLO_SSH_PRIVATE_KEY (base64 key)
+//!   is set,
 //!   the key is mounted read-only instead and loaded into an agent inside the
-//!   session. It must have no passphrase.
+//!   session. It must have no passphrase. (Without the YOLO_ prefix, the old
+//!   names still work.)
 //! - ~/.ssh/allowed_signers, if present, is copied in for git signature checks.
 
 const std = @import("std");
@@ -132,7 +134,7 @@ pub fn config(ctx: Ctx, runtime: Runtime) Docker {
         .home = ctx.opt("DOCKER_HOME", home_default),
         .providers_env = ctx.opt("PROVIDERS_ENV", util.join(ctx, &.{ config_home, "yolo/providers.env" })),
         .forward_agent = mem.eql(u8, ctx.opt("FORWARD_AGENT", "1"), "1"),
-        .user = ctx.opt("USER", "drewr"),
+        .user = util.loginUser(ctx),
     };
 }
 
@@ -215,13 +217,16 @@ fn readRuntime(ctx: Ctx, dir: []const u8) ?Runtime {
 /// (`dockerBuild`). Dies when the build fails.
 pub fn dockerBuild(ctx: Ctx, root: []const u8, d: Docker, harness: []const u8) void {
     util.errPrint("yolo: building {s}\n", .{image(ctx.arena, harness) catch harness});
-    const code = util.inherit(ctx, &.{
-        d.rt.exe,                            "build",
-        "--build-arg",                       std.fmt.allocPrint(ctx.arena, "HARNESS={s}", .{harness}) catch "",
+    var argv: std.ArrayList([]const u8) = .empty;
+    appendMaybe(&argv, ctx, d.rt.exe);
+    appendMaybe(&argv, ctx, "build");
+    for (@import("images.zig").buildArgs(ctx, harness)) |a| appendSlice(&argv, ctx, &.{ "--build-arg", a });
+    appendSlice(&argv, ctx, &.{
         "-t",                                image(ctx.arena, harness) catch "",
         "-f",                                util.join(ctx, &.{ root, "image/Dockerfile" }),
         util.join(ctx, &.{ root, "image" }),
     });
+    const code = util.inherit(ctx, argv.items);
     if (code != 0) util.dief("docker: could not build {s}", .{image(ctx.arena, harness) catch harness});
 }
 
@@ -280,6 +285,7 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
     // The session exists from here on, so `yolo ls` shows it while the image
     // builds; `state` says what it's doing, until it's ready.
     const dir = session.create(ctx, name, "docker", harness);
+    session.recordUser(ctx, dir, d.user);
     writeRuntime(ctx, dir, runtime);
     util.errPrint("yolo: runtime {s}\n", .{runtime.exe});
     const img = image(ctx.arena, harness) catch "";
@@ -293,8 +299,8 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
 
     // SSH: relay the host agent at attach, or inject a key (see above).
     var key_mount: std.ArrayList([]const u8) = .empty;
-    const key_b64 = ctx.envNonEmpty("SSH_PRIVATE_KEY");
-    const key_file = ctx.envNonEmpty("SSH_PRIVATE_KEY_FILE");
+    const key_b64 = ctx.optLegacy("SSH_PRIVATE_KEY", "SSH_PRIVATE_KEY");
+    const key_file = ctx.optLegacy("SSH_PRIVATE_KEY_FILE", "SSH_PRIVATE_KEY_FILE");
     if (key_b64) |b64| {
         const stripped = blk: {
             var b: std.ArrayList(u8) = .empty;
@@ -302,7 +308,7 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
             break :blk b.items;
         };
         const key = util.b64decode(ctx.arena, stripped) catch
-            util.dief("docker: SSH_PRIVATE_KEY is not valid base64", .{});
+            util.dief("docker: YOLO_SSH_PRIVATE_KEY is not valid base64", .{});
         const key_path = util.join(ctx, &.{ dir, "ssh_key" });
         util.writeFile(ctx, key_path, key, @fromBackingInt(@intCast(0o600))) catch |e|
             util.dief("can't write {s}: {t}", .{ key_path, e });
@@ -312,7 +318,7 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
         const real = util.realPath(ctx, f) orelse util.dief("docker: can't resolve {s}", .{f});
         appendSlice(&key_mount, ctx, &.{ "-v", std.fmt.allocPrint(ctx.arena, "{s}:/run/yolo-key/id:ro", .{real}) catch "" });
     } else if (noSocketRelay(d)) {
-        util.errPrint("yolo: {s} (a VM on macOS) can't relay the SSH agent; set SSH_PRIVATE_KEY_FILE for SSH in the session\n", .{std.fs.path.basename(d.rt.exe)});
+        util.errPrint("yolo: {s} (a VM on macOS) can't relay the SSH agent; set YOLO_SSH_PRIVATE_KEY_FILE for SSH in the session\n", .{std.fs.path.basename(d.rt.exe)});
     }
     if (key_mount.items.len != 0) util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "ssh_key_mode" }), "");
 
@@ -330,7 +336,7 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
     var env: std.ArrayList([]const u8) = .empty;
     const uid = std.fmt.allocPrint(ctx.arena, "HOST_UID={d}", .{util.uid()}) catch "";
     const gid = std.fmt.allocPrint(ctx.arena, "HOST_GID={d}", .{util.gid()}) catch "";
-    appendSlice(&env, ctx, &.{ "-e", "YOLO_MODE=local", "-e", std.fmt.allocPrint(ctx.arena, "SESSION_NAME={s}", .{name}) catch "", "-e", uid, "-e", gid });
+    appendSlice(&env, ctx, &.{ "-e", "YOLO_MODE=local", "-e", std.fmt.allocPrint(ctx.arena, "YOLO_USER={s}", .{d.user}) catch "", "-e", std.fmt.allocPrint(ctx.arena, "SESSION_NAME={s}", .{name}) catch "", "-e", uid, "-e", gid });
     for ([_][]const u8{ "GIT_NAME", "GIT_EMAIL", "GIT_SIGNING_KEY", "GITHUB_TOKEN" }) |v| {
         if (ctx.envNonEmpty(v) != null) appendSlice(&env, ctx, &.{ "-e", v });
     }
@@ -379,8 +385,10 @@ pub fn dockerNew(ctx: Ctx, root: []const u8, runtime: Runtime, d: Docker, name: 
     return 0;
 }
 
-pub fn dockerAttach(ctx: Ctx, d: Docker, name: []const u8, args: []const []const u8) u8 {
+pub fn dockerAttach(ctx: Ctx, d0: Docker, name: []const u8, args: []const []const u8) u8 {
     const dir = session.dir(ctx, name);
+    var d = d0;
+    d.user = session.user(ctx, dir, d0.user);
     const tty = util.terminals(ctx);
     const key_mode = util.fileExists(ctx, util.join(ctx, &.{ dir, "ssh_key_mode" }));
     const host_sock = ctx.envNonEmpty("SSH_AUTH_SOCK");

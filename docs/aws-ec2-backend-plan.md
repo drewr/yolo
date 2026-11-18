@@ -17,7 +17,7 @@ Verified while planning: the general-purpose images in
 `image/images-general-purpose` are amd64 OCI images whose entrypoint is
 `/bin/sh /init` (329 MB compressed); they are **private** — an anonymous pull
 is 403, while the local `~/.docker/config.json` token pulls the manifest
-(`ghcr.io`, user `drewr`). The unikernel image digest is not pullable as an OCI
+(`ghcr.io`, your user). The unikernel image digest is not pullable as an OCI
 image, so the EC2 backend must use the general-purpose file. `session.zig`,
 `keys.zig` and `datum.zig` already build the iroh ticket, pinned host key and
 `known_hosts` line, and `init.sh`'s `datum` mode runs dropbear on loopback plus
@@ -145,7 +145,7 @@ Pure section (all `pub`, unit-tested below):
 ```zig
 pub const containerTag = "yolo-ec2";        // SG + IAM role/instance-profile name
 pub const aml2023_ami = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64";
-pub fn registryOf(ref: []const u8) []const u8      // "ghcr.io" from "ghcr.io/drewr/x@sha256:..", else ""
+pub fn registryOf(ref: []const u8) []const u8      // "ghcr.io" from "ghcr.io/example/x@sha256:..", else ""
 pub fn imageDigest(ref: []const u8) ?[]const u8    // "sha256:.." after '@', else null
 pub const Auth = struct { auth: []const u8, user: []const u8, token: []const u8 };
 pub fn dockerAuth(ctx: Ctx, config_text: []const u8, registry: []const u8) ?Auth
@@ -349,7 +349,7 @@ holds the registry token and session keys). Return `code` (`ResponseCode`,
 **`ec2Attach`**: die `no local state for {name}` without `ticket`; read
 `ticket`, `identity`; `util.replace(ctx, session.sshArgs(ctx, .{ .dir = dir,
 .alias = containerName, .ticket = ticket, .identity = ident, .user =
-ctx.opt("USER", "drewr"), .forward_agent = mem.eql(u8, ctx.opt("FORWARD_AGENT",
+util.loginUser(ctx), .forward_agent = mem.eql(u8, ctx.opt("FORWARD_AGENT",
 "1"), "1"), .args = args }))` — exec, so the exit code is ssh's.
 
 **`ec2Logs`**: read `profile`, `region`, `instance` (die `no local state` /
@@ -410,7 +410,7 @@ README says so; a lifecycle rule is the operator's choice).
   - `shellQuote("a'b")` == `'a'\''b'` and `startScript` contains
     `--name 'yolo-x'`, the `docker login` line only with a token, and the
     `docker run ... --env-file` line;
-  - `registryOf("ghcr.io/drewr/agent-claude@sha256:..")` == `ghcr.io`,
+  - `registryOf("ghcr.io/example/agent-claude@sha256:..")` == `ghcr.io`,
     `registryOf("agent-claude:latest")` == `""`;
   - `imageDigest("ghcr.io/d/r@sha256:abcd")` == `sha256:abcd`, and null without
     `@`; `ecrRegistry("123", "us-east-2")` ==
@@ -475,7 +475,7 @@ Static (from the repo root):
 
 Live (requires a live AWS login with ECR permissions, `docker login ghcr.io`,
 and the flake's `crane`; use a scratch state directory so nothing else is
-touched). Use the repo's sandbox profile `datum-sandbox-admin` (region
+touched). Use your AWS profile (`YOLO_AWS_PROFILE`) (region
 `us-east-2`) for `P`/`R` unless told otherwise:
 
 ```sh
@@ -550,8 +550,8 @@ during verification is `yolo rm`'d afterwards (instances bill until then).
   in step 3): if the copy lands under a different digest, resolve the
   destination tag's digest and use it in the ref; if `crane copy` itself fails,
   nothing is recorded and the session directory is removed before dieing.
-- Live verification uses `datum-sandbox-admin` / `us-east-2` (the repo's
-  sandbox profile) unless the implementer is told otherwise.
+- Live verification uses your AWS profile (`YOLO_AWS_PROFILE`) / `us-east-2`
+  unless the implementer is told otherwise.
 - There is no shared home for ec2 sessions: `HOME` and `/work` live in the
   instance's container and are destroyed by `yolo rm`. Git identity can be set
   once per instance by attaching and running `git config --global`.

@@ -2,9 +2,9 @@
 
 ## Context
 
-yolo (`~/src/drewr/yolo`, `main` at `8ec99da`) is now one ~1750-line Haskell
+yolo (a yolo checkout, `main` at `8ec99da`) is now one ~1750-line Haskell
 file (`yolo`) run by runghc, plus a `flake.nix` that compiles it. The owner's
-other tools are Zig (`~/src/drewr/zigutils`), and yolo should match them: same
+other tools are Zig (the zigutils checkout), and yolo should match them: same
 toolchain, layout idioms and build. The goal is a Zig `yolo` that is a drop-in
 replacement: same commands, flags, environment variables, session files and
 Datum objects, so existing sessions and other machines keep working. The
@@ -48,8 +48,8 @@ Verify every std API against 0.18-dev; many changed after 0.15.
 **Process rules (owner's standing constraints):**
 - Work on a feature branch (`zig-port`), with SSH-signed commits; never push to
   `main` without the owner's say-so.
-- Datum production only (`DATUM_SESSION=aaraines@gmail.com@api.datum.net`,
-  project drewr-y4nd1b).
+- Datum production only (`DATUM_SESSION=someone@example.com@api.datum.net`,
+  a project).
 - Datum images are built on the EC2 build box, never locally. The port doesn't
   touch `image/`, so no image rebuild is expected.
 - Clean up every test session you create. Never touch workloads you didn't

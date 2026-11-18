@@ -4,9 +4,10 @@ Builds Datum Compute images until Datum offers instance types large enough to
 build on-platform (datum-cloud/compute#492). Sizing and cost:
 `docs/datum-build-box-ec2.md`.
 
-- **Box:** NixOS on `t3a.large`, `us-east-2`, profile `datum-sandbox-admin`. The
+- **Box:** NixOS on `t3a.large`, `us-east-2`, AWS profile `YOLO_AWS_PROFILE` (if set). The
   whole config is `configuration.nix`, pinned by `flake.lock`. At first boot the
-  box applies the config itself from `github:drewr/yolo/<rev>?dir=infra/buildbox/ec2`.
+  box applies the config itself from `$YOLO_INFRA_SOURCE/<rev>?dir=infra/buildbox/ec2`
+  (default: `github:OWNER/REPO` from the checkout's `origin` remote).
 - **Access:** no inbound ports. BuildKit listens on `127.0.0.1:1234` and is reached
   only through a dumbpipe (iroh) ticket. Shell access goes through SSM Session Manager.
 - **Idle stop:** after 30 minutes with no client and no build, the box powers
@@ -32,12 +33,12 @@ The ticket works like a password for BuildKit. Store it as a secret.
 `yolo build HARNESS --backend datum [--class general-purpose]` builds the yolo
 images here. It reads the ticket from the box (and saves it) the first time,
 and starts the box if it has stopped itself, so usually you only need a
-current AWS login (`aws sso login --profile datum-sandbox-admin`). For anything else, hold a tunnel to the box's BuildKit open and
+current AWS login (`aws sso login --profile $YOLO_AWS_PROFILE`). For anything else, hold a tunnel to the box's BuildKit open and
 point datumctl (or buildctl) at it:
 
 ```sh
 yolo infra buildbox tunnel           # 127.0.0.1:12340, until ctrl-c
-datumctl compute build --push --buildkit-host tcp://127.0.0.1:12340 -o ghcr.io/drewr/sp3-node:dev sp3
+datumctl compute build --push --buildkit-host tcp://127.0.0.1:12340 -o $YOLO_REGISTRY/sp3-node:dev sp3
 ```
 
 The nix build and the BuildKit solve run on the box. datumctl then packages the
@@ -48,5 +49,5 @@ for sp3) but does no heavy compute.
 
 Change `configuration.nix`, push, and either `yolo infra buildbox terminate`
 then `yolo infra buildbox launch`, or run this in an SSM session:
-`nixos-rebuild switch --flake 'github:drewr/yolo/<rev>?dir=infra/buildbox/ec2#buildbox'`.
+`nixos-rebuild switch --flake '<YOLO_INFRA_SOURCE>/<rev>?dir=infra/buildbox/ec2#buildbox'`.
 A new instance gets a new ticket, because the iroh key lives on the instance's volume.

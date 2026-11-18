@@ -43,11 +43,11 @@ yolo rm work
 
 ## Inside a session
 
-- **You log in as `drewr`** (uid 1000) with zsh and the dotfiles' zsh config
+- **You log in as `YOLO_USER`** (default: your local user; uid 1000) with zsh and, with `YOLO_DOTFILES`, the dotfiles' zsh config
   (prompt included), linked from the image into the home
   (`~/.zshrc -> /etc/agent/zsh/zshrc`, and so on) unless the home already has
   its own. `YOLO_USER=root yolo attach NAME` gets root.
-- **`HOME` is the shared home** (`/home/agent`), owned by `drewr`.
+- **`HOME` is the shared home** (`/home/agent`), owned by the login user.
 - **git over SSH uses your keys:** `yolo attach` forwards your SSH agent
   (`YOLO_FORWARD_AGENT=0` turns it off), and the images ship the
   OpenSSH client and GitHub's host keys (`/etc/ssh/ssh_known_hosts`). While
@@ -70,7 +70,7 @@ variable of the same name (the unikernel class has no `envFrom`). Values never
 pass through the client. Add any keys you use:
 
 ```sh
-DATUM_SESSION=aaraines@gmail.com@api.datum.net datumctl apply -f - <<'EOF'
+DATUM_SESSION=someone@example.com@api.datum.net datumctl apply -f - <<'EOF'
 apiVersion: v1
 kind: Secret
 metadata: { name: agent-providers }

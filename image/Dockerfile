@@ -5,13 +5,16 @@
 # lock.
 FROM docker.io/nixos/nix:2.35.3@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3a6b07282cbc7b AS build
 ARG HARNESS=claude
+# A flake reference that replaces the flake's `dotfiles` input (YOLO_DOTFILES);
+# empty builds without dotfiles.
+ARG DOTFILES=
 COPY . /src
 # cache.numtide.com is llm-agents.nix's binary cache (key from its flake's
 # nixConfig); without it nix compiles codex and gemini-cli from source.
 RUN nix --extra-experimental-features 'nix-command flakes' --option sandbox false \
       --option extra-substituters https://cache.numtide.com \
       --option extra-trusted-public-keys 'niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=' \
-      build --out-link /result "path:/src#${HARNESS}" \
+      build --out-link /result ${DOTFILES:+--override-input dotfiles "$DOTFILES"} "path:/src#${HARNESS}" \
  && cp -a /result/. /rootfs
 
 FROM scratch

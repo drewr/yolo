@@ -89,7 +89,7 @@ pub const usage =
     \\
     \\  yolo new NAME [--backend docker|datum] [--agent HARNESS] [backend options]
     \\                                    create a session and wait until it's ready
-    \\  yolo attach NAME [args...]        shell as drewr, or run a command (alias: ssh)
+    \\  yolo attach NAME [args...]        shell as the session user, or run a command (alias: ssh)
     \\  yolo ls [--full]                  list sessions (--full: whole image references)
     \\  yolo logs NAME [args...]          session logs
     \\  yolo rm NAME                      save workspaces, then delete the session
@@ -109,7 +109,9 @@ pub const usage =
     \\          --no-home                 private, ephemeral HOME, not the shared home
     \\          --class unikernel|general-purpose
     \\                                    runtime class (default $YOLO_CLASS, else unikernel)
-    \\Session state lives in $YOLO_STATE (~/.local/state/yolo/sessions).
+    \\Session state lives in $YOLO_STATE (~/.local/state/yolo/sessions). Settings come
+    \\from the environment, else ~/.config/yolo/yolo.conf (KEY=VALUE lines); see the
+    \\README's Configuration section.
     \\
 ;
 
@@ -127,12 +129,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var env = try std.process.Environ.createMap(init.environ, arena);
     const args = try init.args.toSlice(arena);
-    return run(.{
+    const ctx: Ctx = .{
         .io = io,
         .gpa = arena,
         .arena = arena,
         .env = &env,
-    }, args);
+    };
+    // yolo.conf goes below the environment and above the built-in defaults.
+    util.loadConf(ctx);
+    return run(ctx, args);
 }
 
 pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {

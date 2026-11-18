@@ -3,7 +3,10 @@ let
   port = 6379;
   irohPort = 7842;
   state = "/var/lib/agent-meta";
-  bucket = "agent-home-007091975061-use1";
+  # The S3 bucket of the JuiceFS data, for the metadata backups. Not in this
+  # repository: `yolo infra meta launch` writes it from YOLO_META_BUCKET (user
+  # data), and the backup unit reads it at run time.
+  bucketFile = "${state}/bucket";
   metaUrl = "redis://:$(cat ${state}/redis.pass)@127.0.0.1:${toString port}/1";
 in
 {
@@ -80,9 +83,14 @@ in
     after = [ "redis-juicefs.service" ];
     path = with pkgs; [ juicefs awscli2 gzip coreutils ];
     script = ''
+      if [ ! -s ${bucketFile} ]; then
+        echo "agent-meta-backup: ${bucketFile} is missing or empty; write the S3 bucket name to it (yolo infra meta launch does, from YOLO_META_BUCKET)" >&2
+        exit 1
+      fi
+      bucket=$(cat ${bucketFile})
       ts=$(date -u +%Y%m%dT%H%M%SZ)
       juicefs dump "${metaUrl}" --keep-secret-key 2>/dev/null | gzip \
-        | aws s3 cp - "s3://${bucket}/meta-backup/agent-home-$ts.json.gz" --region us-east-1
+        | aws s3 cp - "s3://$bucket/meta-backup/agent-home-$ts.json.gz" --region us-east-1
     '';
     serviceConfig.Type = "oneshot";
   };

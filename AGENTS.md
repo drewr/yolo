@@ -3,6 +3,17 @@
 yolo runs coding agents in named, isolated sessions on two backends: local
 containers (podman, colima or docker) and Datum Compute. See README.md for usage.
 
+## No hard-coded identity
+
+No code, default, test fixture or image may hard-code information that identifies
+a person: emails, login names, Datum sessions or projects, AWS account IDs or
+profiles, buckets, personal registries or repositories. Identity comes from the
+environment or from `~/.config/yolo/yolo.conf` (see README.md, Configuration;
+`util.loadConf`), and tests use placeholders such as `example` and `someone`.
+Links to where the source lives (the README's install line, `github:drewr/yolo`
+comments, the `zigutils` input) are fine; the pin files `image/images*` and the
+lock files are the exception for now.
+
 ## Commit Conventions
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0-beta.2/):

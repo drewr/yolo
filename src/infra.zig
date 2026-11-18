@@ -2,9 +2,14 @@
 //! (infra/buildbox/ec2) and the JuiceFS metadata host for the shared home
 //! (infra/meta/ec2). Idempotent for the security group and IAM role; `launch`
 //! starts a new instance each time, so check `status` first. REV must be
-//! pushed: the box fetches github:drewr/yolo/REV?dir=CONFIG#ATTR. Uses the aws
-//! CLI from PATH with $AWS_PROFILE (default datum-sandbox-admin); TYPE,
-//! DISK_GB and IPV6=1 override a box's defaults.
+//! pushed: the box fetches SOURCE/REV?dir=CONFIG#ATTR, where SOURCE is
+//! $YOLO_INFRA_SOURCE (a flake reference such as github:OWNER/REPO), else
+//! derived from this checkout's origin remote. Uses the aws CLI from PATH, with
+//! --profile $YOLO_AWS_PROFILE when that is set (else the CLI's own lookup,
+//! which honors $AWS_PROFILE); YOLO_INFRA_TYPE, YOLO_INFRA_DISK_GB and
+//! YOLO_INFRA_IPV6=1 override a box's defaults (the old TYPE, DISK_GB and IPV6
+//! still work). The meta box needs $YOLO_META_BUCKET, the S3 bucket of its
+//! metadata backups; user data writes it to the box.
 
 const std = @import("std");
 const mem = std.mem;
@@ -72,10 +77,13 @@ pub const Box = struct {
     ticket_file: []const u8,
     /// Public IPv6 (sets up the VPC once).
     ipv6: bool,
-    profile: []const u8,
+    /// The AWS CLI profile; none means the CLI's own lookup.
+    profile: ?[]const u8,
+    /// The S3 bucket the box writes to (the meta box's backups).
+    bucket: ?[]const u8,
 };
 
-/// A box's defaults, before $TYPE/$DISK_GB/$IPV6 (`boxConfig`).
+/// A box's defaults, before the environment's overrides (`boxConfig`).
 pub fn boxDefaults(which: []const u8) Box {
     if (mem.eql(u8, which, "buildbox")) {
         // 8 GB: the bigger harness images wedged a 4 GB box. The agent image is
@@ -89,7 +97,8 @@ pub fn boxDefaults(which: []const u8) Box {
             .attr = "buildbox",
             .ticket_file = "/var/lib/dumbpipe/ticket",
             .ipv6 = false,
-            .profile = "datum-sandbox-admin",
+            .profile = null,
+            .bucket = null,
         };
     }
     if (mem.eql(u8, which, "meta")) {
@@ -104,30 +113,91 @@ pub fn boxDefaults(which: []const u8) Box {
             .attr = "agentmeta",
             .ticket_file = "/var/lib/agent-meta/ticket",
             .ipv6 = true,
-            .profile = "datum-sandbox-admin",
+            .profile = null,
+            .bucket = null,
         };
     }
     util.dief("unknown box '{s}' (buildbox or meta)", .{which});
 }
 
-/// The user-data script a launch gives the instance: apply the box's config,
-/// pinned to `rev`, on every boot.
-pub fn userData(allocator: mem.Allocator, b: Box, rev: []const u8) ![]u8 {
+/// Where the meta box keeps the bucket name its backup unit reads
+/// (infra/meta/ec2/configuration.nix).
+pub const meta_bucket_file = "/var/lib/agent-meta/bucket";
+
+/// The user-data script a launch gives the instance: write the box's bucket
+/// (when it has one), then apply its config from `source`, pinned to `rev`, on
+/// every boot.
+pub fn userData(allocator: mem.Allocator, b: Box, source: []const u8, rev: []const u8) ![]u8 {
+    const bucket_step = if (b.bucket) |bucket|
+        try std.fmt.allocPrint(allocator,
+            \\install -d -m 0700 {s}
+            \\printf '%s\n' '{s}' > {s}
+            \\
+        , .{ std.fs.path.dirname(meta_bucket_file).?, bucket, meta_bucket_file })
+    else
+        "";
     return std.fmt.allocPrint(allocator,
         \\#!/bin/sh
         \\# Apply the {s} config pinned to {s}. Re-runs on every boot as a no-op.
-        \\nixos-rebuild switch --option experimental-features 'nix-command flakes' \
-        \\  --flake 'github:drewr/yolo/{s}?dir={s}#{s}'
+        \\{s}nixos-rebuild switch --option experimental-features 'nix-command flakes' \
+        \\  --flake '{s}/{s}?dir={s}#{s}'
         \\
-    , .{ b.attr, rev, rev, b.config_dir, b.attr });
+    , .{ b.attr, rev, bucket_step, source, rev, b.config_dir, b.attr });
 }
 
-/// argv for the aws CLI, with the box's profile and region.
+/// An S3 bucket name: 3-63 lowercase letters, digits, dots and hyphens, starting
+/// and ending with a letter or digit. Also safe to put in a shell script.
+pub fn validBucket(name: []const u8) bool {
+    if (name.len < 3 or name.len > 63) return false;
+    const edge = struct {
+        fn ok(c: u8) bool {
+            return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9');
+        }
+    }.ok;
+    if (!edge(name[0]) or !edge(name[name.len - 1])) return false;
+    for (name) |c| {
+        if (!edge(c) and c != '.' and c != '-') return false;
+    }
+    return true;
+}
+
+/// The flake source for a GitHub remote URL: `github:OWNER/REPO` from
+/// `git@github.com:OWNER/REPO(.git)`, `ssh://git@github.com/OWNER/REPO(.git)`
+/// or `https://github.com/OWNER/REPO(.git)`.
+pub fn sourceFromRemote(allocator: mem.Allocator, url0: []const u8) !?[]const u8 {
+    var url = mem.trimEnd(u8, trimWs(url0), "/");
+    if (mem.endsWith(u8, url, ".git")) url = url[0 .. url.len - 4];
+    const prefixes = [_][]const u8{ "git@github.com:", "ssh://git@github.com/", "https://github.com/", "http://github.com/", "git://github.com/" };
+    for (prefixes) |p| {
+        if (!mem.startsWith(u8, url, p)) continue;
+        const path = url[p.len..];
+        const slash = mem.indexOfScalar(u8, path, '/') orelse return null;
+        const owner = path[0..slash];
+        const repo = path[slash + 1 ..];
+        if (owner.len == 0 or repo.len == 0 or mem.indexOfScalar(u8, repo, '/') != null) return null;
+        return try std.fmt.allocPrint(allocator, "github:{s}/{s}", .{ owner, repo });
+    }
+    return null;
+}
+
+fn trimWs(s: []const u8) []const u8 {
+    return mem.trim(u8, s, " \t\r\n");
+}
+
+/// argv for the aws CLI, with the box's profile (when it has one) and region.
 pub fn awsArgs(allocator: mem.Allocator, b: Box, args: []const []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    try out.appendSlice(allocator, &.{ "aws", "--profile", b.profile, "--region", b.region });
+    try out.append(allocator, "aws");
+    if (b.profile) |p| try out.appendSlice(allocator, &.{ "--profile", p });
+    try out.appendSlice(allocator, &.{ "--region", b.region });
     try out.appendSlice(allocator, args);
     return out.items;
+}
+
+/// What to tell someone whose AWS login has expired.
+pub fn loginHint(allocator: mem.Allocator, profile: ?[]const u8) ![]const u8 {
+    if (profile) |p| return std.fmt.allocPrint(allocator, "AWS login needed for profile {s}: aws sso login --profile {s}", .{ p, p });
+    return allocator.dupe(u8, "AWS login needed: aws sso login (YOLO_AWS_PROFILE or AWS_PROFILE picks the profile)");
 }
 
 pub const SsoExpired = enum {
@@ -151,10 +221,13 @@ pub const SsoExpired = enum {
 /// A box's settings with the environment's overrides (`boxConfig`).
 pub fn boxConfig(ctx: Ctx, which: []const u8) Box {
     var b = boxDefaults(which);
-    if (ctx.envNonEmpty("TYPE")) |t| b.instance_type = t;
-    if (ctx.envNonEmpty("DISK_GB")) |d| b.disk_gb = d;
-    if (ctx.envNonEmpty("IPV6")) |v6| b.ipv6 = mem.eql(u8, v6, "1");
-    if (ctx.envNonEmpty("AWS_PROFILE")) |p| b.profile = p;
+    if (ctx.optLegacy("INFRA_TYPE", "TYPE")) |t| b.instance_type = t;
+    if (ctx.optLegacy("INFRA_DISK_GB", "DISK_GB")) |d| b.disk_gb = d;
+    if (ctx.optLegacy("INFRA_IPV6", "IPV6")) |v6| b.ipv6 = mem.eql(u8, v6, "1");
+    const profile = ctx.opt("AWS_PROFILE", "");
+    if (profile.len != 0) b.profile = profile;
+    const bucket = ctx.opt("META_BUCKET", "");
+    if (mem.eql(u8, b.attr, "agentmeta") and bucket.len != 0) b.bucket = bucket;
     return b;
 }
 
@@ -165,7 +238,7 @@ fn aws(ctx: Ctx, b: Box, args: []const []const u8) []const u8 {
     const r = util.capture(ctx, argv, .{}) catch util.die("the aws CLI isn't in PATH");
     if (r.term != .exited or r.code != 0) {
         if (SsoExpired.detect(r.stderr) == .yes)
-            util.dief("AWS login needed for profile {s}: aws sso login --profile {s}", .{ b.profile, b.profile });
+            util.die(loginHint(ctx.arena, b.profile) catch "AWS login needed: aws sso login");
         util.dief("aws {s} {s}: {s}", .{ args[0], if (args.len > 1) args[1] else "", util.trim(r.stderr) });
     }
     return util.trim(r.stdout);
@@ -199,7 +272,7 @@ pub fn cmd(ctx: Ctx, root: []const u8, args: []const []const u8) u8 {
         return 0;
     }
     if (c.len <= 2 and mem.eql(u8, c[0], "tunnel") and mem.eql(u8, args[0], "buildbox")) {
-        const port = if (c.len == 2) c[1] else "12340";
+        const port = if (c.len == 2) c[1] else (ctx.optLegacy("BUILDBOX_PORT", "BUILDBOX_PORT") orelse "12340");
         const tk = buildboxTicket(ctx, b);
         util.errPrint("BuildKit at tcp://127.0.0.1:{s} (ctrl-c to close)\n", .{port});
         const connect = std.fmt.allocPrint(ctx.arena, "127.0.0.1:{s}", .{port}) catch "";
@@ -332,11 +405,11 @@ fn saveTicket(ctx: Ctx, t: []const u8) void {
         util.dief("can't save the build box ticket: {t}", .{e});
 }
 
-/// The build box's ticket: $BUILDBOX_TICKET, else the saved one, else read
+/// The build box's ticket: $YOLO_BUILDBOX_TICKET, else the saved one, else read
 /// from the box (starting it if needed) and saved for next time
 /// (`buildboxTicket`).
 pub fn buildboxTicket(ctx: Ctx, b: Box) []const u8 {
-    if (ctx.envNonEmpty("BUILDBOX_TICKET")) |t| return t;
+    if (ctx.optLegacy("BUILDBOX_TICKET", "BUILDBOX_TICKET")) |t| return t;
     if (util.readFileMaybe(ctx, ticketFile(ctx))) |saved| {
         const t = util.trim(saved);
         if (t.len != 0) return t;
@@ -377,14 +450,14 @@ pub fn buildboxTickets(ctx: Ctx, b: Box) struct { first: []const u8, then: ?[]co
 }
 
 /// Read the box's ticket again after BuildKit didn't answer, saving it when
-/// the box was replaced; dies when nothing changed or $BUILDBOX_TICKET is
+/// the box was replaced; dies when nothing changed or $YOLO_BUILDBOX_TICKET is
 /// stale (`withBuildkit`).
 pub fn refreshTicket(ctx: Ctx, b: Box, old: []const u8) []const u8 {
     const fresh = freshTicket(ctx, b);
     if (mem.eql(u8, fresh, old))
         util.die("BuildKit on the build box isn't answering (yolo infra buildbox status)");
-    if (ctx.envNonEmpty("BUILDBOX_TICKET") != null)
-        util.dief("$BUILDBOX_TICKET is stale; the box's ticket is now {s}", .{fresh});
+    if (ctx.optLegacy("BUILDBOX_TICKET", "BUILDBOX_TICKET") != null)
+        util.dief("$YOLO_BUILDBOX_TICKET is stale; the box's ticket is now {s}", .{fresh});
     util.errPrint("yolo: the build box has a new ticket (it was replaced); saved it\n", .{});
     saveTicket(ctx, fresh);
     return fresh;
@@ -420,6 +493,12 @@ fn buildkitUp(ctx: Ctx, addr: []const u8) bool {
 
 fn launchBox(ctx: Ctx, root: []const u8, b: Box, mrev: ?[]const u8) u8 {
     main.needCheckout(root, "yolo infra launch");
+    if (mem.eql(u8, b.attr, "agentmeta")) {
+        const bucket = b.bucket orelse
+            util.die("set YOLO_META_BUCKET to the S3 bucket for the metadata backups (in the environment or ~/.config/yolo/yolo.conf)");
+        if (!validBucket(bucket)) util.dief("YOLO_META_BUCKET '{s}' isn't an S3 bucket name", .{bucket});
+    }
+    const source = infraSource(ctx, root);
     const rev = mrev orelse git(ctx, root, &.{ "rev-parse", "HEAD" });
     const pushed = git(ctx, root, &.{ "branch", "-r", "--contains", rev });
     if (pushed.len == 0)
@@ -451,7 +530,7 @@ fn launchBox(ctx: Ctx, root: []const u8, b: Box, mrev: ?[]const u8) u8 {
     const root_dev = words.next() orelse util.dief("unexpected AMI lookup result: {s}", .{ami_out});
     util.sayf("ami={s} ({s}) rev={s} sg={s}", .{ ami, ami_name, rev, sg });
 
-    const user_data = userData(ctx.arena, b, rev) catch util.die("out of memory");
+    const user_data = userData(ctx.arena, b, source, rev) catch util.die("out of memory");
     const tmp = ctx.envNonEmpty("TMPDIR") orelse "/tmp";
     const ud_path = util.join(ctx, &.{ tmp, std.fmt.allocPrint(ctx.arena, "yolo-user-data-{d}", .{std.os.linux.getpid()}) catch "yolo-user-data" });
     util.writeFileOrDie(ctx, ud_path, user_data);
@@ -490,6 +569,19 @@ fn launchBox(ctx: Ctx, root: []const u8, b: Box, mrev: ?[]const u8) u8 {
         util.errPrint("yolo: the new {s} has a new ticket (yolo infra meta ticket, after ~5 min); update META_TICKET in the agent-home Secret before starting sessions\n", .{b.name});
     }
     return 0;
+}
+
+/// The flake source the box fetches its config from: $YOLO_INFRA_SOURCE, else
+/// github:OWNER/REPO from this checkout's origin remote.
+fn infraSource(ctx: Ctx, root: []const u8) []const u8 {
+    const source = ctx.opt("INFRA_SOURCE", "");
+    if (source.len != 0) {
+        if (mem.indexOfAny(u8, source, "' \t\r\n") != null) util.die("YOLO_INFRA_SOURCE must be a flake reference without spaces or quotes");
+        return source;
+    }
+    const origin = git(ctx, root, &.{ "remote", "get-url", "origin" });
+    const derived = sourceFromRemote(ctx.arena, origin) catch util.die("out of memory");
+    return derived orelse util.die("can't tell which flake the box should fetch its config from: set YOLO_INFRA_SOURCE (such as github:OWNER/REPO) in the environment or yolo.conf");
 }
 
 fn git(ctx: Ctx, root: []const u8, a: []const []const u8) []const u8 {
@@ -625,8 +717,77 @@ test "user-data pins the config to the rev" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const ud = try userData(a, boxDefaults("meta"), "abc1234");
-    try std.testing.expect(std.mem.indexOf(u8, ud, "github:drewr/yolo/abc1234?dir=infra/meta/ec2#agentmeta") != null);
+    const ud = try userData(a, boxDefaults("buildbox"), "github:example/yolo", "abc1234");
+    try std.testing.expect(std.mem.indexOf(u8, ud, "--flake 'github:example/yolo/abc1234?dir=infra/buildbox/ec2#buildbox'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ud, "bucket") == null);
+}
+
+test "user-data for the meta box writes its bucket first" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b = boxDefaults("meta");
+    b.bucket = "example-bucket";
+    const ud = try userData(a, b, "github:example/yolo", "abc1234");
+    try std.testing.expectEqualStrings(
+        \\#!/bin/sh
+        \\# Apply the agentmeta config pinned to abc1234. Re-runs on every boot as a no-op.
+        \\install -d -m 0700 /var/lib/agent-meta
+        \\printf '%s\n' 'example-bucket' > /var/lib/agent-meta/bucket
+        \\nixos-rebuild switch --option experimental-features 'nix-command flakes' \
+        \\  --flake 'github:example/yolo/abc1234?dir=infra/meta/ec2#agentmeta'
+        \\
+    , ud);
+}
+
+test "bucket names" {
+    try std.testing.expect(validBucket("example-bucket"));
+    try std.testing.expect(validBucket("a.b-c1"));
+    try std.testing.expect(!validBucket("ab"));
+    try std.testing.expect(!validBucket("-abc"));
+    try std.testing.expect(!validBucket("Abc"));
+    try std.testing.expect(!validBucket("a'b"));
+    try std.testing.expect(!validBucket("a b c"));
+}
+
+test "source from a GitHub remote" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{
+        "git@github.com:example/yolo.git",
+        "git@github.com:example/yolo",
+        "https://github.com/example/yolo.git\n",
+        "https://github.com/example/yolo/",
+        "ssh://git@github.com/example/yolo.git",
+    }) |url| {
+        try std.testing.expectEqualStrings("github:example/yolo", (try sourceFromRemote(a, url)).?);
+    }
+    for ([_][]const u8{ "", "git@gitlab.com:example/yolo.git", "/home/u/src/yolo", "https://github.com/example", "https://github.com/example/yolo/extra" }) |url| {
+        try std.testing.expect((try sourceFromRemote(a, url)) == null);
+    }
+}
+
+test "aws args have a profile only when one is set" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var b = boxDefaults("buildbox");
+    const plain = try awsArgs(a, b, &.{ "ec2", "describe-instances" });
+    try std.testing.expectEqual(@as(usize, 5), plain.len);
+    try std.testing.expectEqualStrings("--region", plain[1]);
+    b.profile = "example";
+    const with = try awsArgs(a, b, &.{"sts"});
+    try std.testing.expectEqualStrings("--profile", with[1]);
+    try std.testing.expectEqualStrings("example", with[2]);
+}
+
+test "login hint names a profile only when there is one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings("AWS login needed for profile p: aws sso login --profile p", try loginHint(a, "p"));
+    try std.testing.expect(std.mem.indexOf(u8, try loginHint(a, null), "--profile") == null);
 }
 
 test "sso expiry is recognised" {

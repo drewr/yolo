@@ -111,7 +111,7 @@ pub fn ageSeconds(allocator: mem.Allocator, seconds: i64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{d}d", .{@divTrunc(seconds, 86400)});
 }
 
-/// `ghcr.io/drewr/agent-claude@sha256:a415dd44...` -> `agent-claude@a415dd44231b`.
+/// `ghcr.io/example/agent-claude@sha256:a415dd44...` -> `agent-claude@a415dd44231b`.
 pub fn shortImage(allocator: mem.Allocator, ref: []const u8) ![]const u8 {
     const at = mem.indexOfScalar(u8, ref, '@');
     const name = ref[0 .. at orelse ref.len];
@@ -134,6 +134,114 @@ pub fn optFrom(env: *const std.process.Environ.Map, name: []const u8, default: [
     const old = std.fmt.bufPrint(&b, "AGENT_SANDBOX_{s}", .{name}) catch return default;
     if (envNonEmptyFrom(env, old)) |v| return v;
     return default;
+}
+
+/// `opt` with an older, unprefixed name still honored: $YOLO_NAME, else
+/// $AGENT_SANDBOX_NAME, else $LEGACY; `null` when none is set.
+pub fn optLegacyFrom(env: *const std.process.Environ.Map, name: []const u8, legacy: []const u8) ?[]const u8 {
+    const v = optFrom(env, name, "");
+    if (v.len != 0) return v;
+    return envNonEmptyFrom(env, legacy);
+}
+
+/// The login user inside sessions: $YOLO_USER, else the local $USER (or
+/// $LOGNAME); `null` when none is set.
+pub fn loginUserFrom(env: *const std.process.Environ.Map) ?[]const u8 {
+    const v = optFrom(env, "USER", "");
+    if (v.len != 0) return v;
+    return firstEnvFrom(env, &.{ "USER", "LOGNAME" });
+}
+
+/// One `KEY=VALUE` setting from yolo.conf; both are views into the line, unless
+/// `expandHome` made a new value.
+pub const ConfEntry = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// What one line of yolo.conf is.
+pub const ConfLine = union(enum) {
+    /// Blank, or a comment.
+    skip,
+    entry: ConfEntry,
+    malformed,
+};
+
+/// Parse one line of yolo.conf. `KEY=VALUE`, KEY a valid variable name; blank
+/// lines and lines starting with `#` are skipped; whitespace around KEY and
+/// VALUE is trimmed; an unquoted VALUE ends at a `#` that follows whitespace; a
+/// VALUE in single or double quotes is taken as is (no comment inside the
+/// quotes, and only whitespace or a comment after them).
+pub fn parseConfLine(line: []const u8) ConfLine {
+    const t = trim(line);
+    if (t.len == 0 or t[0] == '#') return .skip;
+    const eq = mem.indexOfScalar(u8, t, '=') orelse return .malformed;
+    const key = trim(t[0..eq]);
+    if (!isVarName(key)) return .malformed;
+    const rest = trim(t[eq + 1 ..]);
+    if (rest.len != 0 and (rest[0] == '"' or rest[0] == '\'')) {
+        const close = mem.indexOfScalarPos(u8, rest, 1, rest[0]) orelse return .malformed;
+        const after = rest[close + 1 ..];
+        if (!isBlank(after) and !isConfComment(after)) return .malformed;
+        return .{ .entry = .{ .key = key, .value = rest[1..close] } };
+    }
+    const raw = t[eq + 1 ..];
+    var end = raw.len;
+    for (raw, 0..) |c, i| {
+        if (c == '#' and i > 0 and std.ascii.isWhitespace(raw[i - 1])) {
+            end = i;
+            break;
+        }
+    }
+    return .{ .entry = .{ .key = key, .value = trim(raw[0..end]) } };
+}
+
+/// Whitespace, then `#` and anything.
+fn isConfComment(s: []const u8) bool {
+    const t = trim(s);
+    return t.len != 0 and t[0] == '#' and s.len != t.len;
+}
+
+/// A leading `~/` in `value` is `home`'s; anything else comes back as is, and so
+/// does `~/` without a home to expand it to.
+pub fn expandHome(allocator: mem.Allocator, value: []const u8, home: ?[]const u8) ![]const u8 {
+    const h = home orelse return value;
+    if (!mem.startsWith(u8, value, "~/")) return value;
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ mem.trimEnd(u8, h, "/"), value[2..] });
+}
+
+/// All the settings in a yolo.conf, `~/` expanded, and the numbers (from 1) of
+/// the lines that aren't settings, comments or blank.
+pub const Conf = struct {
+    entries: []const ConfEntry,
+    bad_lines: []const usize,
+};
+
+pub fn parseConf(allocator: mem.Allocator, text: []const u8, home: ?[]const u8) !Conf {
+    var entries: std.ArrayList(ConfEntry) = .empty;
+    var bad: std.ArrayList(usize) = .empty;
+    var n: usize = 0;
+    var it = mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        n += 1;
+        switch (parseConfLine(line)) {
+            .skip => {},
+            .malformed => try bad.append(allocator, n),
+            .entry => |e| try entries.append(allocator, .{
+                .key = e.key,
+                .value = try expandHome(allocator, e.value, home),
+            }),
+        }
+    }
+    return .{ .entries = entries.items, .bad_lines = bad.items };
+}
+
+/// Put each setting into `env` unless it is already there: the environment
+/// wins over yolo.conf (a variable set to the empty string counts as set).
+pub fn applyConf(env: *std.process.Environ.Map, entries: []const ConfEntry) !void {
+    for (entries) |e| {
+        if (env.get(e.key) == null) try env.put(e.key, e.value);
+    }
 }
 
 /// `firstEnv`: the first set, non-empty variable of `keys`.
@@ -167,6 +275,10 @@ pub const Ctx = struct {
 
     pub fn opt(self: Ctx, name: []const u8, default: []const u8) []const u8 {
         return optFrom(self.env, name, default);
+    }
+
+    pub fn optLegacy(self: Ctx, name: []const u8, legacy: []const u8) ?[]const u8 {
+        return optLegacyFrom(self.env, name, legacy);
     }
 
     pub fn firstEnv(self: Ctx, keys: []const []const u8) ?[]const u8 {
@@ -357,6 +469,32 @@ pub fn terminals(ctx: Ctx) bool {
     const in = std.Io.File.stdin().isTty(ctx.io) catch false;
     const out_tty = std.Io.File.stdout().isTty(ctx.io) catch false;
     return in and out_tty;
+}
+
+/// $XDG_CONFIG_HOME/yolo/yolo.conf, else ~/.config/yolo/yolo.conf; `null` when
+/// there is neither a config home nor a HOME.
+pub fn confPath(ctx: Ctx) ?[]const u8 {
+    if (ctx.envNonEmpty("XDG_CONFIG_HOME")) |x| return join(ctx, &.{ x, "yolo/yolo.conf" });
+    const home = ctx.envNonEmpty("HOME") orelse return null;
+    return join(ctx, &.{ home, ".config/yolo/yolo.conf" });
+}
+
+/// Read yolo.conf into the environment, so the file is the layer below real
+/// environment variables and above the built-in defaults. A missing file is
+/// fine; a malformed line is reported and skipped.
+pub fn loadConf(ctx: Ctx) void {
+    const path = confPath(ctx) orelse return;
+    const text = readFileMaybe(ctx, path) orelse return;
+    const conf = parseConf(ctx.arena, text, ctx.envNonEmpty("HOME")) catch die("out of memory");
+    for (conf.bad_lines) |n| warn("{s}:{d}: not KEY=VALUE, skipped", .{ path, n });
+    applyConf(ctx.env, conf.entries) catch die("out of memory");
+}
+
+/// The login user inside sessions (`YOLO_USER`, default the local user), or
+/// die.
+pub fn loginUser(ctx: Ctx) []const u8 {
+    return loginUserFrom(ctx.env) orelse
+        die("can't tell which login user to use: set YOLO_USER (in the environment or yolo.conf)");
 }
 
 pub fn homeDir(ctx: Ctx) []const u8 {
@@ -769,4 +907,130 @@ pub fn setEnv(key: []const u8, value: []const u8) void {
     kb[key.len] = 0;
     std.mem.copyForwards(u8, vb[0..value.len], value);
     vb[value.len] = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn expectEntry(line: []const u8, key: []const u8, value: []const u8) !void {
+    switch (parseConfLine(line)) {
+        .entry => |e| {
+            try testing.expectEqualStrings(key, e.key);
+            try testing.expectEqualStrings(value, e.value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "conf: blank lines and comments are skipped" {
+    try testing.expect(parseConfLine("") == .skip);
+    try testing.expect(parseConfLine("   \t") == .skip);
+    try testing.expect(parseConfLine("# YOLO_A=1") == .skip);
+    try testing.expect(parseConfLine("  #YOLO_A=1") == .skip);
+}
+
+test "conf: whitespace around key and value is trimmed" {
+    try expectEntry("YOLO_A=1", "YOLO_A", "1");
+    try expectEntry("  YOLO_A \t=  some value  ", "YOLO_A", "some value");
+    try expectEntry("YOLO_A=", "YOLO_A", "");
+    try expectEntry("YOLO_A=a=b", "YOLO_A", "a=b");
+}
+
+test "conf: an inline comment needs whitespace before the #" {
+    try expectEntry("YOLO_A=x   # why", "YOLO_A", "x");
+    try expectEntry("YOLO_A=x\t#why", "YOLO_A", "x");
+    try expectEntry("YOLO_A=#frag", "YOLO_A", "#frag");
+    try expectEntry("YOLO_A=ghcr.io/x#y", "YOLO_A", "ghcr.io/x#y");
+    try expectEntry("YOLO_A=   # nothing", "YOLO_A", "");
+}
+
+test "conf: quoted values are taken as is" {
+    try expectEntry("YOLO_A=\"a b\"", "YOLO_A", "a b");
+    try expectEntry("YOLO_A='a # b'", "YOLO_A", "a # b");
+    try expectEntry("YOLO_A=\" padded \"  # note", "YOLO_A", " padded ");
+    try expectEntry("YOLO_A=\"it's\"", "YOLO_A", "it's");
+    try expectEntry("YOLO_A=\"\"", "YOLO_A", "");
+}
+
+test "conf: malformed lines" {
+    try testing.expect(parseConfLine("just words") == .malformed);
+    try testing.expect(parseConfLine("=value") == .malformed);
+    try testing.expect(parseConfLine("1A=x") == .malformed);
+    try testing.expect(parseConfLine("A-B=x") == .malformed);
+    try testing.expect(parseConfLine("A B=x") == .malformed);
+    try testing.expect(parseConfLine("YOLO_A=\"open") == .malformed);
+    try testing.expect(parseConfLine("YOLO_A=\"a\"b") == .malformed);
+}
+
+test "conf: a leading ~/ is the home directory" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("/h/x/y", try expandHome(a, "~/x/y", "/h"));
+    try testing.expectEqualStrings("/h/x", try expandHome(a, "~/x", "/h/"));
+    try testing.expectEqualStrings("a/~/b", try expandHome(a, "a/~/b", "/h"));
+    try testing.expectEqualStrings("~x", try expandHome(a, "~x", "/h"));
+    try testing.expectEqualStrings("~/x", try expandHome(a, "~/x", null));
+}
+
+test "conf: parseConf collects settings and numbers the bad lines" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const text =
+        \\# yolo configuration
+        \\YOLO_STATE=~/state   # here
+        \\
+        \\oops
+        \\YOLO_BACKEND='datum'
+        \\9X=1
+    ;
+    const conf = try parseConf(a, text, "/home/u");
+    try testing.expectEqual(@as(usize, 2), conf.entries.len);
+    try testing.expectEqualStrings("YOLO_STATE", conf.entries[0].key);
+    try testing.expectEqualStrings("/home/u/state", conf.entries[0].value);
+    try testing.expectEqualStrings("datum", conf.entries[1].value);
+    try testing.expectEqualSlices(usize, &.{ 4, 6 }, conf.bad_lines);
+}
+
+test "conf: the environment wins over yolo.conf" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("YOLO_A", "from env");
+    try env.put("YOLO_EMPTY", "");
+    try applyConf(&env, &.{
+        .{ .key = "YOLO_A", .value = "from conf" },
+        .{ .key = "YOLO_B", .value = "from conf" },
+        .{ .key = "YOLO_EMPTY", .value = "from conf" },
+    });
+    try testing.expectEqualStrings("from env", env.get("YOLO_A").?);
+    try testing.expectEqualStrings("from conf", env.get("YOLO_B").?);
+    try testing.expectEqualStrings("", env.get("YOLO_EMPTY").?);
+}
+
+test "optLegacy: prefixed names win, then the old unprefixed one" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(optLegacyFrom(&env, "BUILDBOX_PORT", "BUILDBOX_PORT") == null);
+    try env.put("BUILDBOX_PORT", "1");
+    try testing.expectEqualStrings("1", optLegacyFrom(&env, "BUILDBOX_PORT", "BUILDBOX_PORT").?);
+    try env.put("AGENT_SANDBOX_BUILDBOX_PORT", "2");
+    try testing.expectEqualStrings("2", optLegacyFrom(&env, "BUILDBOX_PORT", "BUILDBOX_PORT").?);
+    try env.put("YOLO_BUILDBOX_PORT", "3");
+    try testing.expectEqualStrings("3", optLegacyFrom(&env, "BUILDBOX_PORT", "BUILDBOX_PORT").?);
+}
+
+test "loginUser: YOLO_USER, else the local user" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try testing.expect(loginUserFrom(&env) == null);
+    try env.put("LOGNAME", "ln");
+    try testing.expectEqualStrings("ln", loginUserFrom(&env).?);
+    try env.put("USER", "local");
+    try testing.expectEqualStrings("local", loginUserFrom(&env).?);
+    try env.put("YOLO_USER", "other");
+    try testing.expectEqualStrings("other", loginUserFrom(&env).?);
 }

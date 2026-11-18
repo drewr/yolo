@@ -3,7 +3,7 @@
 #
 #   datum (default): configures loopback, installs the session's SSH keys,
 #     mounts the shared home, then supervises dropbear (loopback only) and
-#     dumbpipe (iroh endpoint). Logins land as the user in /etc/agent/user.
+#     dumbpipe (iroh endpoint). Logins land as the login user (see YOLO_USER).
 #   local (docker backend): sets up the same user, environment, nix and home,
 #     then idles; `docker exec` attaches. HOME is a host directory bind-mounted
 #     at /home/agent, and the user takes the host's uid (HOST_UID/HOST_GID) so
@@ -22,6 +22,9 @@
 #                        OAuth logins (claude /login, codex login, ...) persist
 #                        in the shared home instead.
 #   SESSION_NAME         hostname
+#   YOLO_USER            the login user's name (both modes). The image's user is a
+#                        placeholder, renamed to this at boot; it must be a portable
+#                        username and not root, or the placeholder stays.
 # Shared home (optional; all from the shared Secret agent-home):
 #   META_TICKET          dumbpipe ticket for the JuiceFS metadata Redis
 #   META_URL             redis://:<password>@127.0.0.1:6379/1, through that tunnel
@@ -38,7 +41,25 @@ MODE=${YOLO_MODE:-datum}
 chmod 1777 /tmp
 chmod 0700 /root
 
-U=$(cat /etc/agent/user 2>/dev/null || echo drewr)
+# The image's login user is a placeholder (/etc/agent/user), so no name is baked
+# into the image; rename it, and its group, to $YOLO_USER. nix.conf trusts the
+# user through its group (@NAME).
+U=$(cat /etc/agent/user 2>/dev/null || echo agent)
+valid_user() {
+  case $1 in ''|root|[!a-z_]*|*[!a-z0-9_-]*) return 1 ;; esac
+  [ ${#1} -le 32 ]
+}
+if [ -n "${YOLO_USER:-}" ] && [ "$YOLO_USER" != "$U" ]; then
+  if valid_user "$YOLO_USER"; then
+    sed -i "s/^$U:x:\([0-9]*:[0-9]*\):$U:/$YOLO_USER:x:\1:$YOLO_USER:/" /etc/passwd
+    sed -i "s/^$U:/$YOLO_USER:/" /etc/group
+    sed -i "s/@$U\$/@$YOLO_USER/" /etc/nix/nix.conf
+    echo "$YOLO_USER" > /etc/agent/user
+    U=$YOLO_USER
+  else
+    log "YOLO_USER '$YOLO_USER' is not a portable user name; the login user stays $U"
+  fi
+fi
 # local: the user takes the host user's uid and gid, so the bind-mounted home
 # keeps host ownership.
 if [ "$MODE" = local ] && [ -n "$HOST_UID" ] && [ -n "$HOST_GID" ]; then
@@ -184,6 +205,7 @@ as_user '
     for f in zshrc zshenv zprofile; do [ -e ".$f" ] || [ -L ".$f" ] || ln -s "/etc/agent/zsh/$f" ".$f"; done
     [ -e .zsh.d ] || [ -L .zsh.d ] || ln -s /etc/agent/zsh/zsh.d .zsh.d
   fi
+  [ -e .zshrc ] || [ -L .zshrc ] || : > .zshrc   # no dotfiles: skip zsh-newuser-install
   mkdir -p go
   if [ "$(cat /etc/agent/harness)" = claude ]; then
     mkdir -p .claude

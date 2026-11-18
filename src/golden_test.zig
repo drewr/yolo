@@ -122,7 +122,7 @@ test "golden: table" {
 // ---------------------------------------------------------------------------
 
 test "known_hosts line takes the key type and material" {
-    const pub_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEYb2mRCeLVrTfGBhk5YgQvcIIfh+FNsftv8wp+erR2m drewr@agent-foo\n";
+    const pub_line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEYb2mRCeLVrTfGBhk5YgQvcIIfh+FNsftv8wp+erR2m someone@agent-foo\n";
     const line = try keys.knownHostsLine(testing.allocator, "agent-foo", pub_line);
     defer testing.allocator.free(line);
     try testing.expectEqualStrings(

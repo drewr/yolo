@@ -24,7 +24,7 @@ pub const Datum = struct {
     gp_images: []const u8, // general-purpose (standard OCI) images
     user: []const u8, // login user in the sandbox; root also works
     forward_agent: bool, // forward the local agent while connected, for git over SSH
-    pull_secret: []const u8,
+    pull_secret: ?[]const u8, // image pull Secret; none when the images are public
     location: []const u8,
     network: []const u8,
     instance_type: []const u8,
@@ -39,11 +39,39 @@ pub const Datum = struct {
 // Pure
 // ---------------------------------------------------------------------------
 
-/// The login user in the sandbox: `DATUM_SESSION`, else production's default.
-/// Also what `useDatumSession` puts in the environment for child processes.
-pub fn datumSessionFrom(ctx: Ctx) []const u8 {
-    return ctx.firstEnv(&.{ "YOLO_DATUM_SESSION", "AGENT_SANDBOX_DATUM_SESSION", "DATUM_SESSION" }) orelse
-        "aaraines@gmail.com@api.datum.net";
+/// The Datum session asked for: $YOLO_DATUM_SESSION, else $DATUM_SESSION; none
+/// means datumctl's active session. Also what `useDatumSession` puts in the
+/// environment for child processes.
+pub fn datumSessionFrom(ctx: Ctx) ?[]const u8 {
+    return ctx.firstEnv(&.{ "YOLO_DATUM_SESSION", "AGENT_SANDBOX_DATUM_SESSION", "DATUM_SESSION" });
+}
+
+/// A recorded `datum_session` file's contents, if it names a session.
+pub fn recordedSession(contents: ?[]const u8) ?[]const u8 {
+    const t = util.trim(contents orelse return null);
+    return if (t.len == 0) null else t;
+}
+
+/// The active session in `datumctl auth list`'s table (a User, Endpoint and
+/// Status column; the active row says Active), as `USER@ENDPOINT`.
+pub fn parseActiveSession(allocator: mem.Allocator, table: []const u8) ?[]const u8 {
+    var lines = mem.splitScalar(u8, table, '\n');
+    while (lines.next()) |line| {
+        var cols: [3][]const u8 = undefined;
+        var n: usize = 0;
+        var words = mem.tokenizeAny(u8, line, " \t\r");
+        while (words.next()) |w| {
+            if (n == cols.len) {
+                n += 1;
+                break;
+            }
+            cols[n] = w;
+            n += 1;
+        }
+        if (n != 3 or !mem.eql(u8, cols[2], "Active")) continue;
+        return std.fmt.allocPrint(allocator, "{s}@{s}", .{ cols[0], cols[1] }) catch null;
+    }
+    return null;
 }
 
 /// The provider keys to pass: those of `keys` that are valid variable names,
@@ -69,12 +97,13 @@ pub fn providerKeyNames(allocator: mem.Allocator, names: []const []const u8) ![]
 
 pub fn config(ctx: Ctx, root: []const u8) Datum {
     useDatumSession(ctx);
+    const pull_secret = ctx.optLegacy("DATUM_PULL_SECRET", "YOLO_PULL_SECRET") orelse "";
     return Datum{
         .images = ctx.opt("IMAGES", util.join(ctx, &.{ root, "image/images" })),
         .gp_images = ctx.opt("GP_IMAGES", util.join(ctx, &.{ root, "image/images-general-purpose" })),
-        .user = ctx.opt("USER", "drewr"),
+        .user = util.loginUser(ctx),
         .forward_agent = mem.eql(u8, ctx.opt("FORWARD_AGENT", "1"), "1"),
-        .pull_secret = ctx.opt("PULL_SECRET", "ghcr-drewr"),
+        .pull_secret = if (pull_secret.len != 0) pull_secret else null,
         .location = ctx.opt("LOCATION", "us-east-1"),
         .network = ctx.opt("NETWORK", "default"),
         .instance_type = ctx.opt("INSTANCE_TYPE", "datumcloud/d1-standard-2"),
@@ -86,10 +115,37 @@ pub fn config(ctx: Ctx, root: []const u8) Datum {
     };
 }
 
-/// Point DATUM_SESSION at production (api.datum.net), project drewr-y4nd1b;
-/// an explicit session wins.
+/// Point DATUM_SESSION at the session asked for, if any; otherwise datumctl's
+/// children use its active session.
 pub fn useDatumSession(ctx: Ctx) void {
-    ctx.setEnv("DATUM_SESSION", datumSessionFrom(ctx));
+    if (datumSessionFrom(ctx)) |s| ctx.setEnv("DATUM_SESSION", s);
+}
+
+/// For a command acting on an existing session: run datumctl as the Datum
+/// session the session was made in (its `datum_session` file), so a later switch
+/// of datumctl's active context can't aim it at another project. A session
+/// asked for explicitly (YOLO_DATUM_SESSION, DATUM_SESSION) wins.
+pub fn useSessionDatum(ctx: Ctx, dir: []const u8) void {
+    if (datumSessionFrom(ctx) != null) return;
+    const rec = recordedSession(util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "datum_session" }))) orelse return;
+    ctx.setEnv("DATUM_SESSION", rec);
+}
+
+/// `d` with the login user of the session in `dir`.
+fn withSessionUser(ctx: Ctx, d: Datum, dir: []const u8) Datum {
+    var out = d;
+    out.user = session.user(ctx, dir, d.user);
+    return out;
+}
+
+/// The Datum session commands run as: the one asked for, else datumctl's
+/// active one; none when it can't be told.
+pub fn currentSession(ctx: Ctx) ?[]const u8 {
+    if (datumSessionFrom(ctx)) |s| return s;
+    if (util.findExecutable(ctx, "datumctl") == null) return null;
+    const r = util.capture(ctx, &.{ "datumctl", "auth", "list" }, .{}) catch return null;
+    if (r.term != .exited or r.code != 0) return null;
+    return parseActiveSession(ctx.arena, r.stdout);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +196,9 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     const wl = std.fmt.allocPrint(ctx.arena, "yolo-{s}", .{name}) catch util.die("out of memory");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "class" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{cls}) catch "");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "workload" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{wl}) catch "");
-    session.recordDatumSession(ctx, dir);
+    session.recordDatumSession(ctx, dir, currentSession(ctx));
+    session.recordUser(ctx, dir, d.user);
+    useSessionDatum(ctx, dir);
 
     // Session keys, readable only by this user.
     const secret_hex = blk: {
@@ -235,7 +293,7 @@ fn waitForSsh(ctx: Ctx, d: Datum, name: []const u8, t0: std.Io.Timestamp) void {
         const wl = session.workload(ctx, dir, name);
         const identity = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "identity" }));
         const ident = if (identity) |i| util.trim(i) else null;
-        const argv = datumSsh(ctx, d, dir, wl, ticket, ident, &.{ "-o", "ConnectTimeout=20", "-o", "BatchMode=yes", "true" });
+        const argv = datumSsh(ctx, withSessionUser(ctx, d, dir), dir, wl, ticket, ident, &.{ "-o", "ConnectTimeout=20", "-o", "BatchMode=yes", "true" });
         const ok = util.quiet(ctx, argv) == 0;
         if (ok) return;
         const n = util.secondsSince(ctx, t0);
@@ -324,13 +382,15 @@ pub fn datumAttach(ctx: Ctx, d: Datum, name: []const u8, args: []const []const u
     const wl = session.workload(ctx, dir, name);
     const identity = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "identity" }));
     const ident = if (identity) |i| util.trim(i) else null;
-    const argv = datumSsh(ctx, d, dir, wl, ticket, ident, args);
+    useSessionDatum(ctx, dir);
+    const argv = datumSsh(ctx, withSessionUser(ctx, d, dir), dir, wl, ticket, ident, args);
     util.replace(ctx, argv);
 }
 
 pub fn datumLogs(ctx: Ctx, d: Datum, name: []const u8, args: []const []const u8) u8 {
     _ = d;
     const dir = session.dir(ctx, name);
+    useSessionDatum(ctx, dir);
     const wl = session.workload(ctx, dir, name);
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(ctx.arena, &.{ "datumctl", "compute", "logs", wl }) catch {};
@@ -338,8 +398,10 @@ pub fn datumLogs(ctx: Ctx, d: Datum, name: []const u8, args: []const []const u8)
     return util.inherit(ctx, argv.items);
 }
 
-pub fn datumRm(ctx: Ctx, d: Datum, name: []const u8) u8 {
+pub fn datumRm(ctx: Ctx, d0: Datum, name: []const u8) u8 {
     const dir = session.dir(ctx, name);
+    useSessionDatum(ctx, dir);
+    const d = withSessionUser(ctx, d0, dir);
     // Persist RAM workspaces (/work) to the shared home and release their locks
     // before the instance goes, so another session can open them right away.
     const has_ticket = util.fileExists(ctx, util.join(ctx, &.{ dir, "ticket" }));
@@ -413,7 +475,7 @@ pub fn datumSync(ctx: Ctx) ?[]const json.Value {
             _ = ok;
         }
     }
-    const current = ctx.envNonEmpty("DATUM_SESSION") orelse "";
+    const current = currentSession(ctx) orelse "";
     for (local) |n| {
         if (contains(remote.items, n)) continue;
         const owner = util.readMeta(ctx, util.join(ctx, &.{ st, n, "datum_session" }), current);
@@ -595,7 +657,15 @@ pub fn adopt(ctx: Ctx, check_keys: bool, name: []const u8) AdoptError!bool {
     const dir = session.create(ctx, name, "datum", harness);
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "class" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{cls}) catch "");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "workload" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{wl}) catch "");
-    session.recordDatumSession(ctx, dir);
+    session.recordDatumSession(ctx, dir, currentSession(ctx));
+    // The login user the session was made with, from its Workload's env.
+    for (json.list(&.{ "spec", "template", "spec", "runtime", "sandbox", "containers" }, w)) |c| {
+        for (json.list(&.{"env"}, c)) |e| {
+            if (!mem.eql(u8, json.str(&.{"name"}, e), "YOLO_USER")) continue;
+            const u = json.str(&.{"value"}, e);
+            if (u.len != 0) session.recordUser(ctx, dir, u);
+        }
+    }
     {
         const hex = util.trim(iroh_secret);
         util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "iroh_secret" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{hex}) catch "");
@@ -735,13 +805,21 @@ pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []c
         \\        resources:
         \\          instanceType: {s}
         \\        sandbox:
-        \\          imagePullSecrets:
-        \\            - name: {s}
+        \\
+    , .{ in.workload, in.harness, in.cls, d.instance_type }) catch {};
+    if (d.pull_secret) |secret| {
+        out.print(allocator,
+            \\          imagePullSecrets:
+            \\            - name: {s}
+            \\
+        , .{secret}) catch {};
+    }
+    out.print(allocator,
         \\          containers:
         \\            - name: agent
         \\              image: {s}
         \\
-    , .{ in.workload, in.harness, in.cls, d.instance_type, d.pull_secret, in.image }) catch {};
+    , .{in.image}) catch {};
     if (mem.eql(u8, in.cls, "general-purpose")) {
         out.appendSlice(allocator,
             \\              securityContext:
@@ -752,6 +830,7 @@ pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []c
     }
     out.appendSlice(allocator, "              env:\n") catch {};
     value(allocator, &out, "YOLO_MODE", "datum");
+    value(allocator, &out, "YOLO_USER", show(allocator, d.user));
     value(allocator, &out, "SESSION_NAME", in.name);
     value(allocator, &out, "JFS_MOUNT_OPTS", show(allocator, d.jfs_opts));
     value(allocator, &out, "ENDPOINT_DNS", in.endpoint_dns);
@@ -827,8 +906,83 @@ pub fn buildDatum(ctx: Ctx, root: []const u8, cls: []const u8, hs: []const []con
     return @import("images.zig").buildDatum(ctx, root, cls, hs);
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testDatum(pull_secret: ?[]const u8) Datum {
+    return .{
+        .images = "images",
+        .gp_images = "images-gp",
+        .user = "someone",
+        .forward_agent = true,
+        .pull_secret = pull_secret,
+        .location = "us-east-1",
+        .network = "default",
+        .instance_type = "datumcloud/d1-standard-2",
+        .cls = "unikernel",
+        .relay = default_relay,
+        .home_secret = "agent-home",
+        .providers_secret = "agent-providers",
+        .jfs_opts = "",
+    };
+}
+
+const test_input: WorkloadInput = .{
+    .workload = "yolo-foo",
+    .name = "foo",
+    .harness = "claude",
+    .cls = "unikernel",
+    .image = "ghcr.io/example/agent-claude@sha256:aa",
+    .endpoint_dns = "x.example",
+    .provider_keys = &.{},
+    .home = false,
+};
+
+test "renderWorkload has imagePullSecrets only with a pull secret" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const without = renderWorkload(a, testDatum(null), test_input);
+    try testing.expect(mem.indexOf(u8, without, "imagePullSecrets") == null);
+    try testing.expect(mem.indexOf(u8, without, "        sandbox:\n          containers:\n") != null);
+    const with = renderWorkload(a, testDatum("my-pull"), test_input);
+    try testing.expect(mem.indexOf(u8, with, "          imagePullSecrets:\n            - name: my-pull\n          containers:\n") != null);
+}
+
+test "renderWorkload passes the login user to init" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const yaml = renderWorkload(a, testDatum(null), test_input);
+    try testing.expect(mem.indexOf(u8, yaml, "- name: YOLO_USER\n                  value: \"someone\"\n") != null);
+}
+
+test "parseActiveSession finds the Active row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const table =
+        \\User                     Endpoint                   Status
+        \\someone@example.com       api.example.net
+        \\other@example.org         api.staging.example.net    Active
+        \\
+    ;
+    try testing.expectEqualStrings("other@example.org@api.staging.example.net", parseActiveSession(a, table).?);
+    try testing.expect(parseActiveSession(a, "User Endpoint Status\nsomeone@example.com api.example.net\n") == null);
+    try testing.expect(parseActiveSession(a, "") == null);
+    try testing.expect(parseActiveSession(a, "not signed in\n") == null);
+}
+
+test "recordedSession ignores a missing or blank file" {
+    try testing.expectEqualStrings("a@b", recordedSession("a@b\n").?);
+    try testing.expect(recordedSession(null) == null);
+    try testing.expect(recordedSession(" \n") == null);
+}
+
 test {
     _ = renderSecret;
-    _ = renderWorkload;
     _ = providerKeyNames;
 }

@@ -37,16 +37,16 @@
     "dotfiles": {
       "flake": false,
       "locked": {
-        "lastModified": 1792844812,
-        "narHash": "sha256-5qSXsd9Phsy82bb9zifIA9npGNncE7tuE8yWpVG45+0=",
+        "lastModified": 1793753609,
+        "narHash": "sha256-85me45iMo0Su/A5adsXwQjeh3InEnhWDTF5CtpFQPCs=",
         "owner": "drewr",
-        "repo": "dotfiles",
-        "rev": "0ec9e22b79c2eeb956eeb156d2106eb4c22191be",
+        "repo": "yolo",
+        "rev": "c25489dab0b979118f45777697e172f1163aeaec",
         "type": "github"
       },
       "original": {
         "owner": "drewr",
-        "repo": "dotfiles",
+        "repo": "yolo",
         "type": "github"
       }
     },

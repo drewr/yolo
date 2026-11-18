@@ -60,6 +60,13 @@ pub fn sessionOfWorkload(w: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The login user recorded in a session's `user` file, else `fallback` (sessions
+/// made before the record).
+pub fn userFromFile(contents: ?[]const u8, fallback: []const u8) []const u8 {
+    const t = util.trim(contents orelse return fallback);
+    return if (t.len == 0) fallback else t;
+}
+
 /// The session's workload (and Secret) name for NAME, before a record exists.
 pub fn defaultWorkload(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "agent-{s}", .{name});
@@ -151,9 +158,20 @@ pub fn migrateAgentSandboxState(ctx: Ctx) void {
 
 /// The Datum login a session belongs to, so syncing under another login
 /// leaves it alone (`recordDatumSession`).
-pub fn recordDatumSession(ctx: Ctx, d: []const u8) void {
-    const login = ctx.envNonEmpty("DATUM_SESSION") orelse return;
+pub fn recordDatumSession(ctx: Ctx, d: []const u8, session_id: ?[]const u8) void {
+    const login = session_id orelse return;
     util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "datum_session" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{login}) catch "");
+}
+
+/// The login user of the session in directory `d`; `fallback` (YOLO_USER, the
+/// local user) for sessions without a `user` file.
+pub fn user(ctx: Ctx, d: []const u8, fallback: []const u8) []const u8 {
+    return userFromFile(util.readFileMaybe(ctx, util.join(ctx, &.{ d, "user" })), fallback);
+}
+
+/// Record the session's login user.
+pub fn recordUser(ctx: Ctx, d: []const u8, login: []const u8) void {
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "user" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{login}) catch "");
 }
 
 /// The session's workload (and Secret) name, as recorded in its local state;
@@ -194,4 +212,10 @@ test "sessionOfWorkload strips yolo- and agent-, and nothing else" {
     try testing.expect(sessionOfWorkload("agent-") == null);
     try testing.expect(sessionOfWorkload("other-pi") == null);
     try testing.expect(sessionOfWorkload("") == null);
+}
+
+test "userFromFile prefers the recorded user" {
+    try testing.expectEqualStrings("someone", userFromFile("someone\n", "local"));
+    try testing.expectEqualStrings("local", userFromFile(null, "local"));
+    try testing.expectEqualStrings("local", userFromFile("  \n", "local"));
 }
