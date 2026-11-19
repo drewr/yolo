@@ -630,16 +630,20 @@ fn credentialHint(ctx: Ctx) []const u8 {
     return " (check `datumctl whoami` and the active project, or set YOLO_DATUM_CREDENTIALS)";
 }
 
-/// Die with the operation, the status and the server's own message. The body is
-/// never echoed.
-fn failStatus(ctx: Ctx, what: []const u8, r: Response) noreturn {
+/// The operation, the status and the server's own message, for a failed
+/// response. The body is never echoed.
+fn failText(ctx: Ctx, what: []const u8, r: Response) []const u8 {
     const text = errorText(ctx.arena, r.body) catch null;
     const hint: []const u8 = if (r.status == 401 or r.status == 403) credentialHint(ctx) else "";
     if (text) |t| {
-        util.dief("cfg: {s} failed: HTTP {d}: {s}{s}", .{ what, r.status, t, hint });
-    } else {
-        util.dief("cfg: {s} failed: HTTP {d}{s}", .{ what, r.status, hint });
+        return std.fmt.allocPrint(ctx.arena, "cfg: {s} failed: HTTP {d}: {s}{s}", .{ what, r.status, t, hint }) catch "cfg: request failed";
     }
+    return std.fmt.allocPrint(ctx.arena, "cfg: {s} failed: HTTP {d}{s}", .{ what, r.status, hint }) catch "cfg: request failed";
+}
+
+/// Die with the failed response's text (`failText`).
+fn failStatus(ctx: Ctx, what: []const u8, r: Response) noreturn {
+    util.die(failText(ctx, what, r));
 }
 
 /// A new client with its CA bundle configured. The caller deinits it.
@@ -682,6 +686,14 @@ pub fn get(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []c
 pub fn put(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8, value: []const u8) u8 {
     checkValue(kind, value) catch
         util.die("cfg: a plain entry must be valid UTF-8; use --secret for binary values");
+    if (tryPut(ctx, project, name, kind, key, value)) |msg| util.die(msg);
+    return 0;
+}
+
+/// `put` that returns its failure text instead of dying, for a caller that
+/// must clean up first. Null on success. The text never carries the value.
+pub fn tryPut(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8, value: []const u8) ?[]const u8 {
+    checkValue(kind, value) catch return "cfg: a plain entry must be valid UTF-8";
     var client: std.http.Client = undefined;
     defer client.deinit();
     const token = prepare(ctx, &client);
@@ -698,9 +710,9 @@ pub fn put(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []c
     }
     if (r.status < 200 or r.status > 299) {
         const what = std.fmt.allocPrint(ctx.arena, "write {s} {s}", .{ kindName(kind), name }) catch util.die("out of memory");
-        failStatus(ctx, what, r);
+        return failText(ctx, what, r);
     }
-    return 0;
+    return null;
 }
 
 /// `yolo cfg list`: the sorted keys of one kind. A missing object lists nothing.

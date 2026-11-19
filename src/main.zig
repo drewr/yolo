@@ -117,6 +117,7 @@ pub const usage =
     \\  docker  -v HOST:CONTAINER[:ro]    bind-mount a directory (repeatable)
     \\  datum   --key PUBKEY_FILE         authorize this key instead of the agent's
     \\          --no-home                 private, ephemeral HOME, not the shared home
+    \\          --home                    the shared home (default, except for jump)
     \\          --class unikernel|general-purpose
     \\                                    runtime class (default $YOLO_CLASS, else unikernel)
     \\Session state lives in $YOLO_STATE (~/.local/state/yolo/sessions). Settings come

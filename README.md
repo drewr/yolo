@@ -35,6 +35,32 @@ the session authorizes.
 
 Choose the default backend with `YOLO_BACKEND=datum` (otherwise `docker`).
 
+### Jump boxes (datum)
+
+`yolo new NAME --agent jump --backend datum` makes a jump box, a session that
+holds SSH keys and connections for you (see `docs/jump-host-plan.md`). Besides
+the Workload, `new` creates in the session's project:
+
+- the ServiceAccount `jump-NAME`, with the editor role on the project through
+  the PolicyBinding `jump-NAME-PROJECT` in the organization's namespace;
+- a ServiceAccountKey for that account. Its credentials go straight into the
+  Secret `yolo-NAME-config` (key `datum-credentials.json`), and the ConfigMap
+  `yolo-NAME-config` is created empty. Together they are the box's Config,
+  `datum://PROJECT/yolo-NAME-config`.
+
+The Workload gets `YOLO_CONFIG_URL`, `YOLO_BOX`, `YOLO_GENERATION=1` and the
+credentials as `YOLO_DATUM_CREDENTIALS_JSON`. A jump box has no shared home
+unless `--home` asks for one. The organization is the one datumctl's active
+context names for the project, so run `new` from that context.
+
+`yolo rm NAME` deletes all of these, and skips any that are already gone. If
+`new` fails part way, it deletes what it had made before it exits. Names are
+recorded in the session directory (`jump_sa`, `jump_binding`, `jump_org`);
+the credentials are never written to disk or printed.
+
+`yolo attach` doesn't forward your SSH agent to a jump box. `-A` in the
+arguments turns it on again.
+
 ## Inside a session
 
 The same image and init run on both backends:

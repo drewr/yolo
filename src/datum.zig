@@ -14,6 +14,7 @@ const util = @import("util.zig");
 const json = @import("json.zig");
 const keys = @import("keys.zig");
 const session = @import("session.zig");
+const jumpbox = @import("jumpbox.zig");
 const Ctx = util.Ctx;
 const mem = std.mem;
 
@@ -108,6 +109,36 @@ pub fn parseActiveSession(allocator: mem.Allocator, table: []const u8) ?[]const 
         return std.fmt.allocPrint(allocator, "{s}@{s}", .{ cols[0], cols[1] }) catch null;
     }
     return null;
+}
+
+/// Whether the shared home is mounted. A jump box gets none unless --home asks
+/// for it; other sessions get it unless --no-home says otherwise.
+pub fn wantHome(harness: []const u8, flag: ?bool) bool {
+    return flag orelse !mem.eql(u8, harness, jumpbox.harness);
+}
+
+/// Whether `args` (ssh options, then the command) ask for agent forwarding with -A.
+pub fn asksAgent(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (mem.eql(u8, a, "--") or !mem.startsWith(u8, a, "-")) return false;
+        if (mem.eql(u8, a, "-A")) return true;
+        if (isValueOption(a)) {
+            i += 1;
+            continue;
+        }
+        if (a.len > 1 and a[1] != '-' and mem.indexOfScalar(u8, a[1..], 'A') != null) return true;
+    }
+    return false;
+}
+
+/// Whether the client's agent is forwarded. The session's setting (`forward`)
+/// applies, except that a jump box gets the agent only when -A asks for it: the
+/// box holds its own keys and doesn't need the client's.
+pub fn agentForwarded(forward: bool, jump: bool, args: []const []const u8) bool {
+    if (!forward) return false;
+    return !jump or asksAgent(args);
 }
 
 /// The provider keys to pass: those of `keys` that are valid variable names,
@@ -211,7 +242,7 @@ pub fn currentSession(ctx: Ctx) ?[]const u8 {
 
 pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0: []const []const u8) u8 {
     var key: ?[]const u8 = null;
-    var want_home = true;
+    var home_flag: ?bool = null;
     var cls = d.cls;
     var i: usize = 0;
     while (i < opts0.len) {
@@ -219,7 +250,10 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
             key = opts0[i + 1];
             i += 2;
         } else if (mem.eql(u8, opts0[i], "--no-home")) {
-            want_home = false;
+            home_flag = false;
+            i += 1;
+        } else if (mem.eql(u8, opts0[i], "--home")) {
+            home_flag = true;
             i += 1;
         } else if (mem.eql(u8, opts0[i], "--class") and i + 1 < opts0.len) {
             cls = opts0[i + 1];
@@ -233,6 +267,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         if (!util.isReadable(ctx, k)) util.dief("datum: cannot read {s}", .{k});
     }
     // The shared home: only if the Secret exists.
+    const want_home = wantHome(harness, home_flag);
     const home_ok = util.quiet(ctx, datumArgv(ctx, &.{ "datumctl", "get", "secret", d.home_secret })) == 0;
     if (want_home and !home_ok) {
         util.warn("no Secret {s}; this session's HOME is ephemeral", .{d.home_secret});
@@ -249,6 +284,17 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         break :blk found;
     };
 
+    // A jump box needs its project and organization, and none of its objects may
+    // exist yet. All of that is checked before anything is made.
+    var box: ?jumpbox.Box = null;
+    if (mem.eql(u8, harness, jumpbox.harness)) {
+        const project = currentProject(ctx) orelse
+            util.die("a jump box needs a Datum project: set YOLO_DATUM_PROJECT, or make one active in datumctl");
+        const b = jumpbox.plan(ctx, name, project);
+        if (jumpbox.preflight(ctx, b)) |msg| util.die(msg);
+        box = b;
+    }
+
     const dir = session.create(ctx, name, "datum", harness);
     const wl = std.fmt.allocPrint(ctx.arena, "yolo-{s}", .{name}) catch util.die("out of memory");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "class" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{cls}) catch "");
@@ -256,6 +302,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     session.recordDatumSession(ctx, dir, currentSession(ctx));
     session.recordDatumProject(ctx, dir, currentProject(ctx));
     session.recordUser(ctx, dir, d.user);
+    if (box) |b| jumpbox.recordNames(ctx, dir, b);
     useSessionDatum(ctx, dir);
 
     // Session keys, readable only by this user.
@@ -320,12 +367,20 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     const host_key = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "host_key" })) orelse "";
     const auth_b64 = util.b64encode(ctx.arena, authorized_text) catch util.die("out of memory");
     const host_b64 = util.b64encode(ctx.arena, host_key) catch util.die("out of memory");
-    apply(ctx, "the session Secret", renderSecret(ctx.arena, wl, secret_hex_text, auth_b64, host_b64));
+    if (applyError(ctx, "the session Secret", renderSecret(ctx.arena, wl, secret_hex_text, auth_b64, host_b64))) |msg|
+        abandon(ctx, wl, dir, box, msg);
 
     const providers = datumProviderKeyNames(ctx, d);
     const pubkey = keys.pubFromSecretHex(secret_hex_text) catch util.die("bad iroh secret");
     const endpoint_dns = keys.endpointDns(ctx.arena, pubkey) catch util.die("out of memory");
-    apply(ctx, "the Workload", renderWorkload(ctx.arena, d, .{
+    if (box) |b| {
+        if (jumpbox.provision(ctx, b)) |msg| abandon(ctx, wl, dir, box, msg);
+    }
+    const jump_config = if (box) |b|
+        (jumpbox.configUrl(ctx.arena, b.project, name) catch util.die("out of memory"))
+    else
+        null;
+    if (applyError(ctx, "the Workload", renderWorkload(ctx.arena, d, .{
         .workload = wl,
         .name = name,
         .harness = harness,
@@ -334,7 +389,8 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         .endpoint_dns = endpoint_dns,
         .provider_keys = providers,
         .home = home,
-    }));
+        .jump_config = jump_config,
+    }))) |msg| abandon(ctx, wl, dir, box, msg);
 
     util.errPrint("created {s} ({s}: {s}); waiting for SSH...\n", .{ wl, harness, image });
     const t0 = util.monoNow(ctx);
@@ -386,7 +442,8 @@ pub fn datumSsh(
     if (identity) |i| {
         out.appendSlice(ctx.arena, &.{ "-i", i, "-o", "IdentitiesOnly=yes" }) catch util.die("out of memory");
     }
-    if (d.forward_agent) out.appendSlice(ctx.arena, &.{ "-o", "ForwardAgent=yes" }) catch util.die("out of memory");
+    const jump = mem.eql(u8, session.harnessOf(ctx, dir), jumpbox.harness);
+    if (agentForwarded(d.forward_agent, jump, args)) out.appendSlice(ctx.arena, &.{ "-o", "ForwardAgent=yes" }) catch util.die("out of memory");
     // Options up to --, or the first non-option; then the destination.
     const split = splitSshArgs(ctx.arena, args);
     out.appendSlice(ctx.arena, split.opts) catch util.die("out of memory");
@@ -460,10 +517,12 @@ pub fn datumRm(ctx: Ctx, d0: Datum, name: []const u8) u8 {
     const dir = session.dir(ctx, name);
     useSessionDatum(ctx, dir);
     const d = withSessionUser(ctx, d0, dir);
+    const jump = mem.eql(u8, session.harnessOf(ctx, dir), jumpbox.harness);
     // Persist RAM workspaces (/work) to the shared home and release their locks
     // before the instance goes, so another session can open them right away.
+    // Jump boxes have no workspaces and no `ws`, so they skip this.
     const has_ticket = util.fileExists(ctx, util.join(ctx, &.{ dir, "ticket" }));
-    if (has_ticket) {
+    if (has_ticket and !jump) {
         const ticket = util.readMeta(ctx, util.join(ctx, &.{ dir, "ticket" }), "");
         const wl = session.workload(ctx, dir, name);
         const argv = datumSsh(ctx, d, dir, wl, ticket, null, &.{ "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "--", "HOME=/home/agent; [ -d /work ] && ws close --all" });
@@ -474,12 +533,13 @@ pub fn datumRm(ctx: Ctx, d0: Datum, name: []const u8) u8 {
         }
     }
     const wl = session.workload(ctx, dir, name);
-    for ([_][]const u8{ "workload", "secret" }) |kind| {
-        const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "delete", kind, wl }), .{}) catch continue;
-        // The outcome: stdout's last line ("... deleted"), else the error.
-        const line = util.lastLine(r.stdout) orelse util.lastLine(r.stderr) orelse continue;
-        util.outRaw(line);
-        util.outRaw("\n");
+    deleteSession(ctx, wl);
+    if (jump) {
+        if (currentProject(ctx)) |project| {
+            jumpbox.teardown(ctx, jumpbox.recorded(ctx, dir, name, project));
+        } else {
+            util.warn("can't tell the Datum project of {s}, so its jump box objects are left in place", .{name});
+        }
     }
     util.removeTree(ctx, dir);
     return 0;
@@ -794,11 +854,39 @@ pub fn datumProviderKeyNames(ctx: Ctx, d: Datum) []const []const u8 {
     return names.items;
 }
 
-fn apply(ctx: Ctx, what: []const u8, yaml: []const u8) void {
-    const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "apply", "-f", "-" }), .{ .stdin = yaml }) catch
-        util.dief("could not apply {s}", .{what});
-    if (r.term != .exited or r.code != 0)
-        util.dief("could not apply {s}: {s}", .{ what, util.trim(r.stderr) });
+/// Apply a manifest with datumctl: null on success, else the failure message.
+fn applyError(ctx: Ctx, what: []const u8, yaml: []const u8) ?[]const u8 {
+    const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "apply", "-f", "-" }), .{ .stdin = yaml }) catch {
+        return std.fmt.allocPrint(ctx.arena, "could not apply {s}", .{what}) catch "could not apply";
+    };
+    if (r.term != .exited or r.code != 0) {
+        return std.fmt.allocPrint(ctx.arena, "could not apply {s}: {s}", .{ what, util.trim(r.stderr) }) catch "could not apply";
+    }
+    return null;
+}
+
+/// Delete the session's Workload and Secret, printing datumctl's outcome lines.
+fn deleteSession(ctx: Ctx, wl: []const u8) void {
+    for ([_][]const u8{ "workload", "secret" }) |kind| {
+        const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "delete", kind, wl }), .{}) catch continue;
+        // The outcome: stdout's last line ("... deleted"), else the error.
+        const line = util.lastLine(r.stdout) orelse util.lastLine(r.stderr) orelse continue;
+        util.outRaw(line);
+        util.outRaw("\n");
+    }
+}
+
+/// A failed `new` dies with `msg`. A jump box's session first takes down what
+/// it made: the Workload and Secret, the box's objects, and the directory. The
+/// other backends' sessions keep their directory, as they always have, so
+/// `yolo rm` can clear them.
+fn abandon(ctx: Ctx, wl: []const u8, dir: []const u8, box: ?jumpbox.Box, msg: []const u8) noreturn {
+    if (box) |b| {
+        deleteSession(ctx, wl);
+        jumpbox.teardown(ctx, b);
+        util.removeTree(ctx, dir);
+    }
+    util.die(msg);
 }
 
 pub fn lookupImage(ctx: Ctx, file: []const u8, harness: []const u8) ?[]const u8 {
@@ -843,6 +931,8 @@ pub const WorkloadInput = struct {
     endpoint_dns: []const u8,
     provider_keys: []const []const u8,
     home: bool,
+    /// A jump box's YOLO_CONFIG_URL; null for other sessions.
+    jump_config: ?[]const u8 = null,
 };
 
 pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []const u8 {
@@ -908,6 +998,11 @@ pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []c
         for ([_][]const u8{ "META_TICKET", "META_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY" }) |k| {
             fromSecret(allocator, &out, d.home_secret, k);
         }
+    }
+    if (in.jump_config) |url| {
+        const config_name = jumpbox.configName(allocator, in.name) catch util.die("out of memory");
+        const env = jumpbox.envYaml(allocator, url, in.name, config_name) catch util.die("out of memory");
+        out.appendSlice(allocator, env) catch util.die("out of memory");
     }
     out.print(allocator,
         \\      networkInterfaces:
@@ -1076,6 +1171,47 @@ test "withProject adds --project only when a project is known" {
     const without = try withProject(a, null, argv);
     try testing.expectEqual(argv.ptr, without.ptr);
     try testing.expectEqual(@as(usize, 6), without.len);
+}
+
+test "renderWorkload adds a jump box's Config env only when it has a URL" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const plain = renderWorkload(a, testDatum(null), test_input);
+    try testing.expect(mem.indexOf(u8, plain, "YOLO_CONFIG_URL") == null);
+    var jump_input = test_input;
+    jump_input.jump_config = "datum://proj-1/yolo-foo-config";
+    const jump = renderWorkload(a, testDatum(null), jump_input);
+    try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_CONFIG_URL\n                  value: \"datum://proj-1/yolo-foo-config\"\n") != null);
+    try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_BOX\n                  value: \"foo\"\n") != null);
+    try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_GENERATION\n                  value: \"1\"\n") != null);
+    try testing.expect(mem.indexOf(u8, jump, "secretKeyRef: { name: yolo-foo-config, key: datum-credentials.json }") != null);
+    try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_USER\n") != null);
+}
+
+test "wantHome: a jump box has no shared home unless --home asks for it" {
+    try testing.expect(wantHome("claude", null));
+    try testing.expect(!wantHome("jump", null));
+    try testing.expect(wantHome("jump", true));
+    try testing.expect(!wantHome("claude", false));
+}
+
+test "asksAgent reads -A among the ssh options only" {
+    try testing.expect(asksAgent(&.{ "-A", "true" }));
+    try testing.expect(asksAgent(&.{ "-o", "BatchMode=yes", "-A" }));
+    try testing.expect(asksAgent(&.{"-vA"}));
+    try testing.expect(!asksAgent(&.{ "-o", "ConnectTimeout=20", "true" }));
+    try testing.expect(!asksAgent(&.{ "tmux", "-A" }));
+    try testing.expect(!asksAgent(&.{ "--", "-A" }));
+    try testing.expect(!asksAgent(&.{}));
+}
+
+test "agentForwarded: a jump box's attach doesn't forward unless -A asks" {
+    try testing.expect(agentForwarded(true, false, &.{}));
+    try testing.expect(!agentForwarded(false, false, &.{"-A"}));
+    try testing.expect(!agentForwarded(true, true, &.{}));
+    try testing.expect(!agentForwarded(true, true, &.{ "-o", "BatchMode=yes" }));
+    try testing.expect(agentForwarded(true, true, &.{"-A"}));
 }
 
 test {

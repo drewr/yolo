@@ -181,6 +181,11 @@ pub fn recordUser(ctx: Ctx, d: []const u8, login: []const u8) void {
     util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "user" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{login}) catch "");
 }
 
+/// The harness a session was made with (its `harness` file); "" when unknown.
+pub fn harnessOf(ctx: Ctx, d: []const u8) []const u8 {
+    return util.readMeta(ctx, util.join(ctx, &.{ d, "harness" }), "");
+}
+
 /// The session's workload (and Secret) name, as recorded in its local state;
 /// sessions from before the record are agent-NAME (`sessionWorkload`).
 pub fn workload(ctx: Ctx, d: []const u8, name: []const u8) []const u8 {
