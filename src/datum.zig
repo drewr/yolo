@@ -52,6 +52,42 @@ pub fn recordedSession(contents: ?[]const u8) ?[]const u8 {
     return if (t.len == 0) null else t;
 }
 
+/// The Datum project asked for: $YOLO_DATUM_PROJECT; none means datumctl's
+/// active project. Also what `useSessionDatum` puts in the environment for
+/// datumctl calls on a recorded session.
+pub fn datumProjectFrom(ctx: Ctx) ?[]const u8 {
+    return ctx.envNonEmpty("YOLO_DATUM_PROJECT");
+}
+
+/// A recorded `datum_project` file's contents, if it names a project.
+pub fn recordedProject(contents: ?[]const u8) ?[]const u8 {
+    const t = util.trim(contents orelse return null);
+    return if (t.len == 0) null else t;
+}
+
+/// The project on the `Project:` line of `datumctl whoami`, if it names one.
+pub fn parseProject(whoami: []const u8) ?[]const u8 {
+    var lines = mem.splitScalar(u8, whoami, '\n');
+    while (lines.next()) |line| {
+        const t = util.trim(line);
+        if (!mem.startsWith(u8, t, "Project:")) continue;
+        const v = util.trim(t["Project:".len..]);
+        return if (v.len == 0) null else v;
+    }
+    return null;
+}
+
+/// `argv` with `--project PROJECT` appended when a project is known. Without
+/// one, datumctl uses its active project, as it did before.
+pub fn withProject(allocator: mem.Allocator, project: ?[]const u8, argv: []const []const u8) ![]const []const u8 {
+    const p = project orelse return argv;
+    const out = try allocator.alloc([]const u8, argv.len + 2);
+    @memcpy(out[0..argv.len], argv);
+    out[argv.len] = "--project";
+    out[argv.len + 1] = p;
+    return out;
+}
+
 /// The active session in `datumctl auth list`'s table (a User, Endpoint and
 /// Status column; the active row says Active), as `USER@ENDPOINT`.
 pub fn parseActiveSession(allocator: mem.Allocator, table: []const u8) ?[]const u8 {
@@ -124,11 +160,32 @@ pub fn useDatumSession(ctx: Ctx) void {
 /// For a command acting on an existing session: run datumctl as the Datum
 /// session the session was made in (its `datum_session` file), so a later switch
 /// of datumctl's active context can't aim it at another project. A session
-/// asked for explicitly (YOLO_DATUM_SESSION, DATUM_SESSION) wins.
+/// asked for explicitly (YOLO_DATUM_SESSION, DATUM_SESSION) wins. The project
+/// the session was made in (its `datum_project` file) is set the same way.
 pub fn useSessionDatum(ctx: Ctx, dir: []const u8) void {
-    if (datumSessionFrom(ctx) != null) return;
-    const rec = recordedSession(util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "datum_session" }))) orelse return;
-    ctx.setEnv("DATUM_SESSION", rec);
+    if (datumSessionFrom(ctx) == null) {
+        if (recordedSession(util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "datum_session" })))) |rec|
+            ctx.setEnv("DATUM_SESSION", rec);
+    }
+    if (datumProjectFrom(ctx) == null) {
+        if (recordedProject(util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "datum_project" })))) |rec|
+            ctx.setEnv("YOLO_DATUM_PROJECT", rec);
+    }
+}
+
+/// The Datum project commands run in: the one asked for, else datumctl's
+/// active project; none when it can't be told.
+pub fn currentProject(ctx: Ctx) ?[]const u8 {
+    if (datumProjectFrom(ctx)) |p| return p;
+    if (util.findExecutable(ctx, "datumctl") == null) return null;
+    const r = util.capture(ctx, &.{ "datumctl", "whoami" }, .{}) catch return null;
+    if (r.term != .exited or r.code != 0) return null;
+    return parseProject(r.stdout);
+}
+
+/// The datumctl argv for `argv`, in the project this run uses (`datumProjectFrom`).
+fn datumArgv(ctx: Ctx, argv: []const []const u8) []const []const u8 {
+    return withProject(ctx.arena, datumProjectFrom(ctx), argv) catch util.die("out of memory");
 }
 
 /// `d` with the login user of the session in `dir`.
@@ -176,7 +233,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         if (!util.isReadable(ctx, k)) util.dief("datum: cannot read {s}", .{k});
     }
     // The shared home: only if the Secret exists.
-    const home_ok = util.quiet(ctx, &.{ "datumctl", "get", "secret", d.home_secret }) == 0;
+    const home_ok = util.quiet(ctx, datumArgv(ctx, &.{ "datumctl", "get", "secret", d.home_secret })) == 0;
     if (want_home and !home_ok) {
         util.warn("no Secret {s}; this session's HOME is ephemeral", .{d.home_secret});
     }
@@ -197,6 +254,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "class" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{cls}) catch "");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "workload" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{wl}) catch "");
     session.recordDatumSession(ctx, dir, currentSession(ctx));
+    session.recordDatumProject(ctx, dir, currentProject(ctx));
     session.recordUser(ctx, dir, d.user);
     useSessionDatum(ctx, dir);
 
@@ -393,7 +451,7 @@ pub fn datumLogs(ctx: Ctx, d: Datum, name: []const u8, args: []const []const u8)
     useSessionDatum(ctx, dir);
     const wl = session.workload(ctx, dir, name);
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(ctx.arena, &.{ "datumctl", "compute", "logs", wl }) catch {};
+    argv.appendSlice(ctx.arena, datumArgv(ctx, &.{ "datumctl", "compute", "logs", wl })) catch {};
     argv.appendSlice(ctx.arena, args) catch {};
     return util.inherit(ctx, argv.items);
 }
@@ -417,7 +475,7 @@ pub fn datumRm(ctx: Ctx, d0: Datum, name: []const u8) u8 {
     }
     const wl = session.workload(ctx, dir, name);
     for ([_][]const u8{ "workload", "secret" }) |kind| {
-        const r = util.capture(ctx, &.{ "datumctl", "delete", kind, wl }, .{}) catch continue;
+        const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "delete", kind, wl }), .{}) catch continue;
         // The outcome: stdout's last line ("... deleted"), else the error.
         const line = util.lastLine(r.stdout) orelse util.lastLine(r.stderr) orelse continue;
         util.outRaw(line);
@@ -442,7 +500,7 @@ pub fn datumLs(ctx: Ctx, d: Datum, full: bool) u8 {
 }
 
 pub fn datumSync(ctx: Ctx) ?[]const json.Value {
-    const r = util.capture(ctx, &.{ "datumctl", "get", "workloads", "-o", "json" }, .{}) catch |e| {
+    const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "get", "workloads", "-o", "json" }), .{}) catch |e| {
         util.warn("can't list Datum sessions, so they weren't synced: {t}", .{e});
         return null;
     };
@@ -619,7 +677,7 @@ pub fn adopt(ctx: Ctx, check_keys: bool, name: []const u8) AdoptError!bool {
     var workload: ?json.Value = null;
     for (session.workload_prefixes) |p| {
         const wl = std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ p, name }) catch return false;
-        const r = util.capture(ctx, &.{ "datumctl", "get", "workload", wl, "-o", "json" }, .{}) catch continue;
+        const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "get", "workload", wl, "-o", "json" }), .{}) catch continue;
         if (r.term != .exited or r.code != 0) continue;
         if (json.parse(ctx.arena, r.stdout)) |w| {
             found = wl;
@@ -630,7 +688,7 @@ pub fn adopt(ctx: Ctx, check_keys: bool, name: []const u8) AdoptError!bool {
     const wl = found orelse return false;
     const w = workload.?;
 
-    const sr = util.capture(ctx, &.{ "datumctl", "get", "secret", wl, "-o", "json" }, .{}) catch
+    const sr = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "get", "secret", wl, "-o", "json" }), .{}) catch
         return fail(ctx, "{s} exists on Datum, but its Secret can't be read", .{wl});
     if (sr.term != .exited or sr.code != 0)
         return fail(ctx, "{s} exists on Datum, but its Secret can't be read: {s}", .{ wl, util.trim(sr.stderr) });
@@ -718,7 +776,7 @@ fn twice(ctx: Ctx, secret: json.Value, k: []const u8) ?[]const u8 {
 /// Key names in the providers Secret that are valid variable names. Values
 /// are never read here.
 pub fn datumProviderKeyNames(ctx: Ctx, d: Datum) []const []const u8 {
-    const r = util.capture(ctx, &.{ "datumctl", "get", "secret", d.providers_secret, "-o", "json" }, .{}) catch return &.{};
+    const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "get", "secret", d.providers_secret, "-o", "json" }), .{}) catch return &.{};
     if (r.term != .exited or r.code != 0) return &.{};
     const v = json.parse(ctx.arena, r.stdout) orelse return &.{};
     const data = json.object(&.{"data"}, v) orelse return &.{};
@@ -737,7 +795,7 @@ pub fn datumProviderKeyNames(ctx: Ctx, d: Datum) []const []const u8 {
 }
 
 fn apply(ctx: Ctx, what: []const u8, yaml: []const u8) void {
-    const r = util.capture(ctx, &.{ "datumctl", "apply", "-f", "-" }, .{ .stdin = yaml }) catch
+    const r = util.capture(ctx, datumArgv(ctx, &.{ "datumctl", "apply", "-f", "-" }), .{ .stdin = yaml }) catch
         util.dief("could not apply {s}", .{what});
     if (r.term != .exited or r.code != 0)
         util.dief("could not apply {s}: {s}", .{ what, util.trim(r.stderr) });
@@ -980,6 +1038,44 @@ test "recordedSession ignores a missing or blank file" {
     try testing.expectEqualStrings("a@b", recordedSession("a@b\n").?);
     try testing.expect(recordedSession(null) == null);
     try testing.expect(recordedSession(" \n") == null);
+}
+
+test "parseProject reads the Project line of whoami" {
+    const whoami =
+        \\User:         Someone (someone@example.com)
+        \\Onboarding:   ready
+        \\Endpoint:     api.example.net
+        \\Context:      org-1/proj-1
+        \\Organization: Example Org (org-1)
+        \\Project:      proj-1
+        \\
+    ;
+    try testing.expectEqualStrings("proj-1", parseProject(whoami).?);
+    try testing.expect(parseProject("Organization: Example Org (org-1)\n") == null);
+    try testing.expect(parseProject("Project:\n") == null);
+    try testing.expect(parseProject("") == null);
+}
+
+test "recordedProject ignores a missing or blank file" {
+    try testing.expectEqualStrings("proj-1", recordedProject("proj-1\n").?);
+    try testing.expect(recordedProject(null) == null);
+    try testing.expect(recordedProject(" \n") == null);
+}
+
+test "withProject adds --project only when a project is known" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const argv: []const []const u8 = &.{ "datumctl", "get", "secret", "x", "-o", "json" };
+    const with = try withProject(a, "proj-1", argv);
+    try testing.expectEqual(@as(usize, 8), with.len);
+    try testing.expectEqualStrings("--project", with[6]);
+    try testing.expectEqualStrings("proj-1", with[7]);
+    try testing.expectEqualStrings("json", with[5]);
+    // Without a project the argv is the same slice: datumctl's active project.
+    const without = try withProject(a, null, argv);
+    try testing.expectEqual(argv.ptr, without.ptr);
+    try testing.expectEqual(@as(usize, 6), without.len);
 }
 
 test {

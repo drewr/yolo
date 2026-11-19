@@ -113,6 +113,7 @@ Each `YOLO_NAME` also reads the older `AGENT_SANDBOX_NAME`. A name marked
 | Variable | Default |
 | - | - |
 | `YOLO_DATUM_SESSION` | datumctl's active session (`USER@ENDPOINT`); new sessions record the one they were made in |
+| `YOLO_DATUM_PROJECT` | datumctl's active project (passed as `--project`); new sessions record the one they were made in |
 | `YOLO_DATUM_PULL_SECRET` (was `YOLO_PULL_SECRET`) | none: no `imagePullSecrets`, so the images must be public |
 | `YOLO_LOCATION` | `us-east-1` |
 | `YOLO_NETWORK` | `default` |

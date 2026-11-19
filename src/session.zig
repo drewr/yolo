@@ -163,6 +163,13 @@ pub fn recordDatumSession(ctx: Ctx, d: []const u8, session_id: ?[]const u8) void
     util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "datum_session" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{login}) catch "");
 }
 
+/// The Datum project a session was made in, so later datumctl calls for it
+/// use that project (`recordDatumProject`). No file for an unknown project.
+pub fn recordDatumProject(ctx: Ctx, d: []const u8, project: ?[]const u8) void {
+    const p = project orelse return;
+    util.writeFileOrDie(ctx, util.join(ctx, &.{ d, "datum_project" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{p}) catch "");
+}
+
 /// The login user of the session in directory `d`; `fallback` (YOLO_USER, the
 /// local user) for sessions without a `user` file.
 pub fn user(ctx: Ctx, d: []const u8, fallback: []const u8) []const u8 {
