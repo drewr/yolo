@@ -14,8 +14,8 @@
 #
 # The `jump` image (harness jump; datum mode) is a long-lived jump box: no nix,
 # shared home or provider config. Every login runs `jump login` (a forced command
-# on each authorized key), and `jump setup` starts the in-memory ssh-agent and
-# ssh-agent-mux that all logins share.
+# on each authorized key), and `jump setup` starts the one in-memory ssh-agent that
+# logins, tmux and held connections all use. Clients don't forward their agent.
 #
 # Environment (datum), from the per-session Secret written by yolo:
 #   IROH_SECRET          iroh endpoint secret key; the client derives the ticket
@@ -75,7 +75,7 @@ if [ "$MODE" = local ] && [ -n "$HOST_UID" ] && [ -n "$HOST_GID" ]; then
   sed -i "s/^$U:x:$old_uid:/$U:x:$HOST_GID:/" /etc/group
 fi
 # jump: plain bash. The dotfiles' zsh config re-picks SSH_AUTH_SOCK at every
-# shell start, which fights the mux that owns it here.
+# shell start, which fights the persistent agent that owns it here.
 [ $JUMP = 1 ] && sed -i "/^$U:/s|:/bin/zsh\$|:/bin/bash|" /etc/passwd
 UID_=$(/bin/id -u "$U")
 GID_=$(/bin/id -g "$U")
@@ -107,8 +107,8 @@ if [ "$MODE" = datum ]; then
   # user, so the session's keys stay out of the shared home.
   mkdir -p /etc/agent/ssh /etc/dropbear
   echo "$AUTHORIZED_KEYS_B64" | /bin/base64 -d > /etc/agent/ssh/authorized_keys
-  # jump: every key logs in through `jump login` (slot for the forwarded agent,
-  # then the shared tmux or the client's command). Comments and blanks stay.
+  # jump: every key logs in through `jump login` (the persistent agent, then tmux
+  # or the client's command). Comments and blanks stay.
   [ $JUMP = 1 ] && sed -i '/^[[:space:]]*\(#\|$\)/!s|^|command="/bin/jump login" |' /etc/agent/ssh/authorized_keys
   chmod 0644 /etc/agent/ssh/authorized_keys
   umask 077
@@ -128,7 +128,7 @@ if [ -n "$META_TICKET" ] && [ -n "$META_URL" ]; then
     while :; do
       # Without IROH_SECRET: that key belongs to the SSH listener, and two
       # endpoints with one key knock each other off the relay.
-      /bin/env -u IROH_SECRET /bin/dumbpipe connect-tcp --addr 127.0.0.1:6379 "$META_TICKET" 2>&1 \
+      /bin/env -u IROH_SECRET -u YOLO_DATUM_CREDENTIALS_JSON /bin/dumbpipe connect-tcp --addr 127.0.0.1:6379 "$META_TICKET" 2>&1 \
         | /bin/grep -v -e 'endpoint[a-z0-9]\{20\}'
       log "meta tunnel exited; restarting"
       sleep 2
@@ -142,7 +142,7 @@ if [ -n "$META_TICKET" ] && [ -n "$META_URL" ]; then
   # Dual-stack S3: some locations (staging us-east-1) have no IPv4 egress at
   # all, and JuiceFS rewrites the bucket URL to the IPv4-only endpoint.
   # shellcheck disable=SC2086  # JFS_MOUNT_OPTS is a list of options
-  if AWS_USE_DUALSTACK_ENDPOINT=true /bin/juicefs mount --background --cache-dir /tmp/jfs-cache --cache-size 256 \
+  if /bin/env -u YOLO_DATUM_CREDENTIALS_JSON AWS_USE_DUALSTACK_ENDPOINT=true /bin/juicefs mount --background --cache-dir /tmp/jfs-cache --cache-size 256 \
        --buffer-size 128 --log /tmp/juicefs.log $JFS_MOUNT_OPTS "$META_URL" /mnt/agent-fs; then
     mkdir -p /mnt/agent-fs/home/work
     # Files written before the login user existed belong to root; hand them over once.
@@ -170,6 +170,11 @@ mkdir -p /work && chown "$UID_:$GID_" /work
 
 # dropbear does not pass the container environment to sessions, so login
 # shells load it from /etc/agent/env (via /etc/zshenv and /etc/profile).
+# Writes `export NAME='value'`: the value is single-quoted, with any single quote
+# inside it escaped.
+env_export() {
+  printf "export %s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"
+}
 {
   echo 'export PATH=/bin'
   echo 'export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt'
@@ -184,14 +189,21 @@ mkdir -p /work && chown "$UID_:$GID_" /work
   for k in $PROVIDER_KEYS; do
     case $k in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac   # names reach eval
     eval "v=\${$k:-}"
-    # Single-quote the value; escape any single quotes inside it.
     # shellcheck disable=SC2154  # v is set by the eval above
-    [ -n "$v" ] && printf "export %s='%s'\n" "$k" "$(printf '%s' "$v" | sed "s/'/'\\\\''/g")"
+    [ -n "$v" ] && env_export "$k" "$v"
   done
+  # The box's bootstrap locators and generation (jump; harmlessly unset elsewhere).
+  # YOLO_DATUM_CREDENTIALS_JSON never goes here: `jump setup` writes it to a file.
+  [ -n "${YOLO_CONFIG_URL:-}" ] && env_export YOLO_CONFIG_URL "$YOLO_CONFIG_URL"
+  [ -n "${YOLO_BOX:-}" ] && env_export YOLO_BOX "$YOLO_BOX"
+  [ -n "${YOLO_GENERATION:-}" ] && env_export YOLO_GENERATION "$YOLO_GENERATION"
 } > /etc/agent/env
 chown "root:$GID_" /etc/agent/env && chmod 0640 /etc/agent/env
 unset AUTHORIZED_KEYS_B64 SSH_HOST_KEY_B64
 [ $JUMP = 1 ] && U=$U UID_=$UID_ GID_=$GID_ /bin/sh /bin/jump setup
+# jump setup has read the credentials; nothing started after this (dropbear,
+# dumbpipe, ws) inherits them. The early children above are run with -u.
+unset YOLO_DATUM_CREDENTIALS_JSON
 for k in $PROVIDER_KEYS; do case $k in ''|[0-9]*|*[!A-Za-z0-9_]*) ;; *) unset "$k" ;; esac; done
 
 # ws open/clone print the RAM path of the workspace; land the shell there.

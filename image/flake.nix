@@ -112,10 +112,13 @@
         pi = agents.pi;
       };
       busybox = pkgs.pkgsStatic.busybox;
-      base = [ rtk ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync ]);
-      # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in an
-      # ssh-agent behind ssh-agent-mux, shares tmux sessions between devices, and
-      # runs yolo and datumctl to launch Datum sandboxes.
+      base = [ rtk ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync tmux ]);
+      # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in one
+      # persistent ssh-agent that `jump setup` starts; a client logs in without
+      # forwarding its agent, and logins, tmux and held connections all use that
+      # agent. It reads its Config over HTTPS through `yolo cfg`, and runs yolo
+      # and datumctl to launch Datum sandboxes. ssh-keyscan comes with openssh;
+      # su, mount, tar and gzip are busybox applets, linked into /bin by mkRootfs.
       # The jump image's helper (`jump setup`, `jump login`), in that image only.
       jumpScript = pkgs.runCommand "jump" { } ''
         mkdir -p $out/bin
@@ -123,7 +126,7 @@
         chmod 0555 $out/bin/jump
       '';
       jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript ]
-        ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear dumbpipe tmux ssh-agent-mux ]);
+        ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear dumbpipe tmux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).
       locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" ]; };
