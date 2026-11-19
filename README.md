@@ -114,6 +114,9 @@ Each `YOLO_NAME` also reads the older `AGENT_SANDBOX_NAME`. A name marked
 | - | - |
 | `YOLO_DATUM_SESSION` | datumctl's active session (`USER@ENDPOINT`); new sessions record the one they were made in |
 | `YOLO_DATUM_PROJECT` | datumctl's active project (passed as `--project`); new sessions record the one they were made in |
+| `YOLO_DATUM_CREDENTIALS` | none; a service account's credentials JSON (mode 0600 or stricter) for `yolo cfg` on `datum://` Configs. Without it, `yolo cfg` uses `datumctl auth get-token` |
+| `YOLO_DATUM_API` | `https://api.datum.net`; the Datum API that `yolo cfg` talks to |
+| `YOLO_DATUM_AUTH` | `https://auth.datum.net`; the auth server whose token endpoint exchanges a service account's JWT |
 | `YOLO_DATUM_PULL_SECRET` (was `YOLO_PULL_SECRET`) | none: no `imagePullSecrets`, so the images must be public |
 | `YOLO_LOCATION` | `us-east-1` |
 | `YOLO_NETWORK` | `default` |

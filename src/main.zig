@@ -23,6 +23,9 @@ const datum = @import("datum.zig");
 const infra = @import("infra.zig");
 const images = @import("images.zig");
 const jump = @import("jump.zig");
+const config = @import("config.zig");
+const jwt = @import("jwt.zig");
+const datumapi = @import("datumapi.zig");
 
 const Ctx = util.Ctx;
 
@@ -105,6 +108,9 @@ pub const usage =
     \\  yolo jump BOX connect [--accept-new] [USER@]HOST[:PORT]
     \\                                    from jump box BOX, hold ssh -A to HOST (a host or one
     \\                                    of your sessions), reconnecting; attach to it
+    \\  yolo cfg get|put|list [--secret] [KEY]
+    \\                                    read, write (value on stdin) or list the entries of
+    \\                                    the Config at $YOLO_CONFIG_URL
     \\
     \\The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
     \\remembers its own. Backend options for `new`:
@@ -164,6 +170,7 @@ pub fn run(ctx: Ctx, args: []const [:0]const u8) u8 {
     if (rest.len == 1 and std.mem.eql(u8, first, "sync-pins")) return images.syncPins(ctx, root);
     if (rest.len > 0 and std.mem.eql(u8, first, "infra")) return infra.cmd(ctx, root, rest[1..]);
     if (rest.len > 0 and std.mem.eql(u8, first, "jump")) return jump.cmd(ctx, root, rest[1..]);
+    if (rest.len > 0 and std.mem.eql(u8, first, "cfg")) return config.cmd(ctx, rest[1..]);
     if (rest.len == 1 and is_version) {
         util.say(std.fmt.allocPrint(ctx.arena, "{s}", .{versionLine(ctx, root)}) catch "");
         return 0;
@@ -343,5 +350,8 @@ test {
     _ = images;
     _ = docker;
     _ = jump;
+    _ = config;
+    _ = jwt;
+    _ = datumapi;
     _ = @import("compat_test.zig");
 }
