@@ -82,6 +82,21 @@ pub fn patchBody(allocator: mem.Allocator, kind: Kind, key: []const u8, value: [
     return aw.toOwnedSlice();
 }
 
+/// The merge-patch body that removes one key from an existing object's `data`:
+/// a null value deletes the key under JSON merge-patch (RFC 7396).
+pub fn removeBody(allocator: mem.Allocator, key: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+    try s.objectField("data");
+    try s.beginObject();
+    try s.objectField(key);
+    try s.write(null);
+    try s.endObject();
+    try s.endObject();
+    return aw.toOwnedSlice();
+}
+
 /// The body that creates the object, with one key in `data`, for a POST to the
 /// collection when the object doesn't exist yet.
 pub fn createBody(allocator: mem.Allocator, kind: Kind, name: []const u8, key: []const u8, value: []const u8) ![]u8 {
@@ -368,6 +383,16 @@ test "patch body: a Secret value is base64, a ConfigMap value is an escaped stri
     try std.testing.expectEqualStrings(
         "{\"data\":{\"k\":\"a\\nb\\\"c\"}}",
         try patchBody(a, .plain, "k", "a\nb\"c"),
+    );
+}
+
+test "remove body sets the key to null in data" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "{\"data\":{\"ssh-key-abc\":null}}",
+        try removeBody(a, "ssh-key-abc"),
     );
 }
 
@@ -667,33 +692,29 @@ fn fetchObject(ctx: Ctx, client: *std.http.Client, token: []const u8, project: [
     return r;
 }
 
-/// `yolo cfg get`: the raw value of one entry.
-pub fn get(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8) u8 {
+/// `get` of one entry: its raw value, `missing` when the object or the key
+/// doesn't exist (a 404 or no such key), or the failure text.
+pub fn tryGet(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8) config.GetResult {
     var client: std.http.Client = undefined;
     defer client.deinit();
     const token = prepare(ctx, &client);
-    const r = fetchObject(ctx, &client, token, project, name, kind) orelse
-        util.dief("cfg: no {s} entry {s}", .{ kind.dirName(), key });
+    const url = objectUrl(ctx.arena, apiBase(ctx), project, kind, name) catch util.die("out of memory");
+    const r = send(ctx, &client, .GET, url, token, null, null);
+    if (r.status == 404) return .missing;
+    if (r.status != 200) {
+        const what = std.fmt.allocPrint(ctx.arena, "read {s} {s}", .{ kindName(kind), name }) catch util.die("out of memory");
+        return .{ .failed = failText(ctx, what, r) };
+    }
     const found = dataValue(ctx.arena, r.body, kind, key) catch
-        util.dief("cfg: can't read {s} {s}: not the JSON the API sends", .{ kindName(kind), name });
-    const value = found orelse util.dief("cfg: no {s} entry {s}", .{ kind.dirName(), key });
-    util.outRaw(value);
-    return 0;
-}
-
-/// `yolo cfg put`: set one entry, creating the object when it doesn't exist.
-/// The value is never printed.
-pub fn put(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8, value: []const u8) u8 {
-    checkValue(kind, value) catch
-        util.die("cfg: a plain entry must be valid UTF-8; use --secret for binary values");
-    if (tryPut(ctx, project, name, kind, key, value)) |msg| util.die(msg);
-    return 0;
+        return .{ .failed = std.fmt.allocPrint(ctx.arena, "cfg: can't read {s} {s}: not the JSON the API sends", .{ kindName(kind), name }) catch "cfg: can't read the object" };
+    return if (found) |v| .{ .value = v } else .missing;
 }
 
 /// `put` that returns its failure text instead of dying, for a caller that
 /// must clean up first. Null on success. The text never carries the value.
+/// Creates the object when it doesn't exist.
 pub fn tryPut(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8, value: []const u8) ?[]const u8 {
-    checkValue(kind, value) catch return "cfg: a plain entry must be valid UTF-8";
+    checkValue(kind, value) catch return "cfg: a plain entry must be valid UTF-8; use --secret for binary values";
     var client: std.http.Client = undefined;
     defer client.deinit();
     const token = prepare(ctx, &client);
@@ -708,6 +729,24 @@ pub fn tryPut(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: 
         // Another writer created it between the PATCH and the POST: patch it once more.
         if (r.status == 409) r = send(ctx, &client, .PATCH, url, token, merge_patch_type, patch);
     }
+    if (r.status < 200 or r.status > 299) {
+        const what = std.fmt.allocPrint(ctx.arena, "write {s} {s}", .{ kindName(kind), name }) catch util.die("out of memory");
+        return failText(ctx, what, r);
+    }
+    return null;
+}
+
+/// Remove one entry: a merge patch that nulls its key. A missing object has no
+/// such entry, so a 404 is success too. Null on success, else the failure text.
+pub fn tryRemove(ctx: Ctx, project: []const u8, name: []const u8, kind: Kind, key: []const u8) ?[]const u8 {
+    var client: std.http.Client = undefined;
+    defer client.deinit();
+    const token = prepare(ctx, &client);
+    const url = objectUrl(ctx.arena, apiBase(ctx), project, kind, name) catch util.die("out of memory");
+    const patch = removeBody(ctx.arena, key) catch util.die("out of memory");
+
+    const r = send(ctx, &client, .PATCH, url, token, merge_patch_type, patch);
+    if (r.status == 404) return null;
     if (r.status < 200 or r.status > 299) {
         const what = std.fmt.allocPrint(ctx.arena, "write {s} {s}", .{ kindName(kind), name }) catch util.die("out of memory");
         return failText(ctx, what, r);

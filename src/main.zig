@@ -108,9 +108,10 @@ pub const usage =
     \\  yolo jump BOX connect [--accept-new] [USER@]HOST[:PORT]
     \\                                    from jump box BOX, hold ssh -A to HOST (a host or one
     \\                                    of your sessions), reconnecting; attach to it
-    \\  yolo cfg get|put|list [--secret] [KEY]
-    \\                                    read, write (value on stdin) or list the entries of
-    \\                                    the Config at $YOLO_CONFIG_URL
+    \\  yolo cfg get|put|rm|list [--secret] [KEY]
+    \\                                    read, write (value on stdin), remove or list the entries
+    \\                                    of the Config at $YOLO_CONFIG_URL; get exits 3 when the
+    \\                                    entry is missing
     \\
     \\The backend defaults to $YOLO_BACKEND, else docker; after `new`, each session
     \\remembers its own. Backend options for `new`:

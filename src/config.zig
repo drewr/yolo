@@ -128,7 +128,7 @@ pub fn filePath(allocator: mem.Allocator, dir: []const u8, kind: Kind, key: []co
 }
 
 /// What `yolo cfg` does with an entry.
-pub const Op = enum { get, put, list };
+pub const Op = enum { get, put, rm, list };
 
 /// A parsed `yolo cfg` command. `key` is empty for `list`.
 pub const Cmd = struct {
@@ -137,17 +137,24 @@ pub const Cmd = struct {
     key: []const u8,
 };
 
-pub const usage = "usage: yolo cfg get [--secret] KEY | put [--secret] KEY | list [--secret]";
+/// The result of reading one entry: its value, that it doesn't exist, or why
+/// the read failed (a message that never carries the value).
+pub const GetResult = union(enum) { value: []const u8, missing, failed: []const u8 };
 
-/// The arguments after `cfg`: `get KEY`, `put KEY` or `list`, each with an
-/// optional `--secret` in any position (at most once). Null when malformed. The
-/// key's syntax is left to `validKey`, so the caller can name the bad key.
+pub const usage = "usage: yolo cfg get [--secret] KEY | put [--secret] KEY | rm [--secret] KEY | list [--secret]";
+
+/// The arguments after `cfg`: `get KEY`, `put KEY`, `rm KEY` or `list`, each
+/// with an optional `--secret` in any position (at most once). Null when
+/// malformed. The key's syntax is left to `validKey`, so the caller can name
+/// the bad key.
 pub fn parseArgs(args: []const []const u8) ?Cmd {
     if (args.len == 0) return null;
     const op: Op = if (mem.eql(u8, args[0], "get"))
         .get
     else if (mem.eql(u8, args[0], "put"))
         .put
+    else if (mem.eql(u8, args[0], "rm"))
+        .rm
     else if (mem.eql(u8, args[0], "list"))
         .list
     else
@@ -276,6 +283,13 @@ test "parseArgs: get, put and list, with --secret in any position" {
     try testing.expectEqual(Kind.plain, l.kind);
     try testing.expectEqualStrings("", l.key);
     try testing.expectEqual(Kind.secret, parseArgs(&.{ "list", "--secret" }).?.kind);
+    const r = parseArgs(&.{ "rm", "--secret", "k" }).?;
+    try testing.expectEqual(Op.rm, r.op);
+    try testing.expectEqual(Kind.secret, r.kind);
+    try testing.expectEqualStrings("k", r.key);
+    const r2 = parseArgs(&.{ "rm", "k" }).?;
+    try testing.expectEqual(Op.rm, r2.op);
+    try testing.expectEqual(Kind.plain, r2.kind);
 }
 
 test "parseArgs refuses malformed commands" {
@@ -290,6 +304,10 @@ test "parseArgs refuses malformed commands" {
         &.{ "get", "--secret", "--secret", "k" },
         &.{ "get", "--json", "k" },
         &.{ "get", "--" },
+        &.{"rm"},
+        &.{ "rm", "--secret" },
+        &.{ "rm", "k", "x" },
+        &.{ "rm", "--secret", "--secret", "k" },
     };
     for (bad) |a| {
         if (parseArgs(a) != null) return error.TestUnexpectedResult;
@@ -300,47 +318,124 @@ test "parseArgs refuses malformed commands" {
 // IO boundary — everything below does IO
 // ---------------------------------------------------------------------------
 
-/// `yolo cfg get|put|list`: the Config at YOLO_CONFIG_URL.
+/// A message for the caller, in the arena. Falls back to a fixed text when
+/// even the message can't be formatted.
+fn message(ctx: Ctx, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(ctx.arena, fmt, args) catch "cfg: out of memory";
+}
+
+fn keyMessage(ctx: Ctx, key: []const u8) []const u8 {
+    return message(ctx, "cfg: bad key '{s}': use 1 to 253 of a-z A-Z 0-9 - . _, not . or ..", .{key});
+}
+
+fn urlMessage(ctx: Ctx, url: []const u8) []const u8 {
+    return message(ctx, "cfg: bad config URL '{s}' (file:///DIR or datum://PROJECT/NAME)", .{url});
+}
+
+/// Read one entry of the Config at `url`. A bad URL or key comes back as
+/// `failed`; nothing here exits the process for them.
+pub fn getValue(ctx: Ctx, url: []const u8, kind: Kind, key: []const u8) GetResult {
+    const loc = parseUrl(url) orelse return .{ .failed = urlMessage(ctx, url) };
+    if (!validKey(key)) return .{ .failed = keyMessage(ctx, key) };
+    return switch (loc) {
+        .datum => |d| datumapi.tryGet(ctx, d.project, d.name, kind, key),
+        .file => |f| fileGet(ctx, f.dir, kind, key),
+    };
+}
+
+/// Set one entry of the Config at `url`, creating what it needs. Null on
+/// success, else the failure text. The value is never part of a message.
+pub fn putValue(ctx: Ctx, url: []const u8, kind: Kind, key: []const u8, value: []const u8) ?[]const u8 {
+    const loc = parseUrl(url) orelse return urlMessage(ctx, url);
+    if (!validKey(key)) return keyMessage(ctx, key);
+    return switch (loc) {
+        .datum => |d| datumapi.tryPut(ctx, d.project, d.name, kind, key, value),
+        .file => |f| filePut(ctx, f.dir, kind, key, value),
+    };
+}
+
+/// Remove one entry of the Config at `url`. Removing a missing entry succeeds.
+/// Null on success, else the failure text.
+pub fn removeValue(ctx: Ctx, url: []const u8, kind: Kind, key: []const u8) ?[]const u8 {
+    const loc = parseUrl(url) orelse return urlMessage(ctx, url);
+    if (!validKey(key)) return keyMessage(ctx, key);
+    return switch (loc) {
+        .datum => |d| datumapi.tryRemove(ctx, d.project, d.name, kind, key),
+        .file => |f| fileRemove(ctx, f.dir, kind, key),
+    };
+}
+
+/// `yolo cfg get|put|rm|list`: the Config at YOLO_CONFIG_URL.
 pub fn cmd(ctx: Ctx, args: []const []const u8) u8 {
     const c = parseArgs(args) orelse util.die(usage);
-    if (c.op != .list and !validKey(c.key))
-        util.dief("cfg: bad key '{s}': use 1 to 253 of a-z A-Z 0-9 - . _, not . or ..", .{c.key});
+    if (c.op != .list and !validKey(c.key)) util.die(keyMessage(ctx, c.key));
     const url = ctx.opt("CONFIG_URL", "");
     if (url.len == 0) util.die("cfg: YOLO_CONFIG_URL isn't set (in the environment or yolo.conf)");
     const loc = parseUrl(url) orelse
         util.dief("cfg: bad YOLO_CONFIG_URL '{s}' (file:///DIR or datum://PROJECT/NAME)", .{url});
-    return switch (loc) {
-        .datum => |d| switch (c.op) {
-            .get => datumapi.get(ctx, d.project, d.name, c.kind, c.key),
-            .put => datumapi.put(ctx, d.project, d.name, c.kind, c.key, readStdin(ctx)),
-            .list => datumapi.list(ctx, d.project, d.name, c.kind),
-        },
-        .file => |f| switch (c.op) {
-            .get => getFile(ctx, f.dir, c),
-            .put => putFile(ctx, f.dir, c),
-            .list => listFile(ctx, f.dir, c.kind),
+    return switch (c.op) {
+        .get => getCmd(ctx, url, c),
+        .put => putCmd(ctx, url, c),
+        .rm => rmCmd(ctx, url, c),
+        .list => switch (loc) {
+            .datum => |d| datumapi.list(ctx, d.project, d.name, c.kind),
+            .file => |f| listFile(ctx, f.dir, c.kind),
         },
     };
 }
 
-fn getFile(ctx: Ctx, dir: []const u8, c: Cmd) u8 {
-    const path = filePath(ctx.arena, dir, c.kind, c.key) catch util.die("out of memory");
+/// Print the value (exit 0), or exit 3 when the entry or its object doesn't
+/// exist, or exit 1 with the failure text.
+fn getCmd(ctx: Ctx, url: []const u8, c: Cmd) u8 {
+    switch (getValue(ctx, url, c.kind, c.key)) {
+        .value => |v| {
+            util.outRaw(v);
+            return 0;
+        },
+        .missing => {
+            util.errPrint("yolo: cfg: no {s} entry {s}\n", .{ c.kind.dirName(), c.key });
+            return 3;
+        },
+        .failed => |m| util.die(m),
+    }
+}
+
+fn putCmd(ctx: Ctx, url: []const u8, c: Cmd) u8 {
+    if (putValue(ctx, url, c.kind, c.key, readStdin(ctx))) |m| util.die(m);
+    return 0;
+}
+
+fn rmCmd(ctx: Ctx, url: []const u8, c: Cmd) u8 {
+    if (removeValue(ctx, url, c.kind, c.key)) |m| util.die(m);
+    return 0;
+}
+
+fn fileGet(ctx: Ctx, dir: []const u8, kind: Kind, key: []const u8) GetResult {
+    const path = filePath(ctx.arena, dir, kind, key) catch util.die("out of memory");
     const value = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .unlimited) catch |e| switch (e) {
-        error.FileNotFound => util.dief("cfg: no {s} entry {s}", .{ c.kind.dirName(), c.key }),
-        else => util.dief("cfg: can't read {s} entry {s}: {t}", .{ c.kind.dirName(), c.key, e }),
+        error.FileNotFound => return .missing,
+        else => return .{ .failed = message(ctx, "cfg: can't read {s} entry {s}: {t}", .{ kind.dirName(), key, e }) },
     };
-    util.outRaw(value);
-    return 0;
+    return .{ .value = value };
 }
 
-fn putFile(ctx: Ctx, dir: []const u8, c: Cmd) u8 {
-    const sub = util.join(ctx, &.{ dir, c.kind.dirName() });
-    ensureKindDir(ctx, sub, c.kind);
-    const target = filePath(ctx.arena, dir, c.kind, c.key) catch util.die("out of memory");
-    const value = readStdin(ctx);
-    writeAtomic(ctx, sub, target, c.kind.fileMode(), value) catch |e|
-        util.dief("cfg: can't write {s} entry {s}: {t}", .{ c.kind.dirName(), c.key, e });
-    return 0;
+fn filePut(ctx: Ctx, dir: []const u8, kind: Kind, key: []const u8, value: []const u8) ?[]const u8 {
+    const sub = util.join(ctx, &.{ dir, kind.dirName() });
+    if (ensureKindDir(ctx, sub, kind)) |m| return m;
+    const target = filePath(ctx.arena, dir, kind, key) catch util.die("out of memory");
+    writeAtomic(ctx, sub, target, kind.fileMode(), value) catch |e|
+        return message(ctx, "cfg: can't write {s} entry {s}: {t}", .{ kind.dirName(), key, e });
+    return null;
+}
+
+/// Delete an entry's file; a missing file is already removed.
+fn fileRemove(ctx: Ctx, dir: []const u8, kind: Kind, key: []const u8) ?[]const u8 {
+    const path = filePath(ctx.arena, dir, kind, key) catch util.die("out of memory");
+    std.Io.Dir.cwd().deleteFile(ctx.io, path) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return message(ctx, "cfg: can't remove {s} entry {s}: {t}", .{ kind.dirName(), key, e }),
+    };
+    return null;
 }
 
 fn listFile(ctx: Ctx, dir: []const u8, kind: Kind) u8 {
@@ -354,11 +449,12 @@ fn listFile(ctx: Ctx, dir: []const u8, kind: Kind) u8 {
 
 /// Create the kind's directory with its mode when it is missing (an existing
 /// one keeps whatever mode its owner gave it).
-fn ensureKindDir(ctx: Ctx, sub: []const u8, kind: Kind) void {
-    if (util.dirExists(ctx, sub)) return;
-    util.createDirPath(ctx, sub) catch |e| util.dief("cfg: can't create {s}: {t}", .{ sub, e });
+fn ensureKindDir(ctx: Ctx, sub: []const u8, kind: Kind) ?[]const u8 {
+    if (util.dirExists(ctx, sub)) return null;
+    util.createDirPath(ctx, sub) catch |e| return message(ctx, "cfg: can't create {s}: {t}", .{ sub, e });
     std.Io.Dir.cwd().setFilePermissions(ctx.io, sub, .fromMode(kind.dirMode()), .{}) catch |e|
-        util.dief("cfg: can't set the mode of {s}: {t}", .{ sub, e });
+        return message(ctx, "cfg: can't set the mode of {s}: {t}", .{ sub, e });
+    return null;
 }
 
 /// All of stdin, verbatim: the value is never trimmed.
