@@ -15,6 +15,7 @@ const json = @import("json.zig");
 const keys = @import("keys.zig");
 const session = @import("session.zig");
 const jumpbox = @import("jumpbox.zig");
+const brokerreg = @import("brokerreg.zig");
 const Ctx = util.Ctx;
 const mem = std.mem;
 
@@ -295,6 +296,9 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         box = b;
     }
 
+    // A sandbox launched from a jump box (YOLO_BROKER_* set by `jump login`)
+    // gets broker access; see brokerreg.zig.
+    const broker_env = brokerreg.envFrom(ctx, harness);
     const dir = session.create(ctx, name, "datum", harness);
     const wl = std.fmt.allocPrint(ctx.arena, "yolo-{s}", .{name}) catch util.die("out of memory");
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "class" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{cls}) catch "");
@@ -313,6 +317,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "iroh_secret" }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{hex}) catch "");
         break :blk hex;
     };
+    const proxy: ?ProxyKey = if (broker_env != null) proxyKey(ctx) else null;
     {
         const ticket = keys.endpointTicket(ctx.arena, d.relay, secret_hex) catch |e| switch (e) {
             error.RelayTooLong => util.die("relay URL too long"),
@@ -367,7 +372,8 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     const host_key = util.readFileMaybe(ctx, util.join(ctx, &.{ dir, "host_key" })) orelse "";
     const auth_b64 = util.b64encode(ctx.arena, authorized_text) catch util.die("out of memory");
     const host_b64 = util.b64encode(ctx.arena, host_key) catch util.die("out of memory");
-    if (applyError(ctx, "the session Secret", renderSecret(ctx.arena, wl, secret_hex_text, auth_b64, host_b64))) |msg|
+    const proxy_hex: ?[]const u8 = if (proxy) |p| p.hex else null;
+    if (applyError(ctx, "the session Secret", renderSecret(ctx.arena, wl, secret_hex_text, auth_b64, host_b64, proxy_hex))) |msg|
         abandon(ctx, wl, dir, box, msg);
 
     const providers = datumProviderKeyNames(ctx, d);
@@ -380,6 +386,10 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         (jumpbox.configUrl(ctx.arena, b.project, name) catch util.die("out of memory"))
     else
         null;
+    const jump_tokenizer = if (box) |b|
+        (jumpbox.tokenizerConfigUrl(ctx.arena, b.project, name) catch util.die("out of memory"))
+    else
+        "";
     if (applyError(ctx, "the Workload", renderWorkload(ctx.arena, d, .{
         .workload = wl,
         .name = name,
@@ -390,7 +400,22 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         .provider_keys = providers,
         .home = home,
         .jump_config = jump_config,
+        .jump_tokenizer = jump_tokenizer,
+        .broker = if (broker_env) |e| (if (proxy) |p| WorkloadInput.Broker{ .id = p.id, .ca_b64 = e.ca_b64 } else null) else null,
     }))) |msg| abandon(ctx, wl, dir, box, msg);
+
+    // The sandbox is in the broker's policy once its Config entries are written.
+    // A failure only costs the sandbox its broker access.
+    if (broker_env) |e| {
+        if (proxy) |p| {
+            util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, brokerreg.session_file }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{p.id}) catch "");
+            if (brokerreg.register(ctx, e.config_url, name, p.id)) |msg| {
+                util.warn("broker: could not register {s}: {s}; it has no broker access", .{ name, msg });
+            } else {
+                util.errPrint("broker: registered {s} ({s})\n", .{ name, p.id });
+            }
+        }
+    }
 
     util.errPrint("created {s} ({s}: {s}); waiting for SSH...\n", .{ wl, harness, image });
     const t0 = util.monoNow(ctx);
@@ -398,6 +423,20 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
     const n = util.secondsSince(ctx, t0);
     util.errPrint("ready after {d}s: yolo attach {s}\n", .{ n, name });
     return 0;
+}
+
+/// A sandbox's proxy key: the secret as hex (its Secret's YOLO_PROXY_SECRET_KEY)
+/// and the proxy's endpoint id, which the broker's policy names.
+const ProxyKey = struct { hex: []const u8, id: []const u8 };
+
+/// A new proxy key from the OS's random bytes.
+fn proxyKey(ctx: Ctx) ProxyKey {
+    var secret: [32]u8 = undefined;
+    util.randomBytes(ctx, &secret) catch util.die("can't get random bytes");
+    return .{
+        .hex = keys.hexSecret(ctx.arena, secret) catch util.die("out of memory"),
+        .id = brokerreg.endpointId(ctx.arena, secret) catch util.die("out of memory"),
+    };
 }
 
 fn waitForSsh(ctx: Ctx, d: Datum, name: []const u8, t0: std.Io.Timestamp) void {
@@ -534,6 +573,14 @@ pub fn datumRm(ctx: Ctx, d0: Datum, name: []const u8) u8 {
     }
     const wl = session.workload(ctx, dir, name);
     deleteSession(ctx, wl);
+    if (util.fileExists(ctx, util.join(ctx, &.{ dir, brokerreg.session_file }))) {
+        const url = ctx.opt("CONFIG_URL", "");
+        if (url.len == 0) {
+            util.warn("broker: YOLO_CONFIG_URL isn't set, so broker-sandbox.{s} is left in the broker's policy", .{name});
+        } else if (brokerreg.unregister(ctx, url, name)) |msg| {
+            util.warn("broker: could not unregister {s}: {s}", .{ name, msg });
+        }
+    }
     if (jump) {
         if (currentProject(ctx)) |project| {
             jumpbox.teardown(ctx, jumpbox.recorded(ctx, dir, name, project));
@@ -905,7 +952,10 @@ pub fn lookupImage(ctx: Ctx, file: []const u8, harness: []const u8) ?[]const u8 
 // The Secret and Workload YAML
 // ---------------------------------------------------------------------------
 
-pub fn renderSecret(allocator: mem.Allocator, wl: []const u8, secret_hex: []const u8, auth_b64: []const u8, host_b64: []const u8) []const u8 {
+/// The session Secret. `proxy_hex` is a broker sandbox's proxy secret key, which
+/// only those Secrets carry; null for every other session (their Secret is
+/// unchanged).
+pub fn renderSecret(allocator: mem.Allocator, wl: []const u8, secret_hex: []const u8, auth_b64: []const u8, host_b64: []const u8, proxy_hex: ?[]const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     out.print(allocator,
         \\apiVersion: v1
@@ -919,10 +969,19 @@ pub fn renderSecret(allocator: mem.Allocator, wl: []const u8, secret_hex: []cons
         \\  SSH_HOST_KEY_B64: "{s}"
         \\
     , .{ wl, secret_hex, auth_b64, host_b64 }) catch {};
+    if (proxy_hex) |p| {
+        out.print(allocator,
+            \\  YOLO_PROXY_SECRET_KEY: "{s}"
+            \\
+        , .{p}) catch {};
+    }
     return out.items;
 }
 
 pub const WorkloadInput = struct {
+    /// A broker sandbox's proxy endpoint id and the broker's CA (base64 of the PEM).
+    pub const Broker = struct { id: []const u8, ca_b64: []const u8 };
+
     workload: []const u8,
     name: []const u8,
     harness: []const u8,
@@ -933,6 +992,10 @@ pub const WorkloadInput = struct {
     home: bool,
     /// A jump box's YOLO_CONFIG_URL; null for other sessions.
     jump_config: ?[]const u8 = null,
+    /// A jump box's YOLO_TOKENIZER_CONFIG_URL; set together with jump_config.
+    jump_tokenizer: []const u8 = "",
+    /// A broker sandbox's settings; null for every other session.
+    broker: ?Broker = null,
 };
 
 pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []const u8 {
@@ -1001,8 +1064,13 @@ pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []c
     }
     if (in.jump_config) |url| {
         const config_name = jumpbox.configName(allocator, in.name) catch util.die("out of memory");
-        const env = jumpbox.envYaml(allocator, url, in.name, config_name) catch util.die("out of memory");
+        const env = jumpbox.envYaml(allocator, url, in.jump_tokenizer, in.name, config_name) catch util.die("out of memory");
         out.appendSlice(allocator, env) catch util.die("out of memory");
+    }
+    if (in.broker) |b| {
+        value(allocator, &out, "YOLO_BROKER_ID", show(allocator, b.id));
+        value(allocator, &out, "YOLO_BROKER_CA", show(allocator, b.ca_b64));
+        fromSecret(allocator, &out, in.workload, "YOLO_PROXY_SECRET_KEY");
     }
     out.print(allocator,
         \\      networkInterfaces:
@@ -1181,8 +1249,10 @@ test "renderWorkload adds a jump box's Config env only when it has a URL" {
     try testing.expect(mem.indexOf(u8, plain, "YOLO_CONFIG_URL") == null);
     var jump_input = test_input;
     jump_input.jump_config = "datum://proj-1/yolo-foo-config";
+    jump_input.jump_tokenizer = "datum://proj-1/yolo-foo-tokenizer";
     const jump = renderWorkload(a, testDatum(null), jump_input);
     try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_CONFIG_URL\n                  value: \"datum://proj-1/yolo-foo-config\"\n") != null);
+    try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_TOKENIZER_CONFIG_URL\n                  value: \"datum://proj-1/yolo-foo-tokenizer\"\n") != null);
     try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_BOX\n                  value: \"foo\"\n") != null);
     try testing.expect(mem.indexOf(u8, jump, "- name: YOLO_GENERATION\n                  value: \"1\"\n") != null);
     try testing.expect(mem.indexOf(u8, jump, "secretKeyRef: { name: yolo-foo-config, key: datum-credentials.json }") != null);
@@ -1212,6 +1282,41 @@ test "agentForwarded: a jump box's attach doesn't forward unless -A asks" {
     try testing.expect(!agentForwarded(true, true, &.{}));
     try testing.expect(!agentForwarded(true, true, &.{ "-o", "BatchMode=yes" }));
     try testing.expect(agentForwarded(true, true, &.{"-A"}));
+}
+
+test "renderSecret carries the proxy key only for a broker sandbox" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const plain = renderSecret(a, "yolo-foo", "aa", "bb", "cc", null);
+    try testing.expectEqualStrings(
+        "apiVersion: v1\nkind: Secret\nmetadata:\n  name: yolo-foo\ntype: Opaque\nstringData:\n" ++
+            "  IROH_SECRET: \"aa\"\n  AUTHORIZED_KEYS_B64: \"bb\"\n  SSH_HOST_KEY_B64: \"cc\"\n",
+        plain,
+    );
+    const broker = renderSecret(a, "yolo-foo", "aa", "bb", "cc", "dd");
+    try testing.expectEqualStrings(
+        try std.mem.concat(a, u8, &.{ plain, "  YOLO_PROXY_SECRET_KEY: \"dd\"\n" }),
+        broker,
+    );
+}
+
+test "renderWorkload gives a broker sandbox its broker env and proxy key" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const plain = renderWorkload(a, testDatum(null), test_input);
+    try testing.expect(mem.indexOf(u8, plain, "YOLO_BROKER") == null);
+    try testing.expect(mem.indexOf(u8, plain, "YOLO_PROXY_SECRET_KEY") == null);
+    var broker_input = test_input;
+    broker_input.broker = .{
+        .id = "a34699c4808c6f5465cd306f1734d1c6b636de2ecf25e9f670b3332c312a5c6f",
+        .ca_b64 = "Y2E=",
+    };
+    const yaml = renderWorkload(a, testDatum(null), broker_input);
+    try testing.expect(mem.indexOf(u8, yaml, "- name: YOLO_BROKER_ID\n                  value: \"a34699c4808c6f5465cd306f1734d1c6b636de2ecf25e9f670b3332c312a5c6f\"\n") != null);
+    try testing.expect(mem.indexOf(u8, yaml, "- name: YOLO_BROKER_CA\n                  value: \"Y2E=\"\n") != null);
+    try testing.expect(mem.indexOf(u8, yaml, "- name: YOLO_PROXY_SECRET_KEY\n                  valueFrom:\n                    secretKeyRef: { name: yolo-foo, key: YOLO_PROXY_SECRET_KEY }\n") != null);
 }
 
 test {

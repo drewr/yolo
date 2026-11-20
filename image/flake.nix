@@ -32,9 +32,16 @@
     # The yolo CLI, for the jump image, which launches sandboxes itself. Pinned
     # in flake.lock; bump it (`nix flake update yolo`) when the CLI changes.
     yolo.url = "github:drewr/yolo/feature-jump-box";
+    # The credential broker (yolo-broker, yolo-broker-proxy) and the tokenizer
+    # it runs beside. Not a relative path: Lix can't fetch those. Follows our
+    # nixpkgs so the images carry one glibc.
+    broker = {
+      url = "github:drewr/yolo/feature-jump-box?dir=broker";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, llm-agents, dotfiles, yolo }:
+  outputs = { self, nixpkgs, llm-agents, dotfiles, yolo, broker }:
   let
     # x86_64-linux for Datum Compute and Intel hosts; aarch64-linux for the
     # docker backend on Apple Silicon (podman machine / Docker Desktop VMs).
@@ -112,7 +119,9 @@
         pi = agents.pi;
       };
       busybox = pkgs.pkgsStatic.busybox;
-      base = [ rtk ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync tmux ]);
+      # Every harness image: the login tools, and yolo-broker-proxy, which
+      # init starts for a sandbox with a broker (yolo-broker rides along).
+      base = [ rtk broker.packages.${system}.yolo-broker ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync tmux ]);
       # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in one
       # persistent ssh-agent that `jump setup` starts; a client logs in without
       # forwarding its agent, and logins, tmux and held connections all use that
@@ -125,7 +134,8 @@
         cp ${./jump} $out/bin/jump
         chmod 0555 $out/bin/jump
       '';
-      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript ]
+      # The jump image also runs the broker and its tokenizer (on 127.0.0.1:8080).
+      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript broker.packages.${system}.yolo-broker broker.packages.${system}.tokenizer ]
         ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear dumbpipe tmux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).

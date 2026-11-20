@@ -26,6 +26,7 @@ const jump = @import("jump.zig");
 const config = @import("config.zig");
 const jwt = @import("jwt.zig");
 const datumapi = @import("datumapi.zig");
+const brokerreg = @import("brokerreg.zig");
 
 const Ctx = util.Ctx;
 
@@ -355,5 +356,6 @@ test {
     _ = config;
     _ = jwt;
     _ = datumapi;
+    _ = brokerreg;
     _ = @import("compat_test.zig");
 }

@@ -13,6 +13,9 @@
 #                  register NAME  an ssh Host entry for a yolo sandbox or any
 #                               host, from its connection details on stdin, and
 #                               recorded in Config (yolo jump BOX connect does both)
+#                  seal ID      the broker's secret ID: a tokenizer secret (JSON) on
+#                               stdin, sealed for the broker and stored in Config
+#                  rules        the broker's default rules for new sandboxes (TOML on stdin)
 #                  anything else, run by sh
 #
 # Agents: setup starts, as the login user and supervised,
@@ -34,9 +37,22 @@
 # YOLO_DATUM_CREDENTIALS_JSON) to $RUN, mode 0600, and points
 # YOLO_DATUM_CREDENTIALS at that file.
 #
-# JUMP_RUN and JUMP_ENV are overridable for tests only.
+# With the broker in the image (/bin/yolo-broker, /bin/tokenizer), setup also runs,
+# as root, the tokenizer (user yolo-tok) and the broker (user yolo-broker), both
+# supervised, with their store in /run/yolo-broker (a tmpfs). Their keys come from
+# Config and go only into their own environments. The store is rebuilt from the
+# broker-* entries of Config at each boot and whenever broker-gen changes.
+# broker/README.md has the layout.
+#
+# JUMP_RUN, JUMP_ENV, JUMP_BROKER_RUN and JUMP_BROKER_OWNER are overridable for
+# tests only.
 RUN=${JUMP_RUN:-/run/yolo}
 ENVF=${JUMP_ENV:-/etc/agent/env}
+BRUN=${JUMP_BROKER_RUN:-/run/yolo-broker}
+BSTORE=$BRUN/store
+BOWN=${JUMP_BROKER_OWNER:-yolo-broker:yolo-broker}
+TOK_ADDR=127.0.0.1:8080
+TOK_URL=http://$TOK_ADDR
 
 setup() {
   export PATH=/bin
@@ -77,6 +93,7 @@ setup() {
   # The Config address. init.sh has written it to the env file for logins; take
   # that line only, since the file also holds the provider keys.
   [ -n "${YOLO_CONFIG_URL:-}" ] || eval "$(sed -n '/^export YOLO_CONFIG_URL=/p' "$ENVF" 2>/dev/null)"
+  [ -n "${YOLO_TOKENIZER_CONFIG_URL:-}" ] || eval "$(sed -n '/^export YOLO_TOKENIZER_CONFIG_URL=/p' "$ENVF" 2>/dev/null)"
   if [ -n "${YOLO_DATUM_CREDENTIALS_JSON:-}" ]; then
     # The credentials are the box's own service account. The file is created
     # with umask 077 and owned by the login user, so it is never readable by
@@ -101,6 +118,9 @@ setup() {
   agent thismachine.sock "this machine's agent"
   echo "[jump] persistent agent on $RUN/persist.sock"
   restore_connections &
+  # Backgrounded: the open key and the store can wait out a network that is not up
+  # yet, and init.sh does not start sshd until setup returns.
+  broker &
 }
 
 # `yolo cfg list [--secret]` on stdout, retried with backoff (1s to 16s): the
@@ -154,6 +174,296 @@ restore_connections() {
   done
 }
 
+# The credential broker and its tokenizer (broker/README.md). Only where the image
+# ships them and the box has its Config. Each daemon runs as its own user, and a
+# key goes only into the environment of the process that needs it.
+broker_skip() { echo "[jump] WARNING: broker skipped: $*" >&2; }
+
+# `yolo cfg get` into V: URL [--secret] KEY. Returns 0 with V set, 3 when the entry
+# is missing, 1 when it gave up. Other failures (the network may not be up at boot)
+# are retried with backoff, 1s to 16s, as cfg_list does.
+cfg_fetch() {
+  [ -n "$1" ] || return 1
+  u=$1; shift
+  wait=1 n=0
+  while :; do
+    V=$(YOLO_CONFIG_URL=$u /bin/yolo cfg get "$@"); rc=$?
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then return "$rc"; fi
+    n=$((n + 1))
+    if [ "$n" -ge 6 ]; then echo "[jump] broker: can't read $* (rc=$rc)" >&2; return 1; fi
+    sleep "$wait"
+    wait=$((wait * 2))
+  done
+}
+
+# Stdin into Config as KEY: URL [--secret] KEY. Retried like cfg_fetch; 1 when it
+# can't store. The value is read once, so a retry stores the same bytes.
+cfg_put() {
+  [ -n "$1" ] || return 1
+  u=$1; shift
+  v=$(cat)
+  wait=1 n=0
+  until printf '%s\n' "$v" | YOLO_CONFIG_URL=$u /bin/yolo cfg put "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge 6 ]; then echo "[jump] broker: can't store $*" >&2; return 1; fi
+    sleep "$wait"
+    wait=$((wait * 2))
+  done
+}
+
+# 32 random bytes as 64 hex characters: an iroh secret key, or the open key.
+random_key() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+# A new broker-gen: the time and two random bytes, so a change is always new.
+broker_gen_bump() {
+  printf '%s-%s\n' "$(date +%s)" "$(head -c 2 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+}
+
+# Whether a passwd or group FILE has the numeric id $2 in its third field.
+id_taken() { awk -F: -v i="$2" '$3 == i { f = 1 } END { exit !f }' "$1"; }
+
+# A system user and group NAME with ID, appended unless NAME is already a user.
+add_account() {
+  grep -q "^$1:" /etc/passwd && return 0
+  if id_taken /etc/passwd "$2" || id_taken /etc/group "$2"; then
+    echo "[jump] broker: id $2 is taken; can't add $1" >&2
+    return 1
+  fi
+  grep -q "^$1:" /etc/group || echo "$1:x:$2:" >> /etc/group
+  echo "$1:x:$2:$2:$1:/nonexistent:/bin/false" >> /etc/passwd
+}
+
+broker_users() { add_account yolo-broker 990 && add_account yolo-tok 991; }
+
+# /run/yolo-broker: the store and the broker's files, in memory, owned by its user.
+broker_dir() {
+  if ! awk -v d="$BRUN" '$2 == d && $3 == "tmpfs" { f = 1 } END { exit !f }' /proc/mounts; then
+    mkdir -p "$BRUN" || return 1
+    mount -t tmpfs -o mode=0700,size=16m tmpfs "$BRUN" \
+      || { echo "[jump] broker: $BRUN is not in memory" >&2; return 1; }
+  fi
+  chown "$BOWN" "$BRUN" && chmod 700 "$BRUN"
+}
+
+# The tokenizer's open key into OPEN_KEY, from its own Config. A missing entry
+# (exit 3) makes a new key, stored before anything runs with it. Any other failure
+# gives up: a new key would make every sealed secret unreadable.
+open_key() {
+  cfg_fetch "$YOLO_TOKENIZER_CONFIG_URL" --secret open-key; rc=$?
+  if [ "$rc" -eq 0 ]; then OPEN_KEY=$V; return 0; fi
+  [ "$rc" -eq 3 ] || return 1
+  echo "[jump] broker: no tokenizer open key yet; making one"
+  OPEN_KEY=$(random_key)
+  printf '%s\n' "$OPEN_KEY" | cfg_put "$YOLO_TOKENIZER_CONFIG_URL" --secret open-key
+}
+
+# Unexport everything but PATH and the variables named in $1 (space-separated), in
+# the calling subshell: a daemon gets only what it needs, not setup's environment
+# (provider keys, credentials, the box's iroh key).
+only_env() {
+  for name in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+    case " PATH $1 " in *" $name "*) continue ;; esac
+    unset "$name" 2>/dev/null
+  done
+}
+
+# Run CMD as USER with su, restarted whenever it exits. The caller exports what CMD
+# needs inside its own subshell and names it in KEEP; nothing reaches a command line.
+supervise() { # LABEL USER CMD KEEP
+  (
+    only_env "$4"
+    while :; do
+      /bin/su "$2" -s /bin/sh -c "$3"
+      echo "[jump] $1 exited rc=$?; restarting"
+      sleep 2
+    done
+  ) &
+}
+
+# The tokenizer, as yolo-tok, on localhost. The open key is in its environment only.
+start_tokenizer() {
+  (
+    export OPEN_KEY LISTEN_ADDRESS=$TOK_ADDR
+    supervise tokenizer yolo-tok "exec /bin/tokenizer serve" "OPEN_KEY LISTEN_ADDRESS"
+  )
+}
+
+# The seal key (public) that `seal` seals to, stored as broker-seal-key. tokenizer
+# prints it on stderr only, as `export SEAL_KEY=HEX`.
+publish_seal_key() {
+  out=$(OPEN_KEY=$OPEN_KEY /bin/tokenizer sealkey 2>&1) || return 1
+  sk=$(printf '%s\n' "$out" | sed -n 's/^export SEAL_KEY=//p')
+  [ "${#sk}" -eq 64 ] || { echo "[jump] broker: tokenizer printed no seal key" >&2; return 1; }
+  printf '%s\n' "$sk" | cfg_put "$YOLO_CONFIG_URL" broker-seal-key
+}
+
+# The store's first boot: its CA, tokenizer password and iroh key are made once and
+# kept in Config. Only a missing broker-tokenizer-password (exit 3) starts that. Any
+# other failure gives up: a second init would replace the CA and password that the
+# sealed secrets depend on. The password is stored last, so its presence means the
+# rest is there.
+broker_first_boot() {
+  cfg_fetch "$YOLO_CONFIG_URL" --secret broker-tokenizer-password; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 3 ] || return 1
+  echo "[jump] broker: first boot; making its CA, tokenizer password and key"
+  d=$BRUN/init
+  rm -rf "$d"
+  (umask 077; mkdir "$d") || return 1
+  /bin/yolo-broker init --store "$d/store" --tokenizer-url "$TOK_URL" >/dev/null \
+    || { rm -rf "$d"; return 1; }
+  ca=$(cat "$d/store/ca.pem"); cak=$(cat "$d/store/ca.key"); pw=$(cat "$d/store/tokenizer-password")
+  bk=$(random_key)
+  printf '%s\n' "$ca" | cfg_put "$YOLO_CONFIG_URL" broker-ca.pem; rc=$?
+  [ "$rc" -eq 0 ] && { printf '%s\n' "$cak" | cfg_put "$YOLO_CONFIG_URL" --secret broker-ca.key; rc=$?; }
+  [ "$rc" -eq 0 ] && { printf '%s\n' "$bk" | cfg_put "$YOLO_CONFIG_URL" --secret broker-key; rc=$?; }
+  [ "$rc" -eq 0 ] && { printf '%s\n' "$pw" | cfg_put "$YOLO_CONFIG_URL" --secret broker-tokenizer-password; rc=$?; }
+  rm -rf "$d"
+  return "$rc"
+}
+
+# FILE becomes CONTENT, mode MODE, unless it already is. The new copy is written
+# beside it as a dot file and renamed into place, so a reader sees the old file or
+# the new one. Sets broker_changed=1 when it replaced the file.
+store_file() { # CONTENT FILE MODE
+  t=${2%/*}/.${2##*/}.tmp
+  (umask 077; printf '%s\n' "$1" > "$t") || { rm -f "$t"; return 1; }
+  if cmp -s "$t" "$2"; then rm -f "$t"; return 0; fi
+  if chmod "$3" "$t" && chown "$BOWN" "$t" && mv -f "$t" "$2"; then
+    broker_changed=1
+    return 0
+  fi
+  rm -f "$t"
+  return 1
+}
+
+# Config entry KEY (a secret when SECRET is 1) into the store file NAME, mode MODE.
+store_entry() { # SECRET KEY NAME MODE
+  if [ "$1" = 1 ]; then cfg_fetch "$YOLO_CONFIG_URL" --secret "$2"; else cfg_fetch "$YOLO_CONFIG_URL" "$2"; fi || return 1
+  store_file "$V" "$BSTORE/$3" "$4"
+}
+
+# policy.toml: every broker-sandbox.* entry, a blank line after each. Empty when
+# there are none. It fails rather than give a short policy, which would cut off
+# sandboxes that are still allowed.
+sandbox_policy() {
+  names=$(cfg_list) || return 1
+  for k in $names; do
+    case $k in broker-sandbox.*) ;; *) continue ;; esac
+    cfg_fetch "$YOLO_CONFIG_URL" "$k" || return 1
+    printf '%s\n\n' "$V"
+  done
+}
+
+# secrets/ID for every broker-secret.ID entry. A file whose entry is gone is removed.
+sync_secrets() {
+  names=$(cfg_list --secret) || return 1
+  keep=' '
+  for k in $names; do
+    case $k in broker-secret.*) ;; *) continue ;; esac
+    id=${k#broker-secret.}
+    valid_secret_id "$id" || { echo "[jump] broker: skipping $k: bad id" >&2; continue; }
+    cfg_fetch "$YOLO_CONFIG_URL" --secret "$k" || return 1
+    store_file "$V" "$BSTORE/secrets/$id" 600 || return 1
+    keep="$keep$id "
+  done
+  for f in "$BSTORE"/secrets/*; do
+    [ -e "$f" ] || continue
+    id=${f##*/}
+    case $keep in *" $id "*) ;; *) rm -f "$f" && broker_changed=1 ;; esac
+  done
+}
+
+# The whole store, from Config (broker/README.md, "Store"). Sets broker_changed=1
+# when any file changed, so the caller knows to reload the broker.
+broker_sync() {
+  broker_changed=0
+  mkdir -p "$BSTORE/secrets" || return 1
+  chown -R "$BOWN" "$BRUN" && chmod 700 "$BRUN" "$BSTORE" "$BSTORE/secrets" || return 1
+  store_entry 1 broker-tokenizer-password tokenizer-password 600 || return 1
+  store_entry 1 broker-ca.key ca.key 600 || return 1
+  store_entry 0 broker-ca.pem ca.pem 644 || return 1
+  store_file "$TOK_URL" "$BSTORE/tokenizer-url" 644 || return 1
+  pol=$(sandbox_policy) || return 1
+  store_file "$pol" "$BSTORE/policy.toml" 644 || return 1
+  sync_secrets
+}
+
+# The broker, as yolo-broker, on the store. Its iroh key comes from the environment,
+# so --key-file /dev/null is never read; if the variable were empty, serve would
+# fail on it rather than make a new key in the working directory.
+start_broker() {
+  (
+    export YOLO_BROKER_SECRET_KEY="$BKEY"
+    supervise yolo-broker yolo-broker "cd $BRUN && exec /bin/yolo-broker serve --store $BSTORE --key-file /dev/null --log-format text" "YOLO_BROKER_SECRET_KEY"
+  )
+}
+
+# broker-id into Config, and the broker's id and CA file for the login environment,
+# which `yolo new` on this box reads.
+publish_broker() {
+  id=$(YOLO_BROKER_SECRET_KEY=$BKEY /bin/yolo-broker id --key-file /dev/null) || return 1
+  printf '%s\n' "$id" | cfg_put "$YOLO_CONFIG_URL" broker-id || return 1
+  cfg_fetch "$YOLO_CONFIG_URL" broker-ca.pem || return 1
+  (umask 022; printf '%s\n' "$V" > "$RUN/broker-ca.pem") || return 1
+  chown "$UID_:$GID_" "$RUN/broker-ca.pem" && chmod 644 "$RUN/broker-ca.pem" || return 1
+  printf 'export YOLO_BROKER_ID=%s\n' "$id" >> "$ENVF"
+  printf 'export YOLO_BROKER_CA_FILE=%s\n' "$RUN/broker-ca.pem" >> "$ENVF"
+}
+
+reload_broker() {
+  for p in $(pidof yolo-broker); do kill -HUP "$p"; done
+  echo "[jump] broker: store changed; reloaded"
+}
+
+# Every 10 s, when broker-gen changes: rebuild the store, and reload the broker if
+# a file changed. A failed sync keeps the last seen gen, so it is retried.
+broker_poll() {
+  (
+    seen=
+    while :; do
+      sleep 10
+      g=$(YOLO_CONFIG_URL=$YOLO_CONFIG_URL /bin/yolo cfg get broker-gen 2>/dev/null) || continue
+      [ "$g" = "$seen" ] && continue
+      if broker_sync; then
+        seen=$g
+        if [ "$broker_changed" = 1 ]; then reload_broker; fi
+      else
+        echo "[jump] broker: store not synced; retrying in 10s" >&2
+      fi
+    done
+  ) &
+}
+
+broker() {
+  if [ ! -x /bin/yolo-broker ] || [ ! -x /bin/tokenizer ]; then
+    echo "[jump] broker: not in this image; skipped"
+    return 0
+  fi
+  if [ -z "${YOLO_CONFIG_URL:-}" ] || [ -z "${YOLO_TOKENIZER_CONFIG_URL:-}" ]; then
+    echo "[jump] broker: needs YOLO_CONFIG_URL and YOLO_TOKENIZER_CONFIG_URL; skipped"
+    return 0
+  fi
+  if ! broker_users || ! broker_dir || ! open_key; then
+    broker_skip "users, $BRUN or the open key (see above)"
+    return 0
+  fi
+  start_tokenizer
+  publish_seal_key || echo "[jump] WARNING: broker-seal-key not stored; seal won't work until the next boot" >&2
+  broker_first_boot; rc=$?
+  [ "$rc" -eq 0 ] && { cfg_fetch "$YOLO_CONFIG_URL" --secret broker-key; rc=$?; }
+  if [ "$rc" -ne 0 ]; then
+    broker_skip "the broker's key (see above)"
+    return 0
+  fi
+  BKEY=$V
+  broker_sync || { broker_skip "the store (see above)"; return 0; }
+  start_broker
+  publish_broker || echo "[jump] WARNING: broker-id or the CA file not published" >&2
+  unset OPEN_KEY BKEY V
+  broker_poll
+}
+
 login() {
   # shellcheck disable=SC1090  # the session environment written by init.sh
   [ -r "$ENVF" ] && . "$ENVF"
@@ -168,6 +478,8 @@ login() {
     load)      load ;;
     "connect "*)  connect "${SSH_ORIGINAL_COMMAND#connect }" ;;
     "register "*) register "${SSH_ORIGINAL_COMMAND#register }" ;;
+    "seal "*)  seal "${SSH_ORIGINAL_COMMAND#seal }" ;;
+    rules)     rules ;;
     *)         /bin/sh -c "$SSH_ORIGINAL_COMMAND" ;;
   esac
   exit $?
@@ -335,6 +647,45 @@ register_local() {
   fi
   chmod 600 "$HOME/.ssh/config"
   echo "registered $1 (${ticket:+iroh}${host:+$host${port:+:$port}})"
+}
+
+# Valid as crates/broker/src/policy.rs valid_secret_id: 1 to 64 of [A-Za-z0-9_.-],
+# not starting with a dot. A secret id names a file in the store.
+valid_secret_id() {
+  case $1 in ''|.*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+  [ "${#1}" -le 64 ]
+}
+
+# `ssh BOX seal ID < SECRET.json`: seal a tokenizer secret for the broker and store
+# it in Config as broker-secret.ID, then bump broker-gen so the broker reloads.
+seal() {
+  valid_secret_id "$1" || { echo "jump seal: bad id '$1'" >&2; return 2; }
+  ( seal_secret "$1" )
+}
+
+# The JSON on stdin goes straight to yolo-broker seal, in a throwaway store on $RUN
+# that is removed on every exit. None of it reaches a command line.
+seal_secret() { # ID
+  d=$RUN/seal.$$
+  trap 'rm -rf "$d"' EXIT
+  trap 'exit 1' HUP INT TERM
+  (umask 077; mkdir -p "$d/secrets") || return 1
+  cfg_fetch "$YOLO_CONFIG_URL" --secret broker-tokenizer-password || {
+    echo "jump seal: the broker isn't set up on this box" >&2; return 1; }
+  (umask 077; printf '%s\n' "$V" > "$d/tokenizer-password") || return 1
+  cfg_fetch "$YOLO_CONFIG_URL" broker-seal-key || { echo "jump seal: no seal key yet" >&2; return 1; }
+  /bin/yolo-broker seal --seal-key "$V" --store "$d" --id "$1" --json-file - >/dev/null || {
+    echo "jump seal: yolo-broker refused the secret" >&2; return 1; }
+  cfg_put "$YOLO_CONFIG_URL" --secret "broker-secret.$1" < "$d/secrets/$1" || return 1
+  broker_gen_bump | cfg_put "$YOLO_CONFIG_URL" broker-gen || return 1
+  echo "sealed $1"
+}
+
+# `ssh BOX rules < RULES.toml`: the default rules for new sandboxes (broker-rules).
+rules() {
+  v=$(cat)
+  [ -n "$v" ] || { echo "jump rules: empty" >&2; return 2; }
+  printf '%s\n' "$v" | cfg_put "$YOLO_CONFIG_URL" broker-rules && echo "jump rules: stored"
 }
 
 case ${1:-} in

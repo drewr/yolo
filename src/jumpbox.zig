@@ -65,6 +65,17 @@ pub fn configUrl(allocator: mem.Allocator, project: []const u8, name: []const u8
     return std.fmt.allocPrint(allocator, "datum://{s}/yolo-{s}-config", .{ project, name });
 }
 
+/// The name of the tokenizer's own Config: its Secret, which root creates on the
+/// box at first boot.
+pub fn tokenizerConfigName(allocator: mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "yolo-{s}-tokenizer", .{name});
+}
+
+/// YOLO_TOKENIZER_CONFIG_URL for the box: datum://PROJECT/yolo-NAME-tokenizer.
+pub fn tokenizerConfigUrl(allocator: mem.Allocator, project: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "datum://{s}/yolo-{s}-tokenizer", .{ project, name });
+}
+
 /// The namespace that holds a project's PolicyBindings in the organization.
 pub fn organizationNamespace(allocator: mem.Allocator, org: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "organization-{s}", .{org});
@@ -144,11 +155,20 @@ pub fn configMapManifest(allocator: mem.Allocator, config_name: []const u8) ![]u
 }
 
 /// The Workload env items a jump box adds, at the indentation renderWorkload
-/// uses: its Config's URL, its name, the deployment generation, and the
-/// credentials JSON from the Config's Secret. YOLO_USER comes from renderWorkload.
-pub fn envYaml(allocator: mem.Allocator, config_url: []const u8, name: []const u8, config_name: []const u8) ![]u8 {
+/// uses: its Config's URL, the tokenizer's Config URL, its name, the deployment
+/// generation, and the credentials JSON from the Config's Secret. YOLO_USER comes
+/// from renderWorkload.
+pub fn envYaml(
+    allocator: mem.Allocator,
+    config_url: []const u8,
+    tokenizer_url: []const u8,
+    name: []const u8,
+    config_name: []const u8,
+) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\                - name: YOLO_CONFIG_URL
+        \\                  value: "{s}"
+        \\                - name: YOLO_TOKENIZER_CONFIG_URL
         \\                  value: "{s}"
         \\                - name: YOLO_BOX
         \\                  value: "{s}"
@@ -158,7 +178,7 @@ pub fn envYaml(allocator: mem.Allocator, config_url: []const u8, name: []const u
         \\                  valueFrom:
         \\                    secretKeyRef: {{ name: {s}, key: {s} }}
         \\
-    , .{ config_url, name, config_name, credentials_key });
+    , .{ config_url, tokenizer_url, name, config_name, credentials_key });
 }
 
 /// The organization a project belongs to, from `datumctl whoami`'s Context line
@@ -244,6 +264,7 @@ pub const Box = struct {
     sa: []const u8,
     binding: []const u8,
     config: []const u8,
+    tokenizer: []const u8,
 };
 
 /// One datumctl call: its success, its output (may hold a credential, so never
@@ -285,11 +306,12 @@ pub fn orgOf(ctx: Ctx, project: []const u8) ?[]const u8 {
 }
 
 /// The names a box of this session name and project gets.
-fn namesFor(ctx: Ctx, name: []const u8, project: []const u8) struct { sa: []const u8, binding: []const u8, config: []const u8 } {
+fn namesFor(ctx: Ctx, name: []const u8, project: []const u8) struct { sa: []const u8, binding: []const u8, config: []const u8, tokenizer: []const u8 } {
     return .{
         .sa = fmt(ctx, "jump-{s}", .{name}),
         .binding = fmt(ctx, "jump-{s}-{s}", .{ name, project }),
         .config = fmt(ctx, "yolo-{s}-config", .{name}),
+        .tokenizer = fmt(ctx, "yolo-{s}-tokenizer", .{name}),
     };
 }
 
@@ -303,7 +325,7 @@ pub fn plan(ctx: Ctx, name: []const u8, project: []const u8) Box {
         .{project},
     );
     const n = namesFor(ctx, name, project);
-    return .{ .name = name, .project = project, .org = org, .sa = n.sa, .binding = n.binding, .config = n.config };
+    return .{ .name = name, .project = project, .org = org, .sa = n.sa, .binding = n.binding, .config = n.config, .tokenizer = n.tokenizer };
 }
 
 /// The box a session recorded (its `jump_org`, `jump_sa` and `jump_binding`
@@ -319,6 +341,7 @@ pub fn recorded(ctx: Ctx, dir: []const u8, name: []const u8, project: []const u8
         .sa = util.readMeta(ctx, util.join(ctx, &.{ dir, "jump_sa" }), n.sa),
         .binding = util.readMeta(ctx, util.join(ctx, &.{ dir, "jump_binding" }), n.binding),
         .config = n.config,
+        .tokenizer = n.tokenizer,
     };
 }
 
@@ -415,10 +438,12 @@ fn remove(ctx: Ctx, label: []const u8, argv: []const []const u8) void {
 }
 
 /// Take the box's objects down, in reverse order of creation: the Config, the
-/// PolicyBinding, the keys, the ServiceAccount. Missing objects are fine.
+/// tokenizer's Secret, the PolicyBinding, the keys, the ServiceAccount. Missing
+/// objects are fine.
 pub fn teardown(ctx: Ctx, b: Box) void {
     remove(ctx, fmt(ctx, "ConfigMap {s}", .{b.config}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "configmap", b.config }));
     remove(ctx, fmt(ctx, "Secret {s}", .{b.config}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "secret", b.config }));
+    remove(ctx, fmt(ctx, "Secret {s}", .{b.tokenizer}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "secret", b.tokenizer }));
 
     if (b.org.len == 0) {
         util.warn("can't tell the organization of {s}, so PolicyBinding {s} is left in place", .{ b.project, b.binding });
@@ -464,6 +489,14 @@ test "names: the service account, Config, binding and Config URL" {
     try testing.expectEqualStrings("organization-org-1", try organizationNamespace(a, "org-1"));
 }
 
+test "names: the tokenizer's Config name and URL" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("yolo-box-tokenizer", try tokenizerConfigName(a, "box"));
+    try testing.expectEqualStrings("datum://proj-1/yolo-box-tokenizer", try tokenizerConfigUrl(a, "proj-1", "box"));
+}
+
 test "service account manifest" {
     var arena = testArena();
     defer arena.deinit();
@@ -507,11 +540,12 @@ test "ConfigMap manifest" {
     try testing.expectEqualStrings("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: yolo-box-config\n", m);
 }
 
-test "env items: the Config URL, the box name, generation 1, and the credentials from the Config Secret" {
+test "env items: the Config URLs, the box name, generation 1, and the credentials from the Config Secret" {
     var arena = testArena();
     defer arena.deinit();
-    const e = try envYaml(arena.allocator(), "datum://proj-1/yolo-box-config", "box", "yolo-box-config");
+    const e = try envYaml(arena.allocator(), "datum://proj-1/yolo-box-config", "datum://proj-1/yolo-box-tokenizer", "box", "yolo-box-config");
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_CONFIG_URL\n                  value: \"datum://proj-1/yolo-box-config\"\n") != null);
+    try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_TOKENIZER_CONFIG_URL\n                  value: \"datum://proj-1/yolo-box-tokenizer\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_BOX\n                  value: \"box\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_GENERATION\n                  value: \"1\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_DATUM_CREDENTIALS_JSON\n                  valueFrom:\n                    secretKeyRef: { name: yolo-box-config, key: datum-credentials.json }\n") != null);

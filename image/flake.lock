@@ -1,5 +1,28 @@
 {
   "nodes": {
+    "broker": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "dir": "broker",
+        "lastModified": 1795136677,
+        "narHash": "sha256-e1i8XKUVBZb0bzqpcDtjxYapmEGgsdQJMMMOAP1wsNw=",
+        "owner": "drewr",
+        "repo": "yolo",
+        "rev": "a5d1d4742e784fd80e0e881966d240055e410007",
+        "type": "github"
+      },
+      "original": {
+        "dir": "broker",
+        "owner": "drewr",
+        "ref": "feature-jump-box",
+        "repo": "yolo",
+        "type": "github"
+      }
+    },
     "bun2nix": {
       "inputs": {
         "flake-parts": [
@@ -161,6 +184,7 @@
     },
     "root": {
       "inputs": {
+        "broker": "broker",
         "dotfiles": "dotfiles",
         "llm-agents": "llm-agents",
         "nixpkgs": "nixpkgs_2",

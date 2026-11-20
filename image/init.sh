@@ -30,6 +30,9 @@
 #   YOLO_USER            the login user's name (both modes). The image's user is a
 #                        placeholder, renamed to this at boot; it must be a portable
 #                        username and not root, or the placeholder stays.
+#   YOLO_BROKER_ID       the credential broker's endpoint id (not jump harness). With
+#   YOLO_BROKER_CA       the broker CA (PEM, base64) and YOLO_PROXY_SECRET_KEY (the
+#   YOLO_PROXY_SECRET_KEY proxy's own key, hex), see broker_setup. Never written out.
 # Shared home (optional; all from the shared Secret agent-home):
 #   META_TICKET          dumbpipe ticket for the JuiceFS metadata Redis
 #   META_URL             redis://:<password>@127.0.0.1:6379/1, through that tunnel
@@ -38,6 +41,12 @@
 # Programs run by absolute path: Unikraft's execve does no PATH search (H14).
 export PATH=/bin
 export HOME=/root
+# The broker's proxy key and CA are kept in unexported shell variables and removed
+# from the environment here, before any child starts, so no child inherits them.
+# broker_setup hands the key to the proxy alone.
+BROKER_KEY=${YOLO_PROXY_SECRET_KEY:-}
+BROKER_CA=${YOLO_BROKER_CA:-}
+unset YOLO_PROXY_SECRET_KEY YOLO_BROKER_CA
 log() { echo "[agent] $*"; }
 MODE=${YOLO_MODE:-datum}
 JUMP=0
@@ -81,6 +90,56 @@ UID_=$(/bin/id -u "$U")
 GID_=$(/bin/id -g "$U")
 as_user() { /bin/su "$U" -s /bin/sh -c "$1"; }
 
+# The credential broker (datum, not jump): a loopback CONNECT proxy, run as its own
+# user (yolo-proxy, so the login user cannot read its environment), which sends
+# allowed hosts to the broker on the jump box (broker/README.md). Sets BROKER=1
+# once the proxy's supervisor runs. The key comes from BROKER_KEY (captured at the
+# top) and reaches the proxy's environment only: no file, the env file or a log
+# line. env -i gives the proxy nothing else. A CA that is missing or doesn't
+# decode skips the setup, and TLS stays as it was.
+BROKER=0
+broker_setup() {
+  [ "$JUMP" = 0 ] && [ -n "${YOLO_BROKER_ID:-}" ] && [ -n "$BROKER_KEY" ] || return 0
+  sys=/etc/ssl/certs/ca-certificates.crt
+  bundle=/etc/agent/ca-bundle.pem
+  ca=/etc/agent/broker-ca.pem
+  if ! printf '%s' "$BROKER_CA" | /bin/base64 -d > "$ca" 2>/dev/null \
+     || ! /bin/grep -q 'BEGIN CERTIFICATE' "$ca"; then
+    rm -f "$ca"
+    log "broker: YOLO_BROKER_CA is not a base64 PEM certificate; no proxy"
+    return 0
+  fi
+  if [ ! -r "$sys" ] || ! { /bin/cat "$sys"; printf '\n'; /bin/cat "$ca"; } > "$bundle"; then
+    rm -f "$ca" "$bundle"
+    log "broker: cannot write the CA bundle; no proxy"
+    return 0
+  fi
+  chmod 0644 "$ca" "$bundle"
+  # The proxy's own user: no home, no login shell.
+  /bin/grep -q '^yolo-proxy:' /etc/group || echo 'yolo-proxy:x:992:' >> /etc/group
+  /bin/grep -q '^yolo-proxy:' /etc/passwd \
+    || echo 'yolo-proxy:x:992:992:yolo-proxy:/nonexistent:/bin/false' >> /etc/passwd
+  (
+    # Only these four reach the proxy. The key goes through the environment,
+    # never a command line: /proc/PID/cmdline is world-readable.
+    id=$YOLO_BROKER_ID
+    for name in $(/bin/env | /bin/sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$name" 2>/dev/null
+    done
+    # shellcheck disable=SC2030  # meant for this subshell only
+    export PATH=/bin HOME=/nonexistent YOLO_BROKER_ID="$id" YOLO_PROXY_SECRET_KEY="$BROKER_KEY"
+    while :; do
+      # shellcheck disable=SC2016  # $YOLO_BROKER_ID expands in the proxy's shell
+      /bin/su yolo-proxy -s /bin/sh -c 'exec /bin/yolo-broker-proxy run --broker "$YOLO_BROKER_ID"'
+      log "broker proxy exited rc=$?; restarting"
+      sleep 2
+    done
+  ) &
+  BROKER=1
+  # shellcheck disable=SC2031  # the subshell's export is meant to stay there
+  log "broker: proxy for $YOLO_BROKER_ID on 127.0.0.1:3128"
+}
+
 # nix: register the store paths shipped in the image (the store database lives
 # on the RAM overlay and starts empty), then run the daemon the user talks to.
 if [ $JUMP = 0 ] && [ -s /etc/agent/nix-registration ] && [ ! -e /nix/var/nix/db/db.sqlite ]; then
@@ -102,6 +161,9 @@ if [ "$MODE" = datum ]; then
   /bin/ip addr add 127.0.0.1/8 dev lo
   /bin/ip -6 addr add ::1/128 dev lo
   [ -n "$SESSION_NAME" ] && /bin/hostname "$SESSION_NAME"
+
+  # The broker proxy binds loopback, so it starts after lo is up.
+  broker_setup
 
   # SSH keys: dropbear -D reads authorized_keys from /etc/agent/ssh for every
   # user, so the session's keys stay out of the shared home.
@@ -197,6 +259,17 @@ env_export() {
   [ -n "${YOLO_CONFIG_URL:-}" ] && env_export YOLO_CONFIG_URL "$YOLO_CONFIG_URL"
   [ -n "${YOLO_BOX:-}" ] && env_export YOLO_BOX "$YOLO_BOX"
   [ -n "${YOLO_GENERATION:-}" ] && env_export YOLO_GENERATION "$YOLO_GENERATION"
+  # The broker proxy and CA trust (broker_setup). Later lines win, so these
+  # override SSL_CERT_FILE above. The proxy key is never written here.
+  if [ "$BROKER" = 1 ]; then
+    env_export HTTPS_PROXY http://127.0.0.1:3128
+    env_export https_proxy http://127.0.0.1:3128
+    env_export SSL_CERT_FILE /etc/agent/ca-bundle.pem
+    env_export REQUESTS_CA_BUNDLE /etc/agent/ca-bundle.pem
+    env_export CURL_CA_BUNDLE /etc/agent/ca-bundle.pem
+    env_export GIT_SSL_CAINFO /etc/agent/ca-bundle.pem
+    env_export NODE_EXTRA_CA_CERTS /etc/agent/broker-ca.pem
+  fi
 } > /etc/agent/env
 chown "root:$GID_" /etc/agent/env && chmod 0640 /etc/agent/env
 unset AUTHORIZED_KEYS_B64 SSH_HOST_KEY_B64
