@@ -34,8 +34,9 @@
 # restart: the keys (ssh-key-FINGERPRINT, secret) from load, and the
 # connections (conn.NAME) from register. Without it, both stay in memory only.
 # On Datum, setup writes the box's service-account credentials (from
-# YOLO_DATUM_CREDENTIALS_JSON) to $RUN, mode 0600, and points
-# YOLO_DATUM_CREDENTIALS at that file.
+# YOLO_DATUM_CREDENTIALS_JSON) to $RUN, mode 0600, points
+# YOLO_DATUM_CREDENTIALS at that file, and logs datumctl in with it as the login
+# user, in the project of YOLO_CONFIG_URL and the organization of YOLO_DATUM_ORG.
 #
 # With the broker in the image (/bin/yolo-broker, /bin/tokenizer), setup also runs,
 # as root, the tokenizer (user yolo-tok) and the broker (user yolo-broker), both
@@ -53,6 +54,41 @@ BSTORE=$BRUN/store
 BOWN=${JUMP_BROKER_OWNER:-yolo-broker:yolo-broker}
 TOK_ADDR=127.0.0.1:8080
 TOK_URL=http://$TOK_ADDR
+
+# A Datum organization or project name: non-empty, of [A-Za-z0-9._-].
+valid_datum_name() {
+  case $1 in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+}
+
+# datumctl for the login user, as the box's service account, in the box's project:
+# `yolo new` on this box runs datumctl as that user. The config goes in the login
+# user's HOME, which must be in memory: a shared home (JuiceFS) would keep the
+# credentials. Quiet on success, never fatal, and datumctl's output is dropped
+# since it may hold tokens. CREDENTIALS is the file setup wrote.
+datum_login() { # CREDENTIALS
+  h=$(awk -F: -v u="$U" '$1 == u { print $6; exit }' /etc/passwd)
+  org=${YOLO_DATUM_ORG:-}
+  project=${YOLO_CONFIG_URL#datum://}
+  project=${project%%/*}
+  if ! valid_datum_name "$org" || ! valid_datum_name "$project"; then
+    echo "[jump] datum: no organization or project to log $U in to (YOLO_DATUM_ORG, YOLO_CONFIG_URL); datumctl isn't logged in" >&2
+    return 0
+  fi
+  case $h in
+    ''|/)
+      echo "[jump] datum: $U has no home; datumctl isn't logged in" >&2
+      return 0 ;;
+  esac
+  case $(readlink -f "$h") in
+    /mnt/agent-fs|/mnt/agent-fs/*)
+      echo "[jump] datum: $U's home is the shared home, not memory; datumctl isn't logged in" >&2
+      return 0 ;;
+  esac
+  if ! as_user "HOME=$h datumctl login --credentials $1 >/dev/null 2>&1 && HOME=$h datumctl ctx use $org/$project >/dev/null 2>&1"; then
+    echo "[jump] datum: datumctl login or ctx use failed for $U; yolo new on this box won't reach Datum" >&2
+  fi
+  return 0
+}
 
 setup() {
   export PATH=/bin
@@ -105,6 +141,7 @@ setup() {
       export YOLO_DATUM_CREDENTIALS="$c"
       printf 'export YOLO_DATUM_CREDENTIALS=%s\n' "$c" >> "$ENVF"
       echo "[jump] datum: credentials for the box's service account are in $RUN"
+      datum_login "$c"
     else
       echo "[jump] datum: can't write the credentials to $RUN; Config won't work" >&2
     fi
