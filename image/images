@@ -2,9 +2,9 @@
 # yolo new NAME --backend datum --agent HARNESS.
 # Rebuild on the EC2 build box with: yolo build HARNESS --backend datum
 # (rewrites that harness's line).
-jump      ghcr.io/drewr/agent-jump@sha256:fcca0824b9a5c9a528c91a3abadf3734a0b5903965c48f6297fbd7f2454abd03
-claude    ghcr.io/drewr/agent-claude@sha256:b365d335b66328d2978823a6fa093f006aa7af92a700005b40ba9bdabad828e2
-gemini    ghcr.io/drewr/agent-gemini@sha256:c6068fe0b3f0d940a9a6a282a06cc8c55b62654fdc45d83d1b00a99965a99041
-codex     ghcr.io/drewr/agent-codex@sha256:7f62d8509d9bfb8da5f0b81027ca07fabad27f147470ddf81dcff8047825433d
-opencode  ghcr.io/drewr/agent-opencode@sha256:407df9fa876d0917783796a06f8a07e28ed788ebbb4a962077f29d34d37c461e
-pi        ghcr.io/drewr/agent-pi@sha256:06f30c15e9900980650de7cff878ccc16b4a9d10e06b56d307437c6ffa6b734a
+jump      ghcr.io/drewr/agent-jump@sha256:ff2e63941eb6bbce8a8bbd28952117f868f37792c899fea306505af8d72ae48e
+claude    ghcr.io/drewr/agent-claude@sha256:2ee6cf5ac8956dfba416e400f3bff194f2a99d41ee9e48ed82219c745661912c
+gemini    ghcr.io/drewr/agent-gemini@sha256:444961a4f9da463b28a6d277f394d8119e0f6eacd7014e6bad9fad3dbf971f07
+codex     ghcr.io/drewr/agent-codex@sha256:81f926c0add47e39e8bbba85399f9026c960854ff12d1fde902d8c4333170c1f
+opencode  ghcr.io/drewr/agent-opencode@sha256:7b914234eca5d5c250737107bc6daded3ad008cf91f7aba7a9e171c60b5c4e50
+pi        ghcr.io/drewr/agent-pi@sha256:e4dfc78a64c15db3016e2ba191a84af67f60cfa54b15b2445efd3b6f9f70f47c

@@ -31,7 +31,7 @@
     dotfiles = { url = "github:drewr/yolo"; flake = false; };
     # The yolo CLI, for the jump image, which launches sandboxes itself. Pinned
     # in flake.lock; bump it (`nix flake update yolo`) when the CLI changes.
-    yolo.url = "github:drewr/yolo";
+    yolo.url = "github:drewr/yolo/feature-jump-box";
   };
 
   outputs = { self, nixpkgs, llm-agents, dotfiles, yolo }:

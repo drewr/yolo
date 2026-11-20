@@ -224,15 +224,16 @@
         "zigutils": "zigutils"
       },
       "locked": {
-        "lastModified": 1793753609,
-        "narHash": "sha256-85me45iMo0Su/A5adsXwQjeh3InEnhWDTF5CtpFQPCs=",
+        "lastModified": 1795124508,
+        "narHash": "sha256-r7HGq7S4hgL9v9Vee2XBml81sD/BzsLI+GeRBWJzE0k=",
         "owner": "drewr",
         "repo": "yolo",
-        "rev": "c25489dab0b979118f45777697e172f1163aeaec",
+        "rev": "bbbb03bb04c691c6466e461f416530b3026233eb",
         "type": "github"
       },
       "original": {
         "owner": "drewr",
+        "ref": "feature-jump-box",
         "repo": "yolo",
         "type": "github"
       }
