@@ -401,7 +401,7 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         .home = home,
         .jump_config = jump_config,
         .jump_tokenizer = jump_tokenizer,
-        .broker = if (broker_env) |e| (if (proxy) |p| WorkloadInput.Broker{ .id = p.id, .ca_b64 = e.ca_b64 } else null) else null,
+        .broker = if (broker_env) |e| (if (proxy) |_| WorkloadInput.Broker{ .id = e.broker_id, .ca_b64 = e.ca_b64 } else null) else null,
     }))) |msg| abandon(ctx, wl, dir, box, msg);
 
     // The sandbox is in the broker's policy once its Config entries are written.
@@ -979,7 +979,7 @@ pub fn renderSecret(allocator: mem.Allocator, wl: []const u8, secret_hex: []cons
 }
 
 pub const WorkloadInput = struct {
-    /// A broker sandbox's proxy endpoint id and the broker's CA (base64 of the PEM).
+    /// The broker's endpoint id (what the sandbox's proxy dials) and the broker's CA (base64 of the PEM).
     pub const Broker = struct { id: []const u8, ca_b64: []const u8 };
 
     workload: []const u8,
