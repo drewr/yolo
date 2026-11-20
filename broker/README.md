@@ -144,10 +144,14 @@ tokenizer URL may be `http://127.0.0.1:8080` or `http://[::1]:8080`).
   10 s per attempt.
 - IPv6 literal upstreams (`[2001:db8::1]:443`) need a patched tokenizer: stock
   tokenizer splits its dial address at the first `:` and mishandles an IPv6
-  literal on port 80 or 443. `nix/tokenizer-ipv6.patch` fixes that and is
-  applied to the tokenizer this flake builds, pending the same fix upstream. A
-  tokenizer built without it still works for DNS names (which may resolve to
-  IPv6) and IPv4 literals.
+  literal on port 80 or 443. The flake applies two patches to the tokenizer it
+  builds. `nix/tokenizer-ipv6.patch` fixes the dial address, pending the same
+  fix upstream. `nix/tokenizer-oauth-seal.patch` makes the OAuth processors seal
+  the token endpoint's reply to a refresh grant (`subtoken=refresh`), as the JWT
+  processor already does, so a refresh never returns a cleartext access token;
+  it is not about IPv6, but it is in the same build, pending upstream. A
+  tokenizer built without the IPv6 patch still works for DNS names (which may
+  resolve to IPv6) and IPv4 literals.
 
 The sandbox must trust `ca.pem` from the store. Mind the trust variables of
 each client (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, ...).
@@ -274,12 +278,15 @@ no code change.
   "IPv4 and IPv6").
 - Tokenizer is dialed per request; there is no connection reuse.
 - A secret's JSON is whatever tokenizer accepts. Processors that return
-  sealed tokens in responses (OAuth) are not handled by the broker.
+  sealed tokens in responses (JWT, client credentials, GitHub App, OAuth
+  refresh) hand the sealed reply through unchanged; the broker does not run
+  OAuth refreshes itself.
 
 ## Next steps
 
-- OAuth flows and refresh caching (token endpoints, refresh tokens, sealing
-  the refreshed access token back into the store).
+- OAuth refresh in the broker: running the refresh grant, caching the sealed
+  access token and writing a rotated refresh token back into the store. Tokenizer
+  already seals the refresh reply (see the patches under "IPv4 and IPv6").
 - A Datum Secret store backend, and writing sealed secrets through it.
 - yolo CLI integration: create each sandbox's key and policy entry, set
   `HTTPS_PROXY` and the CA trust in the sandbox.

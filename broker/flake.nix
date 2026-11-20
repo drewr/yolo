@@ -23,7 +23,13 @@
         rev = "0f51c9d780d0edea243574c12e7ba43a15894595";
         hash = "sha256-DAWuQnpFplNxB7G+HIUiMCfYmfU59pwbVi6KTR4ZxSE=";
       };
-      patches = [ ./nix/tokenizer-ipv6.patch ];
+      # tokenizer-oauth-seal.patch seals the token endpoint's reply to a
+      # refresh grant, as the JWT processor does. Drop it once upstream has
+      # the same.
+      patches = [
+        ./nix/tokenizer-ipv6.patch
+        ./nix/tokenizer-oauth-seal.patch
+      ];
       vendorHash = "sha256-L52HJC/h65I/QjaaGdwupHKJca+61tudQy5CINQuwPU=";
       # "." is the library package, built only so its tests (the patch's
       # included) run in the check phase; the binary is cmd/tokenizer.

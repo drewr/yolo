@@ -1,0 +1,426 @@
+diff --git a/processor.go b/processor.go
+index 2df8035..58e9aa3 100644
+--- a/processor.go
++++ b/processor.go
+@@ -327,6 +327,7 @@ type OAuthToken struct {
+ }
+ 
+ var _ ProcessorConfig = (*OAuthProcessorConfig)(nil)
++var _ ResponseProcessorConfig = (*OAuthProcessorConfig)(nil)
+ 
+ func (c *OAuthProcessorConfig) Processor(params map[string]string, _ *SealingContext) (RequestProcessor, error) {
+ 	token := c.Token.AccessToken
+@@ -365,6 +366,22 @@ func (c *OAuthProcessorConfig) Processor(params map[string]string, _ *SealingCon
+ 	}, nil
+ }
+ 
++// ResponseProcessor seals the token endpoint's reply to a refresh grant (the
++// refresh token was injected into the request), so the caller only gets back
++// a sealed secret holding the new tokens. Other requests are not touched.
++func (c *OAuthProcessorConfig) ResponseProcessor(params map[string]string, sctx *SealingContext) (func(*http.Response) error, error) {
++	if params[ParamSubtoken] != SubtokenRefresh {
++		return nil, nil
++	}
++	if sctx == nil {
++		return nil, errors.New("OAuth refresh response processor requires a sealing context")
++	}
++
++	return sealTokenResponseAs(sctx, func(tr tokenResponse) ProcessorConfig {
++		return &OAuthProcessorConfig{Token: rotatedOAuthToken(c.Token, tr)}
++	}), nil
++}
++
+ func (c *OAuthProcessorConfig) StripHazmat() ProcessorConfig {
+ 	return &OAuthProcessorConfig{
+ 		Token: &OAuthToken{
+@@ -380,6 +397,7 @@ type OAuthBodyProcessorConfig struct {
+ }
+ 
+ var _ ProcessorConfig = (*OAuthBodyProcessorConfig)(nil)
++var _ ResponseProcessorConfig = (*OAuthBodyProcessorConfig)(nil)
+ 
+ func (c *OAuthBodyProcessorConfig) Processor(params map[string]string, _ *SealingContext) (RequestProcessor, error) {
+ 	token := c.Token.AccessToken
+@@ -417,6 +435,32 @@ func (c *OAuthBodyProcessorConfig) Processor(params map[string]string, _ *Sealin
+ 	}, nil
+ }
+ 
++// ResponseProcessor seals a refresh reply as OAuthProcessorConfig does, and
++// the sealed secret keeps the placeholder.
++func (c *OAuthBodyProcessorConfig) ResponseProcessor(params map[string]string, sctx *SealingContext) (func(*http.Response) error, error) {
++	if params[ParamSubtoken] != SubtokenRefresh {
++		return nil, nil
++	}
++	if sctx == nil {
++		return nil, errors.New("OAuth refresh response processor requires a sealing context")
++	}
++
++	return sealTokenResponseAs(sctx, func(tr tokenResponse) ProcessorConfig {
++		return &OAuthBodyProcessorConfig{Token: rotatedOAuthToken(c.Token, tr), Placeholder: c.Placeholder}
++	}), nil
++}
++
++// rotatedOAuthToken is the token a refresh response leaves behind: the new
++// access token, and the new refresh token when the endpoint rotated it. A
++// response without one means the old refresh token still works.
++func rotatedOAuthToken(old *OAuthToken, tr tokenResponse) *OAuthToken {
++	refresh := old.RefreshToken
++	if tr.RefreshToken != "" {
++		refresh = tr.RefreshToken
++	}
++	return &OAuthToken{AccessToken: tr.AccessToken, RefreshToken: refresh}
++}
++
+ func (c *OAuthBodyProcessorConfig) StripHazmat() ProcessorConfig {
+ 	return &OAuthBodyProcessorConfig{
+ 		Token: &OAuthToken{
+@@ -721,13 +765,31 @@ func (c *JWTProcessorConfig) ResponseProcessor(params map[string]string, sctx *S
+ 	return sealTokenResponse(sctx), nil
+ }
+ 
++// tokenResponse is what the response processors read from a token endpoint's
++// JSON reply.
++type tokenResponse struct {
++	AccessToken  string `json:"access_token"`
++	RefreshToken string `json:"refresh_token"`
++	ExpiresIn    int    `json:"expires_in"`
++	TokenType    string `json:"token_type"`
++}
++
+ // sealTokenResponse returns a response processor that reads a token endpoint's
+ // JSON response, seals the access token into a new InjectProcessorConfig, and
+ // replaces the response body with a SealedTokenResponse.
+ func sealTokenResponse(sctx *SealingContext) func(*http.Response) error {
++	return sealTokenResponseAs(sctx, func(tr tokenResponse) ProcessorConfig {
++		return &InjectProcessorConfig{Token: tr.AccessToken}
++	})
++}
++
++// sealTokenResponseAs is sealTokenResponse with the processor of the new
++// secret built from the parsed response. The new secret keeps the original
++// secret's auth and request validators.
++func sealTokenResponseAs(sctx *SealingContext, newProcessor func(tokenResponse) ProcessorConfig) func(*http.Response) error {
+ 	return func(resp *http.Response) error {
+-		// Pass through non-OK responses without modification
+-		if resp.StatusCode != http.StatusOK {
++		// Pass through non-2xx responses without modification
++		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+ 			return nil
+ 		}
+ 
+@@ -737,11 +799,7 @@ func sealTokenResponse(sctx *SealingContext) func(*http.Response) error {
+ 			return fmt.Errorf("failed to read token response: %w", err)
+ 		}
+ 
+-		var tokenResp struct {
+-			AccessToken string `json:"access_token"`
+-			ExpiresIn   int    `json:"expires_in"`
+-			TokenType   string `json:"token_type"`
+-		}
++		var tokenResp tokenResponse
+ 		if err := json.Unmarshal(body, &tokenResp); err != nil {
+ 			return fmt.Errorf("failed to parse token response: %w", err)
+ 		}
+@@ -750,11 +808,11 @@ func sealTokenResponse(sctx *SealingContext) func(*http.Response) error {
+ 			return errors.New("token response missing access_token")
+ 		}
+ 
+-		// Create a new Secret with InjectProcessorConfig, forwarding auth
+-		// and validators from the original secret
++		// Create a new Secret, forwarding auth and validators from the
++		// original secret
+ 		newSecret := &Secret{
+ 			AuthConfig:        sctx.AuthConfig,
+-			ProcessorConfig:   &InjectProcessorConfig{Token: tokenResp.AccessToken},
++			ProcessorConfig:   newProcessor(tokenResp),
+ 			RequestValidators: sctx.RequestValidators,
+ 		}
+ 
+diff --git a/processor_test.go b/processor_test.go
+index 2e85a7d..08cc751 100644
+--- a/processor_test.go
++++ b/processor_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/url"
++	"sort"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -943,6 +944,168 @@ func TestJWTProcessorConfig_ResponseProcessor_NilContext(t *testing.T) {
+ 	assert.Error(t, err)
+ }
+ 
++// sealedOAuth unseals a refresh response's sealed secret and returns the
++// token and placeholder of whichever OAuth processor it holds.
++func sealedOAuth(t *testing.T, sealed string, pub, priv *[32]byte) (*OAuthToken, string) {
++	t.Helper()
++	got, err := unsealSecret(sealed, pub, priv)
++	assert.NoError(t, err)
++
++	switch pc := got.ProcessorConfig.(type) {
++	case *OAuthProcessorConfig:
++		return pc.Token, ""
++	case *OAuthBodyProcessorConfig:
++		return pc.Token, pc.Placeholder
++	}
++	t.Fatalf("unexpected processor %T", got.ProcessorConfig)
++	return nil, ""
++}
++
++// wireFields returns the top-level JSON fields of a secret, so a test can
++// compare what a sealed secret carries over from the original.
++func wireFields(t *testing.T, s *Secret) map[string]json.RawMessage {
++	t.Helper()
++	b, err := json.Marshal(s)
++	assert.NoError(t, err)
++
++	var m map[string]json.RawMessage
++	assert.NoError(t, json.Unmarshal(b, &m))
++	return m
++}
++
++// sortedHosts decodes a secret's allowed_hosts field. The validator lists its
++// hosts in map order, so the order is not compared.
++func sortedHosts(t *testing.T, raw json.RawMessage) []string {
++	t.Helper()
++	var hosts []string
++	assert.NoError(t, json.Unmarshal(raw, &hosts))
++	sort.Strings(hosts)
++	return hosts
++}
++
++func TestOAuthProcessorConfig_ResponseProcessor_SealsRefresh(t *testing.T) {
++	_, pub, priv := generateTestSealKey(t)
++
++	authCfg := NewBearerAuthConfig("trustno1")
++	validators := []RequestValidator{AllowHosts("oauth.example.com", "api.example.com")}
++	refreshParams := map[string]string{ParamSubtoken: SubtokenRefresh}
++
++	cases := []struct {
++		name        string
++		cfg         ProcessorConfig
++		placeholder string
++	}{
++		{"header", &OAuthProcessorConfig{&OAuthToken{AccessToken: "access-old", RefreshToken: "refresh-old"}}, ""},
++		{"body", &OAuthBodyProcessorConfig{Token: &OAuthToken{AccessToken: "access-old", RefreshToken: "refresh-old"}, Placeholder: "{{REFRESH}}"}, "{{REFRESH}}"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			orig := &Secret{AuthConfig: authCfg, ProcessorConfig: tc.cfg, RequestValidators: validators}
++			ctx := &SealingContext{AuthConfig: authCfg, RequestValidators: validators, SealKey: pub}
++
++			respProc, err := tc.cfg.(ResponseProcessorConfig).ResponseProcessor(refreshParams, ctx)
++			assert.NoError(t, err)
++			assert.NotEqual(t, nil, respProc)
++
++			t.Run("rotated refresh token", func(t *testing.T) {
++				resp := &http.Response{
++					StatusCode: http.StatusOK,
++					Body:       io.NopCloser(strings.NewReader(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600,"token_type":"Bearer"}`)),
++					Header:     make(http.Header),
++				}
++				assert.NoError(t, respProc(resp))
++
++				body, err := io.ReadAll(resp.Body)
++				assert.NoError(t, err)
++				assert.False(t, strings.Contains(string(body), "access-new") || strings.Contains(string(body), "refresh-new"), "cleartext token in response")
++
++				var sealedResp SealedTokenResponse
++				assert.NoError(t, json.Unmarshal(body, &sealedResp))
++				assert.Equal(t, "sealed", sealedResp.TokenType)
++				assert.Equal(t, 3540, sealedResp.ExpiresIn)
++
++				tok, placeholder := sealedOAuth(t, sealedResp.SealedToken, pub, priv)
++				assert.Equal(t, &OAuthToken{AccessToken: "access-new", RefreshToken: "refresh-new"}, tok)
++				assert.Equal(t, tc.placeholder, placeholder)
++
++				got := wireFields(t, orig)
++				sealed, err := unsealSecret(sealedResp.SealedToken, pub, priv)
++				assert.NoError(t, err)
++				gotFields := wireFields(t, sealed)
++				assert.Equal(t, got["bearer_auth"], gotFields["bearer_auth"])
++				assert.Equal(t, []string{"api.example.com", "oauth.example.com"}, sortedHosts(t, gotFields["allowed_hosts"]))
++				assert.Equal(t, sortedHosts(t, got["allowed_hosts"]), sortedHosts(t, gotFields["allowed_hosts"]))
++			})
++
++			t.Run("no rotated refresh token keeps the old one", func(t *testing.T) {
++				resp := &http.Response{
++					StatusCode: http.StatusOK,
++					Body:       io.NopCloser(strings.NewReader(`{"access_token":"access-new","expires_in":60,"token_type":"Bearer"}`)),
++					Header:     make(http.Header),
++				}
++				assert.NoError(t, respProc(resp))
++
++				body, err := io.ReadAll(resp.Body)
++				assert.NoError(t, err)
++				var sealedResp SealedTokenResponse
++				assert.NoError(t, json.Unmarshal(body, &sealedResp))
++				assert.Equal(t, 60, sealedResp.ExpiresIn)
++
++				tok, _ := sealedOAuth(t, sealedResp.SealedToken, pub, priv)
++				assert.Equal(t, &OAuthToken{AccessToken: "access-new", RefreshToken: "refresh-old"}, tok)
++			})
++
++			t.Run("non-2xx passes through", func(t *testing.T) {
++				const errBody = `{"error":"invalid_grant"}`
++				resp := &http.Response{
++					StatusCode: http.StatusBadRequest,
++					Body:       io.NopCloser(strings.NewReader(errBody)),
++					Header:     make(http.Header),
++				}
++				assert.NoError(t, respProc(resp))
++
++				body, err := io.ReadAll(resp.Body)
++				assert.NoError(t, err)
++				assert.Equal(t, errBody, string(body))
++			})
++
++			t.Run("other 2xx is sealed too", func(t *testing.T) {
++				resp := &http.Response{
++					StatusCode: http.StatusCreated,
++					Body:       io.NopCloser(strings.NewReader(`{"access_token":"access-new","token_type":"Bearer"}`)),
++					Header:     make(http.Header),
++				}
++				assert.NoError(t, respProc(resp))
++
++				body, err := io.ReadAll(resp.Body)
++				assert.NoError(t, err)
++				assert.False(t, strings.Contains(string(body), "access-new"), "cleartext token in response")
++			})
++		})
++	}
++}
++
++func TestOAuthProcessorConfig_ResponseProcessor_OnlyRefresh(t *testing.T) {
++	_, pub, _ := generateTestSealKey(t)
++	ctx := &SealingContext{AuthConfig: NewBearerAuthConfig("trustno1"), SealKey: pub}
++
++	cfgs := []ResponseProcessorConfig{
++		&OAuthProcessorConfig{&OAuthToken{AccessToken: "access-old", RefreshToken: "refresh-old"}},
++		&OAuthBodyProcessorConfig{Token: &OAuthToken{AccessToken: "access-old", RefreshToken: "refresh-old"}},
++	}
++	for _, cfg := range cfgs {
++		for _, params := range []map[string]string{nil, {ParamSubtoken: SubtokenAccess}} {
++			respProc, err := cfg.ResponseProcessor(params, ctx)
++			assert.NoError(t, err)
++			assert.True(t, respProc == nil, "params %v: access request must not get a response processor", params)
++		}
++
++		_, err := cfg.ResponseProcessor(map[string]string{ParamSubtoken: SubtokenRefresh}, nil)
++		assert.Error(t, err)
++	}
++}
++
+ func TestJWTProcessorConfig_JSONRoundTrip(t *testing.T) {
+ 	_, pemBytes := generateTestRSAKey(t)
+ 
+diff --git a/tokenizer_test.go b/tokenizer_test.go
+index 4168be8..e81369f 100644
+--- a/tokenizer_test.go
++++ b/tokenizer_test.go
+@@ -273,13 +273,8 @@ func TestTokenizer(t *testing.T) {
+ 			Body:    "",
+ 		}, doEcho(t, client, req))
+ 
+-		// OAuth - refresh token (explicit)
+-		client, err = Client(tkzServer.URL, WithAuth(auth), WithSecret(secret, map[string]string{ParamSubtoken: SubtokenRefresh}))
+-		assert.NoError(t, err)
+-		assert.Equal(t, &echoResponse{
+-			Headers: http.Header{"Authorization": {fmt.Sprintf("Bearer %s", token.RefreshToken)}},
+-			Body:    "",
+-		}, doEcho(t, client, req))
++		// OAuth - refresh token (explicit) is covered by "oauth refresh": a
++		// refresh reply is a token response, which the echo server is not.
+ 	})
+ 
+ 	t.Run("allow-hosts validator", func(t *testing.T) {
+@@ -581,6 +576,86 @@ func TestTokenizer(t *testing.T) {
+ 		assert.Equal(t, http.StatusProxyAuthRequired, resp.StatusCode)
+ 	})
+ 
++	t.Run("oauth refresh", func(t *testing.T) {
++		// Mock token endpoint. The first refresh token rotates, the second
++		// does not, so the second refresh must reuse the one the sealed
++		// secret carried from the first.
++		replies := map[string]string{
++			"Bearer refresh-old": `{"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600,"token_type":"Bearer"}`,
++			"Bearer refresh-new": `{"access_token":"access-newer","expires_in":3600,"token_type":"Bearer"}`,
++		}
++		tokenEndpoint := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			reply, ok := replies[r.Header.Get("Authorization")]
++			if !ok {
++				http.Error(w, "unknown refresh token", http.StatusUnauthorized)
++				return
++			}
++			w.Header().Set("Content-Type", "application/json")
++			_, _ = io.WriteString(w, reply)
++		}))
++		defer tokenEndpoint.Close()
++
++		// Trust the mock token endpoint's certificate
++		UpstreamTrust.AddCert(tokenEndpoint.Certificate())
++
++		tokenEndpointURL, err := url.Parse(tokenEndpoint.URL)
++		assert.NoError(t, err)
++		tokenEndpointURL.Scheme = "http" // tokenizer upgrades to TLS
++		tokenHost := tokenEndpointURL.Host
++
++		auth := "oauth-refresh-auth"
++		secret, err := (&Secret{
++			AuthConfig:        NewBearerAuthConfig(auth),
++			ProcessorConfig:   &OAuthProcessorConfig{&OAuthToken{AccessToken: "access-old", RefreshToken: "refresh-old"}},
++			RequestValidators: []RequestValidator{AllowHosts(tokenHost, appHost)},
++		}).Seal(sealKey)
++		assert.NoError(t, err)
++
++		refresh := func(sealed string) *SealedTokenResponse {
++			t.Helper()
++			client, err := Client(tkzServer.URL, WithAuth(auth), WithSecret(sealed, map[string]string{ParamSubtoken: SubtokenRefresh}))
++			assert.NoError(t, err)
++
++			refreshReq, err := http.NewRequest(http.MethodPost, tokenEndpointURL.String(), nil)
++			assert.NoError(t, err)
++
++			resp, err := client.Do(refreshReq)
++			assert.NoError(t, err)
++			body, err := io.ReadAll(resp.Body)
++			assert.NoError(t, err)
++			resp.Body.Close()
++			assert.Equal(t, http.StatusOK, resp.StatusCode, "body %s", body)
++			assert.False(t, strings.Contains(string(body), "access-new") || strings.Contains(string(body), "refresh-new") || strings.Contains(string(body), "access-newer"), "cleartext token in response")
++
++			var sealedResp SealedTokenResponse
++			assert.NoError(t, json.Unmarshal(body, &sealedResp))
++			assert.Equal(t, "sealed", sealedResp.TokenType)
++			return &sealedResp
++		}
++
++		// Step 1: refresh rotates the refresh token
++		first := refresh(secret)
++
++		// Step 2: the sealed access token reaches the app API
++		client, err = Client(tkzServer.URL, WithAuth(auth), WithSecret(first.SealedToken, nil))
++		assert.NoError(t, err)
++		assert.Equal(t, &echoResponse{
++			Headers: http.Header{"Authorization": {"Bearer access-new"}},
++			Body:    "",
++		}, doEcho(t, client, req))
++
++		// Step 3: refreshing with the sealed secret uses the rotated refresh
++		// token; the endpoint does not rotate it this time
++		second := refresh(first.SealedToken)
++
++		client, err = Client(tkzServer.URL, WithAuth(auth), WithSecret(second.SealedToken, nil))
++		assert.NoError(t, err)
++		assert.Equal(t, &echoResponse{
++			Headers: http.Header{"Authorization": {"Bearer access-newer"}},
++			Body:    "",
++		}, doEcho(t, client, req))
++	})
++
+ 	t.Run("MultiProcessor", func(t *testing.T) {
+ 		auth := "trustno1"
+ 		token1 := "supersecret"
