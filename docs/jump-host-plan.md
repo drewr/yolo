@@ -132,7 +132,7 @@ Restart recovery comes first: steps 1 to 3 give a box, made by `yolo new` alone,
   - [x] set `YOLO_CONFIG_URL`, `YOLO_BOX`, `YOLO_USER` and `YOLO_GENERATION=1` in the workload's env;
   - [x] make `--no-home` the default for jump.
 - [x] `yolo rm NAME` deletes everything above. A failure halfway through `new` cleans up whatever it already created.
-- [ ] Unit tests for the manifests (pure builders), and a live `new`, `load`, `connect`, restart and `rm` run in a test project. Done: the unit tests (`src/jumpbox.zig`), and a live `new` and `rm` on the current image, including a rollback after a failed step (2026-11-19). Left: `load`, `connect` and restart, which need the rebuilt image.
+- [x] Unit tests for the manifests (pure builders), and a live `new`, `load`, `connect`, restart and `rm` run in a test project. Done: the unit tests (`src/jumpbox.zig`), and a live `new` and `rm` on the current image, including a rollback after a failed step (2026-11-19). Then `load`, `connect`, a restart of the box and of the target, and `rm` on the rebuilt image (2026-11-20).
 
 ### Phase 3: Bake the jump image
 
@@ -147,9 +147,9 @@ Restart recovery comes first: steps 1 to 3 give a box, made by `yolo new` alone,
   - [x] remove the slot pool, the mux config, their tests, and ssh-agent-mux from the image.
 - [x] `src/datum.zig`: `yolo attach` doesn't forward the client's agent to a jump box (no `ForwardAgent=yes` when the session's harness is `jump`); `-A` still opts in.
 - [x] Add tmux to every harness image.
-- [ ] Bump the image's `yolo` input to a revision that includes Config and jump.
-- [ ] Rebuild every harness image for both classes, and fold the digests into the jump commit before any push.
-- [ ] Live: create a jump box from the image (not jumpdev), then `load`, `connect`, restart the box, restart the target, `rm`. Check that `ssh-add -l` on the box lists only the loaded keys.
+- [x] Bump the image's `yolo` input to a revision that includes Config and jump.
+- [x] Rebuild every harness image for both classes, and fold the digests into the jump commit before any push.
+- [x] Live: create a jump box from the image (not jumpdev), then `load`, `connect`, restart the box, restart the target, `rm`. Check that `ssh-add -l` on the box lists only the loaded keys. Done 2026-11-20: the service account (editor) reads and writes its own Config; `load` stored the key; `connect` held a shell on a second sandbox; after restarting the box, `ssh-add -l` showed only the loaded key and the connection came back; after restarting the target, the box reconnected; `rm` left nothing behind.
 
 ### Phase 4: Credential broker on the box
 
