@@ -8,6 +8,12 @@ let
   # data), and the backup unit reads it at run time.
   bucketFile = "${state}/bucket";
   metaUrl = "redis://:$(cat ${state}/redis.pass)@127.0.0.1:${toString port}/1";
+  # dumbpipe with nix/dumbpipe-keep-listening.patch: a failed incoming
+  # connection no longer ends listen-tcp (and every tunnel on it). Drop it once
+  # upstream has the same.
+  dumbpipe = pkgs.dumbpipe.overrideAttrs (o: {
+    patches = (o.patches or [ ]) ++ [ ./dumbpipe-keep-listening.patch ];
+  });
 in
 {
   system.stateVersion = "26.05";
@@ -18,7 +24,7 @@ in
   # security group opens no inbound ports.
   services.openssh.enable = lib.mkForce false;
 
-  environment.systemPackages = with pkgs; [ juicefs redis dumbpipe awscli2 ];
+  environment.systemPackages = [ dumbpipe ] ++ (with pkgs; [ juicefs redis awscli2 ]);
 
   # Secrets generated on first boot and kept on the volume: the Redis password
   # (handed to sandboxes through the Datum Secret agent-home) and the iroh key
@@ -61,7 +67,7 @@ in
     after = [ "redis-juicefs.service" "network-online.target" "agent-meta-secrets.service" ];
     wants = [ "network-online.target" ];
     requires = [ "agent-meta-secrets.service" ];
-    path = with pkgs; [ dumbpipe coreutils ];
+    path = [ dumbpipe ] ++ (with pkgs; [ coreutils ]);
     script = ''
       IROH_SECRET=$(cat ${state}/iroh.secret)
       export IROH_SECRET

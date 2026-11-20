@@ -1,0 +1,32 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -612,8 +612,12 @@
+         let Some(incoming) = incoming else {
+             break;
+         };
+-        let Ok(connecting) = incoming.accept() else {
+-            break;
++        let connecting = match incoming.accept() {
++            Ok(c) => c,
++            Err(e) => {
++                tracing::warn!("error accepting incoming connection: {e}");
++                continue;
++            }
+         };
+         let addrs = addrs.clone();
+         let handshake = !args.common.is_custom_alpn();
+@@ -722,8 +726,12 @@
+         let Some(incoming) = incoming else {
+             break;
+         };
+-        let Ok(connecting) = incoming.accept() else {
+-            break;
++        let connecting = match incoming.accept() {
++            Ok(c) => c,
++            Err(e) => {
++                tracing::warn!("error accepting incoming connection: {e}");
++                continue;
++            }
+         };
+         let socket_path = socket_path.clone();
+         let handshake = !args.common.is_custom_alpn();

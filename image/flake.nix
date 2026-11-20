@@ -119,9 +119,15 @@
         pi = agents.pi;
       };
       busybox = pkgs.pkgsStatic.busybox;
+      # dumbpipe with nix/dumbpipe-keep-listening.patch: a failed incoming
+      # connection no longer ends listen-tcp and listen-unix (and every tunnel
+      # on them). Drop it once upstream has the same.
+      dumbpipe = pkgs.dumbpipe.overrideAttrs (o: {
+        patches = (o.patches or []) ++ [ ./nix/dumbpipe-keep-listening.patch ];
+      });
       # Every harness image: the login tools, and yolo-broker-proxy, which
       # init starts for a sandbox with a broker (yolo-broker rides along).
-      base = [ rtk broker.packages.${system}.yolo-broker ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear dumbpipe juicefs rsync tmux ]);
+      base = [ rtk broker.packages.${system}.yolo-broker dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear juicefs rsync tmux ]);
       # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in one
       # persistent ssh-agent that `jump setup` starts; a client logs in without
       # forwarding its agent, and logins, tmux and held connections all use that
@@ -136,7 +142,7 @@
       '';
       # The jump image also runs the broker and its tokenizer (on 127.0.0.1:8080).
       jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript broker.packages.${system}.yolo-broker broker.packages.${system}.tokenizer ]
-        ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear dumbpipe tmux ]);
+        ++ [ dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear tmux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).
       locales = pkgs.glibcLocales.override { allLocales = false; locales = [ "en_US.UTF-8/UTF-8" ]; };

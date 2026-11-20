@@ -2,6 +2,13 @@
 let
   port = 1234;
 
+  # dumbpipe with nix/dumbpipe-keep-listening.patch: a failed incoming
+  # connection no longer ends listen-tcp (and every tunnel on it). Drop it once
+  # upstream has the same.
+  dumbpipe = pkgs.dumbpipe.overrideAttrs (o: {
+    patches = (o.patches or [ ]) ++ [ ./dumbpipe-keep-listening.patch ];
+  });
+
   buildkitdConfig = pkgs.writeText "buildkitd.toml" ''
     [worker.oci]
       enabled = true
@@ -27,7 +34,7 @@ in
   # security group opens no inbound ports.
   services.openssh.enable = lib.mkForce false;
 
-  environment.systemPackages = with pkgs; [ buildkit dumbpipe git ];
+  environment.systemPackages = [ dumbpipe ] ++ (with pkgs; [ buildkit git ]);
 
   # BuildKit's TCP listener is unauthenticated, so it binds to loopback only and
   # is reached through dumbpipe below. Its root is on the EBS volume (ext4), not
@@ -55,7 +62,7 @@ in
     wantedBy = [ "multi-user.target" ];
     after = [ "buildkitd.service" "network-online.target" ];
     wants = [ "network-online.target" ];
-    path = with pkgs; [ dumbpipe openssl ];
+    path = [ dumbpipe ] ++ (with pkgs; [ openssl ]);
     script = ''
       cd /var/lib/dumbpipe
       [ -s secret ] || (umask 077 && openssl rand -hex 32 > secret)
