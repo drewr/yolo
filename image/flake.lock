@@ -8,11 +8,11 @@
       },
       "locked": {
         "dir": "broker",
-        "lastModified": 1795136677,
-        "narHash": "sha256-e1i8XKUVBZb0bzqpcDtjxYapmEGgsdQJMMMOAP1wsNw=",
+        "lastModified": 1795145907,
+        "narHash": "sha256-OC7ZtfOhib4XdxwRNF2stxqevSajeanrHWMjzv3Eyts=",
         "owner": "drewr",
         "repo": "yolo",
-        "rev": "a5d1d4742e784fd80e0e881966d240055e410007",
+        "rev": "57c2e52c292ff9b7c7a8214eec5ba9f7803c2f9a",
         "type": "github"
       },
       "original": {
@@ -248,11 +248,11 @@
         "zigutils": "zigutils"
       },
       "locked": {
-        "lastModified": 1795124508,
-        "narHash": "sha256-r7HGq7S4hgL9v9Vee2XBml81sD/BzsLI+GeRBWJzE0k=",
+        "lastModified": 1795186410,
+        "narHash": "sha256-uihytTyhBA3EWibCpyYhnmM/Botsi0mw6bQbc/vrAks=",
         "owner": "drewr",
         "repo": "yolo",
-        "rev": "bbbb03bb04c691c6466e461f416530b3026233eb",
+        "rev": "466f658e7ade840bf60737fda569a685411c12e7",
         "type": "github"
       },
       "original": {

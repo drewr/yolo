@@ -125,9 +125,20 @@
       dumbpipe = pkgs.dumbpipe.overrideAttrs (o: {
         patches = (o.patches or []) ++ [ ./nix/dumbpipe-keep-listening.patch ];
       });
+      # The broker and tokenizer for the images, built without their check
+      # phases: the broker's suite (integration tests included) runs in
+      # broker/'s own `nix build`, and every image build would otherwise repeat
+      # it. Dropping TOKENIZER_BIN/TOKENIZER_TEST_BIN also keeps the test
+      # tokenizer out of the closure.
+      yoloBroker = broker.packages.${system}.yolo-broker.overrideAttrs (_: {
+        doCheck = false;
+        TOKENIZER_BIN = "";
+        TOKENIZER_TEST_BIN = "";
+      });
+      tokenizer = broker.packages.${system}.tokenizer.overrideAttrs (_: { doCheck = false; });
       # Every harness image: the login tools, and yolo-broker-proxy, which
       # init starts for a sandbox with a broker (yolo-broker rides along).
-      base = [ rtk broker.packages.${system}.yolo-broker dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear juicefs rsync tmux ]);
+      base = [ rtk yoloBroker dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils ripgrep curl jq nix dropbear juicefs rsync tmux ]);
       # The jump box: no agent harness, nix, juicefs or rtk. It holds keys in one
       # persistent ssh-agent that `jump setup` starts; a client logs in without
       # forwarding its agent, and logins, tmux and held connections all use that
@@ -141,7 +152,7 @@
         chmod 0555 $out/bin/jump
       '';
       # The jump image also runs the broker and its tokenizer (on 127.0.0.1:8080).
-      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript broker.packages.${system}.yolo-broker broker.packages.${system}.tokenizer ]
+      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript yoloBroker tokenizer ]
         ++ [ dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear tmux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).

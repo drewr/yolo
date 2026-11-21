@@ -1,6 +1,6 @@
 # One pinned image per harness for the general-purpose class (yolo build HARNESS --backend datum --class general-purpose).
-claude    ghcr.io/drewr/agent-claude@sha256:be291844a3ee568aeaa211344a73c03394acc995fd5692b3f5fbeac2b4b2d756
-gemini    ghcr.io/drewr/agent-gemini@sha256:a24fa725ed12f0b4d5cdc165a25f46eb6cad2390ea142be19da2632d2aace992
-codex     ghcr.io/drewr/agent-codex@sha256:e3c05b6a9e51e6a0f8763f24f7bf84bf813d769a3dad9586722f29c0d50cfbda
-opencode  ghcr.io/drewr/agent-opencode@sha256:900ad20220c5d0e35f53d41421cc97aa9ad23f4e0839b9fa9188f9a40e0d31ce
-pi        ghcr.io/drewr/agent-pi@sha256:8bf1b286238e8a9f228c77c08c2f627da275c4fc434266309bc49b17c9070812
+claude    ghcr.io/drewr/agent-claude@sha256:0ffc87439ab91f935163be332d463c3eb622a73f54085874362608f297832c94
+opencode  ghcr.io/drewr/agent-opencode@sha256:37eaa1b9d1a50b3791a98130299cb3974fd87edb1a98a66266a5714b3cfc857b
+pi        ghcr.io/drewr/agent-pi@sha256:8abe547e1c96b23ec36e2498a4d7a139e3c13271f2f64d61774849ae0b20731b
+gemini    ghcr.io/drewr/agent-gemini@sha256:76b17dccb2791c0c81764d6f3de3eea01e3f2b01ef65bb47b698b4476677de8e
+codex     ghcr.io/drewr/agent-codex@sha256:f16dc02f1474f217b38566526b924819e9e294c18a3430d9d035436c6843682a
