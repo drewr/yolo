@@ -401,7 +401,6 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         .home = home,
         .jump_config = jump_config,
         .jump_tokenizer = jump_tokenizer,
-        .jump_org = if (box) |b| b.org else "",
         .broker = if (broker_env) |e| (if (proxy) |_| WorkloadInput.Broker{ .id = e.broker_id, .ca_b64 = e.ca_b64 } else null) else null,
     }))) |msg| abandon(ctx, wl, dir, box, msg);
 
@@ -995,8 +994,6 @@ pub const WorkloadInput = struct {
     jump_config: ?[]const u8 = null,
     /// A jump box's YOLO_TOKENIZER_CONFIG_URL; set together with jump_config.
     jump_tokenizer: []const u8 = "",
-    /// A jump box's organization (YOLO_DATUM_ORG); set together with jump_config.
-    jump_org: []const u8 = "",
     /// A broker sandbox's settings; null for every other session.
     broker: ?Broker = null,
 };
@@ -1067,7 +1064,7 @@ pub fn renderWorkload(allocator: mem.Allocator, d: Datum, in: WorkloadInput) []c
     }
     if (in.jump_config) |url| {
         const config_name = jumpbox.configName(allocator, in.name) catch util.die("out of memory");
-        const env = jumpbox.envYaml(allocator, url, in.jump_tokenizer, in.name, in.jump_org, config_name) catch util.die("out of memory");
+        const env = jumpbox.envYaml(allocator, url, in.jump_tokenizer, in.name, config_name, d.pull_secret) catch util.die("out of memory");
         out.appendSlice(allocator, env) catch util.die("out of memory");
     }
     if (in.broker) |b| {

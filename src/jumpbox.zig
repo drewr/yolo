@@ -5,8 +5,6 @@
 //!   jump-NAME            ServiceAccount (iam.miloapis.com), in P
 //!   jump-NAME-P          PolicyBinding (iam.miloapis.com), in O's namespace:
 //!                        the box's account gets the editor role on project P
-//!   jump-NAME-P-org      PolicyBinding (iam.miloapis.com), in O's namespace:
-//!                        the box's account gets the organization-viewer role on O
 //!   (generated)          ServiceAccountKey (identity.miloapis.com). Datum
 //!                        generates its name; its status.privateKey is the
 //!                        credentials JSON, returned once, and goes straight
@@ -38,7 +36,6 @@ pub const credentials_key = "datum-credentials.json";
 
 const role_name = "editor";
 const role_namespace = "datum-cloud";
-const org_role_name = "resourcemanager.miloapis.com-organization-viewer";
 const project_group = "resourcemanager.miloapis.com";
 /// How long to wait for Datum to give a new ServiceAccount its email.
 const account_wait_tries = 30;
@@ -61,28 +58,6 @@ pub fn configName(allocator: mem.Allocator, name: []const u8) ![]u8 {
 /// the project is part of the name.
 pub fn bindingName(allocator: mem.Allocator, name: []const u8, project: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "jump-{s}-{s}", .{ name, project });
-}
-
-/// The PolicyBinding that gives the box's account the organization-viewer role.
-/// Bindings share the organization's namespace, so the project is part of the
-/// name, as it is for the project's own binding.
-pub fn orgBindingName(allocator: mem.Allocator, name: []const u8, project: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "jump-{s}-{s}-org", .{ name, project });
-}
-
-/// The argv that reads the organization; its metadata.uid is the one the
-/// organization binding needs. Organizations are platform-wide, so the lookup
-/// names the resource's full group and asks for the platform scope.
-pub fn orgLookupArgv(allocator: mem.Allocator, org: []const u8) ![]const []const u8 {
-    return allocator.dupe([]const u8, &.{
-        "datumctl",
-        "get",
-        "organizations.resourcemanager.miloapis.com",
-        org,
-        "--platform-wide",
-        "-o",
-        "json",
-    });
 }
 
 /// YOLO_CONFIG_URL for the box: datum://PROJECT/yolo-NAME-config.
@@ -144,36 +119,6 @@ pub fn policyBindingManifest(
     email: []const u8,
     sa_uid: []const u8,
 ) ![]u8 {
-    return bindingManifest(allocator, org_namespace, binding, "Project", project, project_uid, role_name, email, sa_uid);
-}
-
-/// The PolicyBinding that gives the box's account the organization-viewer role on
-/// the organization.
-pub fn orgPolicyBindingManifest(
-    allocator: mem.Allocator,
-    org_namespace: []const u8,
-    binding: []const u8,
-    org: []const u8,
-    org_uid: []const u8,
-    email: []const u8,
-    sa_uid: []const u8,
-) ![]u8 {
-    return bindingManifest(allocator, org_namespace, binding, "Organization", org, org_uid, org_role_name, email, sa_uid);
-}
-
-/// A PolicyBinding for the account on one resource (of kind `kind`, in the
-/// resource-manager group) under the role `role`.
-fn bindingManifest(
-    allocator: mem.Allocator,
-    org_namespace: []const u8,
-    binding: []const u8,
-    kind: []const u8,
-    resource: []const u8,
-    resource_uid: []const u8,
-    role: []const u8,
-    email: []const u8,
-    sa_uid: []const u8,
-) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\apiVersion: iam.miloapis.com/v1alpha1
         \\kind: PolicyBinding
@@ -184,7 +129,7 @@ fn bindingManifest(
         \\  resourceSelector:
         \\    resourceRef:
         \\      apiGroup: {s}
-        \\      kind: {s}
+        \\      kind: Project
         \\      name: {s}
         \\      uid: "{s}"
         \\  roleRef:
@@ -195,7 +140,7 @@ fn bindingManifest(
         \\      name: "{s}"
         \\      uid: "{s}"
         \\
-    , .{ binding, org_namespace, project_group, kind, resource, resource_uid, role, role_namespace, email, sa_uid });
+    , .{ binding, org_namespace, project_group, project, project_uid, role_name, role_namespace, email, sa_uid });
 }
 
 /// The ConfigMap of the box's Config. It starts empty; `yolo cfg put` fills it.
@@ -210,17 +155,24 @@ pub fn configMapManifest(allocator: mem.Allocator, config_name: []const u8) ![]u
 }
 
 /// The Workload env items a jump box adds, at the indentation renderWorkload
-/// uses: its Config's URL, the tokenizer's Config URL, its name, its organization
-/// (for its datumctl context), the deployment generation, and the credentials
-/// JSON from the Config's Secret. YOLO_USER comes from renderWorkload.
+/// uses: its Config's URL, the tokenizer's Config URL, its name, the deployment
+/// generation, the credentials JSON from the Config's Secret, and, when
+/// `pull_secret` names an image pull Secret (not null or empty), its name as
+/// YOLO_DATUM_PULL_SECRET, so the box's yolo can give sandboxes the pull Secret.
+/// YOLO_USER comes from renderWorkload.
 pub fn envYaml(
     allocator: mem.Allocator,
     config_url: []const u8,
     tokenizer_url: []const u8,
     name: []const u8,
-    org: []const u8,
     config_name: []const u8,
+    pull_secret: ?[]const u8,
 ) ![]u8 {
+    const pull = if (pull_secret) |secret| if (secret.len == 0) "" else try std.fmt.allocPrint(allocator,
+        \\                - name: YOLO_DATUM_PULL_SECRET
+        \\                  value: "{s}"
+        \\
+    , .{secret}) else "";
     return std.fmt.allocPrint(allocator,
         \\                - name: YOLO_CONFIG_URL
         \\                  value: "{s}"
@@ -228,15 +180,13 @@ pub fn envYaml(
         \\                  value: "{s}"
         \\                - name: YOLO_BOX
         \\                  value: "{s}"
-        \\                - name: YOLO_DATUM_ORG
-        \\                  value: "{s}"
         \\                - name: YOLO_GENERATION
         \\                  value: "1"
         \\                - name: YOLO_DATUM_CREDENTIALS_JSON
         \\                  valueFrom:
         \\                    secretKeyRef: {{ name: {s}, key: {s} }}
-        \\
-    , .{ config_url, tokenizer_url, name, org, config_name, credentials_key });
+        \\{s}
+    , .{ config_url, tokenizer_url, name, config_name, credentials_key, pull });
 }
 
 /// The organization a project belongs to, from `datumctl whoami`'s Context line
@@ -321,7 +271,6 @@ pub const Box = struct {
     org: []const u8,
     sa: []const u8,
     binding: []const u8,
-    org_binding: []const u8,
     config: []const u8,
     tokenizer: []const u8,
 };
@@ -365,11 +314,10 @@ pub fn orgOf(ctx: Ctx, project: []const u8) ?[]const u8 {
 }
 
 /// The names a box of this session name and project gets.
-fn namesFor(ctx: Ctx, name: []const u8, project: []const u8) struct { sa: []const u8, binding: []const u8, org_binding: []const u8, config: []const u8, tokenizer: []const u8 } {
+fn namesFor(ctx: Ctx, name: []const u8, project: []const u8) struct { sa: []const u8, binding: []const u8, config: []const u8, tokenizer: []const u8 } {
     return .{
         .sa = fmt(ctx, "jump-{s}", .{name}),
         .binding = fmt(ctx, "jump-{s}-{s}", .{ name, project }),
-        .org_binding = orgBindingName(ctx.arena, name, project) catch util.die("out of memory"),
         .config = fmt(ctx, "yolo-{s}-config", .{name}),
         .tokenizer = fmt(ctx, "yolo-{s}-tokenizer", .{name}),
     };
@@ -391,7 +339,6 @@ pub fn plan(ctx: Ctx, name: []const u8, project: []const u8) Box {
         .org = org,
         .sa = n.sa,
         .binding = n.binding,
-        .org_binding = n.org_binding,
         .config = n.config,
         .tokenizer = n.tokenizer,
     };
@@ -409,9 +356,6 @@ pub fn recorded(ctx: Ctx, dir: []const u8, name: []const u8, project: []const u8
         .org = if (org.len != 0) org else (orgOf(ctx, project) orelse ""),
         .sa = util.readMeta(ctx, util.join(ctx, &.{ dir, "jump_sa" }), n.sa),
         .binding = util.readMeta(ctx, util.join(ctx, &.{ dir, "jump_binding" }), n.binding),
-        // A session made before the organization binding has no file; its
-        // derived name is then absent, and teardown skips it quietly.
-        .org_binding = util.readMeta(ctx, util.join(ctx, &.{ dir, "jump_org_binding" }), n.org_binding),
         .config = n.config,
         .tokenizer = n.tokenizer,
     };
@@ -422,7 +366,6 @@ pub fn recordNames(ctx: Ctx, dir: []const u8, b: Box) void {
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "jump_org" }), fmt(ctx, "{s}\n", .{b.org}));
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "jump_sa" }), fmt(ctx, "{s}\n", .{b.sa}));
     util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "jump_binding" }), fmt(ctx, "{s}\n", .{b.binding}));
-    util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, "jump_org_binding" }), fmt(ctx, "{s}\n", .{b.org_binding}));
 }
 
 /// Null when none of the box's objects exist yet, else why `new` must stop.
@@ -432,7 +375,6 @@ pub fn preflight(ctx: Ctx, b: Box) ?[]const u8 {
     const ns = organizationNamespace(ctx.arena, b.org) catch util.die("out of memory");
     if (checkAbsent(ctx, b, "service account", b.sa, projectArgv(ctx, b.project, &.{ "datumctl", "get", "serviceaccount", b.sa, "-o", "json" }))) |m| return m;
     if (checkAbsent(ctx, b, "PolicyBinding", b.binding, orgArgv(ctx, b.org, &.{ "datumctl", "get", "policybinding", b.binding, "-n", ns, "-o", "json" }))) |m| return m;
-    if (checkAbsent(ctx, b, "PolicyBinding", b.org_binding, orgArgv(ctx, b.org, &.{ "datumctl", "get", "policybinding", b.org_binding, "-n", ns, "-o", "json" }))) |m| return m;
     if (checkAbsent(ctx, b, "ConfigMap", b.config, projectArgv(ctx, b.project, &.{ "datumctl", "get", "configmap", b.config, "-o", "json" }))) |m| return m;
     if (checkAbsent(ctx, b, "Secret", b.config, projectArgv(ctx, b.project, &.{ "datumctl", "get", "secret", b.config, "-o", "json" }))) |m| return m;
     return null;
@@ -462,8 +404,7 @@ fn accountOf(ctx: Ctx, b: Box) ?struct { email: []const u8, uid: []const u8 } {
 }
 
 /// Create the box's objects in order: ServiceAccount, the project's PolicyBinding,
-/// the organization's PolicyBinding, ServiceAccountKey (its credentials go into
-/// the Config Secret), ConfigMap.
+/// ServiceAccountKey (its credentials go into the Config Secret), ConfigMap.
 /// Null on success; else the failed step and the server's message. The caller
 /// takes down what exists with `teardown`, whatever the failure.
 pub fn provision(ctx: Ctx, b: Box) ?[]const u8 {
@@ -483,15 +424,6 @@ pub fn provision(ctx: Ctx, b: Box) ?[]const u8 {
         util.die("out of memory");
     const bound = call(ctx, orgArgv(ctx, b.org, &.{ "datumctl", "create", "-f", "-", "-o", "json", "-n", ns }), binding_manifest);
     if (!bound.ok) return fmt(ctx, "could not create the PolicyBinding {s}: {s}", .{ b.binding, bound.err });
-
-    const org_body = call(ctx, orgLookupArgv(ctx.arena, b.org) catch util.die("out of memory"), null);
-    if (!org_body.ok) return fmt(ctx, "could not read organization {s}: {s}", .{ b.org, org_body.err });
-    const org_uid = uidFrom(ctx.arena, org_body.out) orelse
-        return fmt(ctx, "organization {s} has no UID", .{b.org});
-    const org_binding_manifest = orgPolicyBindingManifest(ctx.arena, ns, b.org_binding, b.org, org_uid, account.email, account.uid) catch
-        util.die("out of memory");
-    const org_bound = call(ctx, orgArgv(ctx, b.org, &.{ "datumctl", "create", "-f", "-", "-o", "json", "-n", ns }), org_binding_manifest);
-    if (!org_bound.ok) return fmt(ctx, "could not create the PolicyBinding {s}: {s}", .{ b.org_binding, org_bound.err });
 
     const key_manifest = serviceAccountKeyManifest(ctx.arena, b.sa, account.email) catch util.die("out of memory");
     const key = call(ctx, projectArgv(ctx, b.project, &.{ "datumctl", "create", "-f", "-", "-o", "json", "--validate=false" }), key_manifest);
@@ -522,18 +454,17 @@ fn remove(ctx: Ctx, label: []const u8, argv: []const []const u8) void {
 }
 
 /// Take the box's objects down, in reverse order of creation: the Config, the
-/// tokenizer's Secret, the organization's and the project's PolicyBindings, the
-/// keys, the ServiceAccount. Missing objects are fine.
+/// tokenizer's Secret, the project's PolicyBinding, the keys, the ServiceAccount.
+/// Missing objects are fine.
 pub fn teardown(ctx: Ctx, b: Box) void {
     remove(ctx, fmt(ctx, "ConfigMap {s}", .{b.config}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "configmap", b.config }));
     remove(ctx, fmt(ctx, "Secret {s}", .{b.config}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "secret", b.config }));
     remove(ctx, fmt(ctx, "Secret {s}", .{b.tokenizer}), projectArgv(ctx, b.project, &.{ "datumctl", "delete", "secret", b.tokenizer }));
 
     if (b.org.len == 0) {
-        util.warn("can't tell the organization of {s}, so PolicyBindings {s} and {s} are left in place", .{ b.project, b.org_binding, b.binding });
+        util.warn("can't tell the organization of {s}, so PolicyBinding {s} is left in place", .{ b.project, b.binding });
     } else {
         const ns = organizationNamespace(ctx.arena, b.org) catch util.die("out of memory");
-        remove(ctx, fmt(ctx, "PolicyBinding {s}", .{b.org_binding}), orgArgv(ctx, b.org, &.{ "datumctl", "delete", "policybinding", b.org_binding, "-n", ns }));
         remove(ctx, fmt(ctx, "PolicyBinding {s}", .{b.binding}), orgArgv(ctx, b.org, &.{ "datumctl", "delete", "policybinding", b.binding, "-n", ns }));
     }
 
@@ -570,7 +501,6 @@ test "names: the service account, Config, binding and Config URL" {
     try testing.expectEqualStrings("jump-box", try serviceAccountName(a, "box"));
     try testing.expectEqualStrings("yolo-box-config", try configName(a, "box"));
     try testing.expectEqualStrings("jump-box-proj-1", try bindingName(a, "box", "proj-1"));
-    try testing.expectEqualStrings("jump-box-proj-1-org", try orgBindingName(a, "box", "proj-1"));
     try testing.expectEqualStrings("datum://proj-1/yolo-box-config", try configUrl(a, "proj-1", "box"));
     try testing.expectEqualStrings("organization-org-1", try organizationNamespace(a, "org-1"));
 }
@@ -619,37 +549,6 @@ test "policy binding: editor on the project, for the account, in the organizatio
     try testing.expect(mem.indexOf(u8, m, "    - kind: ServiceAccount\n      name: \"jump-box@proj-1.identity.example\"\n      uid: \"uid-sa\"\n") != null);
 }
 
-test "organization lookup argv reads the platform-wide organization" {
-    var arena = testArena();
-    defer arena.deinit();
-    const argv = try orgLookupArgv(arena.allocator(), "org-1");
-    try testing.expectEqual(@as(usize, 7), argv.len);
-    try testing.expectEqualStrings("datumctl", argv[0]);
-    try testing.expectEqualStrings("get", argv[1]);
-    try testing.expectEqualStrings("organizations.resourcemanager.miloapis.com", argv[2]);
-    try testing.expectEqualStrings("org-1", argv[3]);
-    try testing.expectEqualStrings("--platform-wide", argv[4]);
-    try testing.expectEqualStrings("json", argv[6]);
-}
-
-test "organization policy binding: organization-viewer on the organization, for the account" {
-    var arena = testArena();
-    defer arena.deinit();
-    const m = try orgPolicyBindingManifest(
-        arena.allocator(),
-        "organization-org-1",
-        "jump-box-proj-1-org",
-        "org-1",
-        "uid-o",
-        "jump-box@proj-1.identity.example",
-        "uid-sa",
-    );
-    try testing.expect(mem.indexOf(u8, m, "  name: jump-box-proj-1-org\n  namespace: organization-org-1\n") != null);
-    try testing.expect(mem.indexOf(u8, m, "      apiGroup: resourcemanager.miloapis.com\n      kind: Organization\n      name: org-1\n      uid: \"uid-o\"\n") != null);
-    try testing.expect(mem.indexOf(u8, m, "  roleRef:\n    name: resourcemanager.miloapis.com-organization-viewer\n    namespace: datum-cloud\n") != null);
-    try testing.expect(mem.indexOf(u8, m, "    - kind: ServiceAccount\n      name: \"jump-box@proj-1.identity.example\"\n      uid: \"uid-sa\"\n") != null);
-}
-
 test "ConfigMap manifest" {
     var arena = testArena();
     defer arena.deinit();
@@ -660,13 +559,26 @@ test "ConfigMap manifest" {
 test "env items: the Config URLs, the box name, generation 1, and the credentials from the Config Secret" {
     var arena = testArena();
     defer arena.deinit();
-    const e = try envYaml(arena.allocator(), "datum://proj-1/yolo-box-config", "datum://proj-1/yolo-box-tokenizer", "box", "org-1", "yolo-box-config");
+    const e = try envYaml(arena.allocator(), "datum://proj-1/yolo-box-config", "datum://proj-1/yolo-box-tokenizer", "box", "yolo-box-config", null);
+    try testing.expect(mem.endsWith(u8, e, "key: datum-credentials.json }\n"));
+    try testing.expect(mem.indexOf(u8, e, "YOLO_DATUM_PULL_SECRET") == null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_CONFIG_URL\n                  value: \"datum://proj-1/yolo-box-config\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_TOKENIZER_CONFIG_URL\n                  value: \"datum://proj-1/yolo-box-tokenizer\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_BOX\n                  value: \"box\"\n") != null);
-    try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_DATUM_ORG\n                  value: \"org-1\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_GENERATION\n                  value: \"1\"\n") != null);
     try testing.expect(mem.indexOf(u8, e, "                - name: YOLO_DATUM_CREDENTIALS_JSON\n                  valueFrom:\n                    secretKeyRef: { name: yolo-box-config, key: datum-credentials.json }\n") != null);
+}
+
+test "env items: the pull Secret's name only when one is set" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const with = try envYaml(a, "datum://proj-1/yolo-box-config", "datum://proj-1/yolo-box-tokenizer", "box", "yolo-box-config", "pull-secret");
+    try testing.expect(mem.indexOf(u8, with, "                - name: YOLO_DATUM_PULL_SECRET\n                  value: \"pull-secret\"\n") != null);
+    try testing.expect(mem.endsWith(u8, with, "key: datum-credentials.json }\n                - name: YOLO_DATUM_PULL_SECRET\n                  value: \"pull-secret\"\n"));
+    const empty = try envYaml(a, "datum://proj-1/yolo-box-config", "datum://proj-1/yolo-box-tokenizer", "box", "yolo-box-config", "");
+    try testing.expect(mem.indexOf(u8, empty, "YOLO_DATUM_PULL_SECRET") == null);
+    try testing.expect(mem.endsWith(u8, empty, "key: datum-credentials.json }\n"));
 }
 
 test "orgIn reads the organization of the Context line, only for its own project" {

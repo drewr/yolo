@@ -3,8 +3,8 @@
 # Rebuild on the EC2 build box with: yolo build HARNESS --backend datum
 # (rewrites that harness's line).
 pi        ghcr.io/drewr/agent-pi@sha256:78e650c23892f1e578d7a51e6b8b9556c0f9721244a309a8d4f47ea0166d6bb1
-jump      ghcr.io/drewr/agent-jump@sha256:7c866aa843be9ec6e4ded03b6981c06c1ff61a725f9dc59eb1d41549b89f301e
 claude    ghcr.io/drewr/agent-claude@sha256:4cc3a6719f283690e59b4f9e4dbc709f5232fcd00e95425842d30903256f2351
 codex     ghcr.io/drewr/agent-codex@sha256:c17af534e7985b051e47ab6771b811a8535e2fb9f9e586cbb7c6f0f321cf30b2
 opencode  ghcr.io/drewr/agent-opencode@sha256:1406ea07b1f1c71bbc3c246a7dbbe6407a3a7bd4016a03f55518fe8bf46ecf5c
 gemini    ghcr.io/drewr/agent-gemini@sha256:6b8ac4b12a42236bd8e1b7159f16c0c156efa82a83b4ce49cce93a3ac8ebab2d
+jump      ghcr.io/drewr/agent-jump@sha256:87d672877db5a828d5e29ddb9869abaca8425582778c88d07231bab4e049a3bb

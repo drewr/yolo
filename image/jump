@@ -36,7 +36,12 @@
 # On Datum, setup writes the box's service-account credentials (from
 # YOLO_DATUM_CREDENTIALS_JSON) to $RUN, mode 0600, points
 # YOLO_DATUM_CREDENTIALS at that file, and logs datumctl in with it as the login
-# user, in the project of YOLO_CONFIG_URL and the organization of YOLO_DATUM_ORG.
+# user, with no context: the box's account can't read its organization, and yolo
+# passes the project of YOLO_CONFIG_URL to datumctl as --project (YOLO_DATUM_PROJECT,
+# which setup adds to the env file), so no `ctx use` is needed. With
+# YOLO_DATUM_PULL_SECRET (the name of the image pull Secret, set by the client
+# that made the box), setup adds it to the env file too, so the box's yolo can
+# give its sandboxes the pull Secret.
 #
 # With the broker in the image (/bin/yolo-broker, /bin/tokenizer), setup also runs,
 # as root, the tokenizer (user yolo-tok) and the broker (user yolo-broker), both
@@ -60,20 +65,23 @@ valid_datum_name() {
   case $1 in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
 }
 
-# datumctl for the login user, as the box's service account, in the box's project:
-# `yolo new` on this box runs datumctl as that user. The config goes in the login
-# user's HOME, which must be in memory: a shared home (JuiceFS) would keep the
-# credentials. Quiet on success, never fatal, and datumctl's output is dropped
-# since it may hold tokens. CREDENTIALS is the file setup wrote.
+# datumctl for the login user, as the box's service account. `yolo new` on this box
+# runs datumctl as that user with --project, so the login needs no context: the
+# box's account can't read its organization, and `ctx use` would need it. The
+# project goes to the env file as YOLO_DATUM_PROJECT for yolo to pass on. The
+# config goes in the login user's HOME, which must be in memory: a shared home
+# (JuiceFS) would keep the credentials. Quiet on success, never fatal, and
+# datumctl's output is dropped since it may hold tokens. CREDENTIALS is the file
+# setup wrote.
 datum_login() { # CREDENTIALS
   h=$(awk -F: -v u="$U" '$1 == u { print $6; exit }' /etc/passwd)
-  org=${YOLO_DATUM_ORG:-}
   project=${YOLO_CONFIG_URL#datum://}
   project=${project%%/*}
-  if ! valid_datum_name "$org" || ! valid_datum_name "$project"; then
-    echo "[jump] datum: no organization or project to log $U in to (YOLO_DATUM_ORG, YOLO_CONFIG_URL); datumctl isn't logged in" >&2
+  if ! valid_datum_name "$project"; then
+    echo "[jump] datum: no project to log $U in to (YOLO_CONFIG_URL); datumctl isn't logged in" >&2
     return 0
   fi
+  printf 'export YOLO_DATUM_PROJECT=%s\n' "$project" >> "$ENVF"
   case $h in
     ''|/)
       echo "[jump] datum: $U has no home; datumctl isn't logged in" >&2
@@ -84,8 +92,8 @@ datum_login() { # CREDENTIALS
       echo "[jump] datum: $U's home is the shared home, not memory; datumctl isn't logged in" >&2
       return 0 ;;
   esac
-  if ! as_user "HOME=$h datumctl login --credentials $1 >/dev/null 2>&1 && HOME=$h datumctl ctx use $org/$project >/dev/null 2>&1"; then
-    echo "[jump] datum: datumctl login or ctx use failed for $U; yolo new on this box won't reach Datum" >&2
+  if ! as_user "HOME=$h datumctl login --credentials $1 >/dev/null 2>&1"; then
+    echo "[jump] datum: datumctl login failed for $U; yolo new on this box won't reach Datum" >&2
   fi
   return 0
 }
@@ -147,6 +155,15 @@ setup() {
     fi
   else
     echo "[jump] no Datum credentials; load and register won't persist"
+  fi
+  # dropbear doesn't pass the container's env to logins, so yolo on the box gets
+  # the pull Secret's name through the env file, as it gets YOLO_DATUM_PROJECT.
+  if [ -n "${YOLO_DATUM_PULL_SECRET:-}" ]; then
+    if valid_datum_name "$YOLO_DATUM_PULL_SECRET"; then
+      printf 'export YOLO_DATUM_PULL_SECRET=%s\n' "$YOLO_DATUM_PULL_SECRET" >> "$ENVF"
+    else
+      echo "[jump] datum: YOLO_DATUM_PULL_SECRET isn't a valid Secret name; sandboxes can't pull private images" >&2
+    fi
   fi
   unset YOLO_DATUM_CREDENTIALS_JSON
   [ -n "${YOLO_CONFIG_URL:-}" ] || echo "[jump] no Config (YOLO_CONFIG_URL); keys and connections stay in memory"
