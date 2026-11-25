@@ -390,6 +390,21 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         (jumpbox.tokenizerConfigUrl(ctx.arena, b.project, name) catch util.die("out of memory"))
     else
         "";
+    // The sandbox fetches its broker policy as soon as it boots, so it is
+    // registered before its Workload is applied. A failure only costs the
+    // sandbox its broker access.
+    var registered_url: ?[]const u8 = null;
+    if (broker_env) |e| {
+        if (proxy) |p| {
+            util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, brokerreg.session_file }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{p.id}) catch "");
+            if (brokerreg.register(ctx, e.config_url, name, p.id)) |msg| {
+                util.warn("broker: could not register {s}: {s}; it has no broker access", .{ name, msg });
+            } else {
+                util.errPrint("broker: registered {s} ({s})\n", .{ name, p.id });
+                registered_url = e.config_url;
+            }
+        }
+    }
     if (applyError(ctx, "the Workload", renderWorkload(ctx.arena, d, .{
         .workload = wl,
         .name = name,
@@ -402,19 +417,13 @@ pub fn datumNew(ctx: Ctx, d: Datum, name: []const u8, harness: []const u8, opts0
         .jump_config = jump_config,
         .jump_tokenizer = jump_tokenizer,
         .broker = if (broker_env) |e| (if (proxy) |_| WorkloadInput.Broker{ .id = e.broker_id, .ca_b64 = e.ca_b64 } else null) else null,
-    }))) |msg| abandon(ctx, wl, dir, box, msg);
-
-    // The sandbox is in the broker's policy once its Config entries are written.
-    // A failure only costs the sandbox its broker access.
-    if (broker_env) |e| {
-        if (proxy) |p| {
-            util.writeFileOrDie(ctx, util.join(ctx, &.{ dir, brokerreg.session_file }), std.fmt.allocPrint(ctx.arena, "{s}\n", .{p.id}) catch "");
-            if (brokerreg.register(ctx, e.config_url, name, p.id)) |msg| {
-                util.warn("broker: could not register {s}: {s}; it has no broker access", .{ name, msg });
-            } else {
-                util.errPrint("broker: registered {s} ({s})\n", .{ name, p.id });
-            }
+    }))) |msg| {
+        // No sandbox will boot, so take its registration back out.
+        if (registered_url) |url| {
+            if (brokerreg.unregister(ctx, url, name)) |m| util.warn("broker: could not unregister {s}: {s}", .{ name, m });
+            util.removeFile(ctx, util.join(ctx, &.{ dir, brokerreg.session_file }));
         }
+        abandon(ctx, wl, dir, box, msg);
     }
 
     util.errPrint("created {s} ({s}: {s}); waiting for SSH...\n", .{ wl, harness, image });
