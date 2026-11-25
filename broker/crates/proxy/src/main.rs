@@ -13,7 +13,7 @@ yolo-broker-proxy: sandbox-side CONNECT proxy for yolo-broker
 
   yolo-broker-proxy run --broker ID [--broker-addr SOCKADDR]... [--listen ADDR]...
                         [--key-file FILE] [--bind ADDR]... [--direct]
-                        [--refresh-secs N]
+                        [--refresh-secs N] [--first-policy-wait-secs N]
       Listen on each ADDR (default: both 127.0.0.1:3128 and [::1]:3128, the
       second skipped if the host has no IPv6; set HTTPS_PROXY to either).
       --listen may be repeated. --bind (iroh's local address) may be given
@@ -25,6 +25,10 @@ yolo-broker-proxy: sandbox-side CONNECT proxy for yolo-broker
       iroh secret key comes from $YOLO_PROXY_SECRET_KEY (hex) or --key-file
       ($YOLO_PROXY_KEY_FILE, default ./proxy.key, created if missing).
       --direct disables relays and lookup; give --broker-addr then.
+      --refresh-secs (default 60) is how often the policy is refreshed once
+      it has loaded. Until the first load the proxy retries every 2 seconds,
+      and a CONNECT arriving meanwhile waits up to --first-policy-wait-secs
+      (default 30; 0 does not wait) for it before going direct.
   yolo-broker-proxy id [--key-file FILE]
       Print this sandbox's endpoint id, to add to the broker's policy.
 ";
@@ -101,6 +105,12 @@ async fn run() -> Result<()> {
                 .transpose()
                 .context("--refresh-secs")?
                 .unwrap_or(60);
+            let first_policy_wait = args
+                .value("--first-policy-wait-secs")?
+                .map(|s| s.parse::<u64>())
+                .transpose()
+                .context("--first-policy-wait-secs")?
+                .unwrap_or(30);
             args.done()?;
             if refresh == 0 {
                 bail!("--refresh-secs must be positive");
@@ -120,6 +130,8 @@ async fn run() -> Result<()> {
                 listen_is_default,
                 bind,
                 refresh: Duration::from_secs(refresh),
+                first_policy_retry: Duration::from_secs(2),
+                first_policy_wait: Duration::from_secs(first_policy_wait),
                 rpc_timeout: Duration::from_secs(10),
             })
             .await?;

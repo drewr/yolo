@@ -5,13 +5,22 @@
 //!
 //! The patterns are fetched from the broker at startup and refreshed
 //! periodically. If the broker cannot be reached the last known patterns stay
-//! in force (none at startup), so unlisted traffic is never held up. Traffic
-//! to a listed host is never sent direct while the broker is unreachable once
-//! its pattern is known.
+//! in force, so unlisted traffic is never held up. Traffic to a listed host is
+//! never sent direct while the broker is unreachable once its pattern is known.
+//!
+//! Startup: the proxy tries the broker once, briefly, before it listens, then
+//! retries every `first_policy_retry` until it has a policy. A sandbox can
+//! start before the broker has loaded it, so a CONNECT arriving before the
+//! first policy waits up to `first_policy_wait` for it rather than deciding
+//! direct-or-brokered on no patterns. That wait happens at most once: after it
+//! times out, the CONNECT goes direct and later CONNECTs do not wait, so a dead
+//! broker does not hold up unrelated traffic. Once the first policy is in,
+//! refreshes run every `refresh` and a CONNECT never waits.
 
 pub mod dial;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -20,6 +29,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use yolo_broker_wire::{
     bind_endpoint, read_frame, split_authority, write_frame, EndpointOpts, HostPattern, Network,
@@ -42,7 +52,15 @@ pub struct Config {
     /// Local addresses for the iroh endpoint, at most one per IP family
     /// (empty: iroh's wildcards for both).
     pub bind: Vec<SocketAddr>,
+    /// How often the policy is refreshed once the first one has loaded.
     pub refresh: Duration,
+    /// Interval between attempts until the first policy loads. Default for
+    /// the binary: 2 seconds.
+    pub first_policy_retry: Duration,
+    /// How long a CONNECT waits for the first policy before it is routed with
+    /// whatever patterns there are (none, so direct). Zero does not wait.
+    /// Default for the binary: 30 seconds.
+    pub first_policy_wait: Duration,
     /// How long one exchange with the broker (open a stream, send a request,
     /// read the reply) may take before the connection is judged dead and
     /// replaced. Default for the binary: 10 seconds.
@@ -87,7 +105,18 @@ struct Inner {
     conn: tokio::sync::Mutex<Option<Connection>>,
     rpc_timeout: Duration,
     patterns: RwLock<Vec<HostPattern>>,
+    /// Becomes true at the first successful policy load and stays true.
+    loaded: watch::Sender<bool>,
+    first_policy_wait: Duration,
+    /// Set when a CONNECT's wait for the first policy has timed out. Later
+    /// CONNECTs then skip the wait and route by the patterns they have, so a
+    /// broker that stays down costs one wait, not one per CONNECT. Also keeps
+    /// the timeout warning to one log line.
+    gave_up_waiting: AtomicBool,
 }
+
+/// Bound on one policy fetch, so a stuck broker cannot stall the refresher.
+const POLICY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn start(cfg: Config) -> Result<Proxy> {
     let endpoint = bind_endpoint(
@@ -97,19 +126,26 @@ pub async fn start(cfg: Config) -> Result<Proxy> {
         EndpointOpts::bind(cfg.bind),
     )
     .await?;
+    let (loaded, _) = watch::channel(false);
     let inner = Arc::new(Inner {
         endpoint,
         broker: cfg.broker,
         conn: tokio::sync::Mutex::new(None),
         rpc_timeout: cfg.rpc_timeout,
         patterns: RwLock::new(Vec::new()),
+        loaded,
+        first_policy_wait: cfg.first_policy_wait,
+        gave_up_waiting: AtomicBool::new(false),
     });
     let id = inner.endpoint.id();
 
-    match tokio::time::timeout(Duration::from_secs(15), inner.refresh()).await {
+    // One attempt before listening, bounded by the retry interval: a broker
+    // that is up answers at once, and one that is not does not hold up the
+    // listeners. The refresher below keeps trying.
+    match tokio::time::timeout(cfg.first_policy_retry, inner.refresh()).await {
         Ok(Ok(n)) => info!(id = %id, patterns = n, "policy loaded from broker"),
-        Ok(Err(e)) => warn!(id = %id, "could not load policy from broker yet: {e:#}"),
-        Err(_) => warn!(id = %id, "timed out loading policy from broker"),
+        Ok(Err(e)) => debug!(id = %id, "policy not loaded at startup: {e:#}"),
+        Err(_) => debug!(id = %id, "policy not loaded at startup: timed out"),
     }
 
     let mut listeners = Vec::new();
@@ -132,15 +168,36 @@ pub async fn start(cfg: Config) -> Result<Proxy> {
     let refresher = {
         let inner = inner.clone();
         let every = cfg.refresh;
+        let retry = cfg.first_policy_retry;
         tokio::spawn(async move {
+            let mut failures: u32 = 0;
             loop {
-                tokio::time::sleep(every).await;
-                match tokio::time::timeout(Duration::from_secs(15), inner.refresh()).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
+                let loaded = *inner.loaded.borrow();
+                tokio::time::sleep(if loaded { every } else { retry }).await;
+                let res = match tokio::time::timeout(POLICY_TIMEOUT, inner.refresh()).await {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!("timed out loading policy from broker")),
+                };
+                match (res, loaded) {
+                    (Ok(n), false) => info!(id = %id, patterns = n, "policy loaded from broker"),
+                    (Ok(_), true) => {}
+                    (Err(e), false) => {
+                        // Warn on the first failure and then every fifth,
+                        // so a broker that stays down is not logged each retry.
+                        failures = failures.saturating_add(1);
+                        if failures % 5 == 1 {
+                            warn!(
+                                id = %id,
+                                attempts = failures,
+                                "policy not loaded from broker yet, retrying every {retry:?}: {e:#}"
+                            );
+                        } else {
+                            debug!(id = %id, "policy not loaded yet: {e:#}");
+                        }
+                    }
+                    (Err(e), true) => {
                         warn!("policy refresh failed, keeping the previous patterns: {e:#}")
                     }
-                    Err(_) => warn!("policy refresh timed out, keeping the previous patterns"),
                 }
             }
         })
@@ -257,10 +314,32 @@ impl Inner {
                     .patterns
                     .write()
                     .unwrap_or_else(PoisonError::into_inner) = parsed;
+                self.loaded.send_replace(true);
                 Ok(n)
             }
             Response::Refused { reason } => bail!("broker refused: {reason}"),
             Response::Connected => bail!("unexpected reply from the broker"),
+        }
+    }
+
+    /// Wait for the first policy, up to `first_policy_wait`. Returns at once
+    /// once it has loaded, and without waiting at all after an earlier wait
+    /// has timed out. On timeout the caller routes by the patterns it has
+    /// (none, so every host goes direct until the policy loads); the warning
+    /// is logged once.
+    async fn await_first_policy(&self) {
+        if self.gave_up_waiting.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut loaded = self.loaded.subscribe();
+        let timed_out = tokio::time::timeout(self.first_policy_wait, loaded.wait_for(|l| *l))
+            .await
+            .is_err();
+        if timed_out && !self.gave_up_waiting.swap(true, Ordering::Relaxed) {
+            warn!(
+                "no policy from the broker after {:?}; sending connections direct until it loads",
+                self.first_policy_wait
+            );
         }
     }
 
@@ -289,6 +368,7 @@ impl Inner {
             bail!("bad CONNECT target {target:?}");
         };
 
+        self.await_first_policy().await;
         if self.brokered(&host, port) {
             let route = async {
                 match self

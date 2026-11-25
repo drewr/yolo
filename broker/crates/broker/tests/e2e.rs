@@ -11,7 +11,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -374,6 +374,19 @@ impl World {
         self.write_rules(&rules);
     }
 
+    /// A policy that knows some other sandbox but not this one, so the
+    /// broker refuses this sandbox's endpoint until it is added.
+    fn write_policy_without_this_sandbox(&self) {
+        std::fs::write(
+            self.store.dir().join("policy.toml"),
+            format!(
+                "[[sandbox]]\nid = \"{}\"\nname = \"someone else\"\n",
+                SecretKey::generate().public()
+            ),
+        )
+        .unwrap();
+    }
+
     /// The sandbox's whole policy: (host pattern, secret id) rules.
     fn write_rules(&self, rules: &[(String, String)]) {
         let rules = if rules.is_empty() {
@@ -473,6 +486,10 @@ impl World {
     }
 
     async fn start_proxy(&mut self) {
+        self.start_proxy_with(Duration::from_secs(10)).await;
+    }
+
+    async fn start_proxy_with(&mut self, first_policy_wait: Duration) {
         let broker = self
             .broker_addrs
             .iter()
@@ -485,6 +502,8 @@ impl World {
             listen_is_default: false,
             bind: self.local_addrs(),
             refresh: Duration::from_millis(500),
+            first_policy_retry: Duration::from_millis(100),
+            first_policy_wait,
             rpc_timeout: Duration::from_secs(3),
         })
         .await
@@ -865,6 +884,89 @@ async fn proxy_stops_routing_revoked_hosts_after_its_refresh() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("proxy kept the revoked pattern");
+}
+
+/// The proxy starts before the broker knows its sandbox. A CONNECT made in
+/// that window must wait for the first policy and then be brokered, not sent
+/// direct without the credential.
+#[tokio::test]
+async fn connect_before_first_policy_waits_and_is_brokered() {
+    let Some(bins) = bins() else { return };
+    let mut w = World::new(&bins).await;
+    w.write_policy_without_this_sandbox();
+    w.start_broker().await;
+    w.start_proxy_with(Duration::from_secs(20)).await;
+
+    let (proxy, ca, port) = (w.proxy_addr(), w.broker_ca_pem(), w.upstream_port);
+    let client = tokio::spawn(async move {
+        let mut t = open_tunnel(proxy, "localhost", port, &ca).await.unwrap();
+        t.get("localhost", port, "/", &[]).await
+    });
+
+    // Still waiting: the broker has not admitted this sandbox yet.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!client.is_finished(), "CONNECT was routed before a policy");
+
+    w.write_policy(true);
+    w.reload().await;
+    let r = tokio::time::timeout(Duration::from_secs(15), client)
+        .await
+        .expect("CONNECT finished once the policy loaded")
+        .unwrap();
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        json_body(&r)["authorization_sha256"],
+        sha256_hex(&format!("Bearer {TOKEN}")),
+        "the CONNECT was brokered: the credential was injected"
+    );
+}
+
+/// Once a CONNECT has waited out `first_policy_wait` with no policy, later
+/// CONNECTs must not wait again while the broker stays down. The first one
+/// waits and goes direct; the second is spliced at once.
+#[tokio::test]
+async fn first_policy_wait_is_taken_once() {
+    let Some(bins) = bins() else { return };
+    let mut w = World::new(&bins).await;
+    w.write_policy_without_this_sandbox();
+    w.start_broker().await;
+    w.start_proxy_with(Duration::from_secs(1)).await;
+
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = echo.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut wr) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut wr).await;
+            });
+        }
+    });
+
+    let proxy = w.proxy_addr();
+    let connect_direct = || async move {
+        let start = Instant::now();
+        let mut sock = TcpStream::connect(proxy).await.unwrap();
+        sock.write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 39];
+        sock.read_exact(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200"));
+        start.elapsed()
+    };
+
+    let first = connect_direct().await;
+    assert!(
+        first >= Duration::from_millis(900),
+        "first CONNECT did not wait for the policy: {first:?}"
+    );
+    let second = connect_direct().await;
+    assert!(
+        second < Duration::from_millis(500),
+        "second CONNECT waited again: {second:?}"
+    );
 }
 
 #[tokio::test]
