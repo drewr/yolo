@@ -25,7 +25,7 @@ file outside it, so it can move to its own repository as is.
 1. The sandbox sets `HTTPS_PROXY=http://127.0.0.1:3128` (or `http://[::1]:3128`;
    the proxy listens on both) and trusts the broker's CA certificate.
 2. `yolo-broker-proxy` asks the broker which host patterns this sandbox may use
-   (at startup, then every minute). A CONNECT to a listed host opens an iroh
+   (every 2 seconds until the first policy loads, then every minute). A CONNECT to a listed host opens an iroh
    bi-stream to the broker. Every other CONNECT is spliced straight to its
    destination.
 3. The broker drops a dialer whose endpoint id the policy does not list as soon
@@ -113,8 +113,13 @@ suffix; DNS names only), an IPv4 address or a bracketed IPv6 address
 (`[2001:db8::1]`), or any of them with `:port`; without a port it means 443.
 IP literals are compared as addresses, so `[::1]` and `[0:0:0:0:0:0:0:1]` are the
 same pattern. The most specific matching rule wins. `params` ride along after the sealed secret (tokenizer's
-`dst` and `fmt`). A host with no rule is refused, and so is an endpoint id that
-is not listed.
+`dst` and `fmt`). The broker refuses a host with no rule, and an endpoint id
+that is not listed.
+
+The proxy sends only the hosts in the sandbox's policy to the broker. Every
+other CONNECT is spliced directly from the sandbox, so it never reaches the
+broker and gets no credential. The broker's refusals therefore apply only to
+traffic the proxy routes to it.
 
 Run the broker, and the proxy in each sandbox:
 
@@ -123,6 +128,20 @@ yolo-broker serve --store /var/lib/yolo-broker --key-file /var/lib/yolo-broker/b
 yolo-broker-proxy run --broker <broker id> --key-file /sandbox/proxy.key
 export HTTPS_PROXY=http://127.0.0.1:3128 SSL_CERT_FILE=<copy of the store's ca.pem + system roots>
 ```
+
+### Proxy startup
+
+The proxy fetches the policy at startup. Until the first policy loads, it
+retries every 2 seconds. A CONNECT that arrives before then waits up to
+`--first-policy-wait-secs` (default 30; 0 does not wait) for the policy, so a
+sandbox that starts before the broker has loaded its entry does not send its
+first request direct. That wait happens once. If the policy still has not
+loaded, the CONNECT goes direct, and later CONNECTs do not wait, so a dead
+broker does not hold up unrelated traffic.
+
+After the first policy loads, the proxy refreshes it every `--refresh-secs`
+(default 60) and a CONNECT never waits. A listed host's traffic is never sent
+direct while the broker is unreachable, once its pattern is known.
 
 ### IPv4 and IPv6
 
@@ -212,6 +231,10 @@ handshake proved.
 
 ### Risks the broker does not remove
 
+- **The proxy is not a network boundary.** It only sees clients that use
+  `HTTPS_PROXY`. A process that ignores the variable connects directly anyway,
+  with no credential and no audit line. Limiting what a sandbox can reach is
+  the job of the sandbox's network policy.
 - **Never give a secret to a host that echoes request headers** (httpbin-style
   debug endpoints, `TRACE`-like behavior, error pages that print the request,
   webhook inspectors). The credential is injected into the request the host

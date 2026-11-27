@@ -153,14 +153,25 @@ Restart recovery comes first: steps 1 to 3 give a box, made by `yolo new` alone,
 
 ### Phase 4: Credential broker on the box
 
-- [ ] A Config-backed `Store` for the broker (per Question 4): the CA, the tokenizer password, the policy and the sealed secrets live in the box's Secret and ConfigMap, read at start and on `SIGHUP`.
-- [ ] Jump image: ship `yolo-broker` and the patched tokenizer. `jump setup` starts both at boot, each as its own user, supervised.
-- [ ] Tokenizer's open key (`OPEN_KEY`, outside the broker's store) persists in its own Secret, readable with a credential only tokenizer's user gets (a PolicyBinding on that one resource), and reaches tokenizer through its environment, never a file the broker can read. Without it, sealing protects nothing at rest, and a restart makes every sealed secret unreadable.
-- [ ] A box-side command to seal a secret into the store (`yolo-broker seal`, writing through Config).
-- [ ] Harness images: ship `yolo-broker-proxy`. When the session has a broker, the sandbox's init starts it and sets `HTTPS_PROXY` and CA trust (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`).
-- [ ] yolo: `yolo new` on the box registers the sandbox's proxy endpoint ID and policy with the broker and passes the sandbox the broker's ID and CA; `yolo rm` removes the entry.
-- [ ] OAuth: refresh tokens, and sealing refreshed access tokens back into the store.
-- [ ] Live: a sandbox calls an API through the broker; restart the box, and the call works again with nobody logged in; removing the sandbox's entry stops it.
+- [x] A Config-backed `Store` for the broker (per Question 4): the CA, the tokenizer password, the policy and the sealed secrets live in the box's Secret and ConfigMap, read at start and on `SIGHUP`. Done: the broker's store is in the box's Config.
+- [x] Jump image: ship `yolo-broker` and the patched tokenizer. `jump setup` starts both at boot, each as its own user, supervised. Done: the jump image ships both, each supervised as its own user.
+- [x] Tokenizer's open key (`OPEN_KEY`, outside the broker's store) persists in its own Secret, readable with a credential only tokenizer's user gets (a PolicyBinding on that one resource), and reaches tokenizer through its environment, never a file the broker can read. Without it, sealing protects nothing at rest, and a restart makes every sealed secret unreadable. Done: the open key is in its own Secret, `yolo-NAME-tokenizer`.
+- [x] A box-side command to seal a secret into the store (`yolo-broker seal`, writing through Config). Done: `seal` (`ssh BOX seal ID`) and `rules` work on the box.
+- [x] Harness images: ship `yolo-broker-proxy`. When the session has a broker, the sandbox's init starts it and sets `HTTPS_PROXY` and CA trust (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`). Done: harness images ship `yolo-broker-proxy`.
+- [x] yolo: `yolo new` on the box registers the sandbox's proxy endpoint ID and policy with the broker and passes the sandbox the broker's ID and CA; `yolo rm` removes the entry. Done: `yolo new` on the box registers the sandbox before its Workload, so its first policy is there, and passes the broker's id and CA.
+- [ ] OAuth: refresh tokens, and sealing refreshed access tokens back into the store. Note: tokenizer now seals OAuth refresh replies (`nix/tokenizer-oauth-seal.patch`). The broker doesn't yet refresh on a schedule or write refreshed secrets back to Config.
+- [x] Live: a sandbox calls an API through the broker; restart the box, and the call works again with nobody logged in; removing the sandbox's entry stops it. Done: verified live:
+  - a sandbox's call to httpbin.org came back with the injected credential (a fake test token: httpbin echoes request headers), and the token was not in the sandbox's environment;
+  - after a box restart with nobody logged in, the broker id was the same and the call worked on the first try;
+  - removing the sandbox's entry gives 403;
+  - `yolo rm` removes Config, the tokenizer Secret, the binding, the service account and the key;
+  - `yolo new` run on the box works. The box's datumctl is logged in with no context, so `YOLO_DATUM_PROJECT` makes yolo pass `--project`: a project-only account can't read its organization, and Datum lets an organization bind only its platform roles. The box passes the client's image pull Secret name as `YOLO_DATUM_PULL_SECRET`;
+  - the first call from a new sandbox gets its credential, because the proxy waits for its first policy.
+
+Findings:
+
+- dumbpipe 0.39.0's listener exits on one failed accept, which drops every tunnel. Patched in the images, build box and meta host (`image/nix/dumbpipe-keep-listening.patch`). No upstream fix filed yet.
+- Builds on a c7a.4xlarge build box, four at a time, take about 35 min for all 11 images.
 
 ### Phase 5: Storage
 
