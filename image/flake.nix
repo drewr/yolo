@@ -102,6 +102,31 @@
         sourceRoot = ".";
         installPhase = "install -Dm755 datumctl $out/bin/datumctl";
       };
+      # The compute plugin for datumctl, for `yolo logs` on the jump box (it runs
+      # `datumctl compute logs`). The same kind of release binary as datumctl: a
+      # static Go executable, so no patchelf. datumctl blocks a plugin it didn't
+      # install until it is trusted; jump's datum_login runs `datumctl plugin trust
+      # compute` after logging in.
+      datumctlComputeSrc = {
+        x86_64-linux = {
+          asset = "datumctl-compute_Linux_x86_64.tar.gz";
+          hash = "sha256-oGtD66mUyngC51t7T/6d081Elz7Of8CniRXgfei0LEA=";
+        };
+        aarch64-linux = {
+          asset = "datumctl-compute_Linux_arm64.tar.gz";
+          hash = "sha256-kYeCxNBYkAkU2mWc8oC1ChyL1PwPYDHRH3BOVo94RL4=";
+        };
+      }.${system};
+      datumctl-compute = pkgs.stdenv.mkDerivation {
+        pname = "datumctl-compute";
+        version = "0.16.3";
+        src = pkgs.fetchurl {
+          url = "https://github.com/datum-cloud/compute/releases/download/v0.16.3/${datumctlComputeSrc.asset}";
+          inherit (datumctlComputeSrc) hash;
+        };
+        sourceRoot = ".";
+        installPhase = "install -Dm755 datumctl-compute $out/bin/datumctl-compute";
+      };
       agents = llm-agents.packages.${system};
       # The same harnesses the dotfiles install (d/.config/home-manager/flake.nix),
       # from the same pinned llm-agents rev; opencode2 is also exposed as opencode.
@@ -152,7 +177,7 @@
         chmod 0555 $out/bin/jump
       '';
       # The jump image also runs the broker and its tokenizer (on 127.0.0.1:8080).
-      jumpTools = [ yolo.packages.${system}.yolo datumctl jumpScript yoloBroker tokenizer ]
+      jumpTools = [ yolo.packages.${system}.yolo datumctl datumctl-compute jumpScript yoloBroker tokenizer ]
         ++ [ dumbpipe ] ++ (with pkgs; [ bashInteractive zsh gitMinimal openssh iputils curl jq dropbear tmux ]);
 
       # Only the locale the dotfiles' zshenv asks for (LC_ALL=en_US.UTF-8).

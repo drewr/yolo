@@ -7,4 +7,4 @@ claude    ghcr.io/drewr/agent-claude@sha256:45d5f37543b3c98ba8e0903b326f22a7b9c3
 gemini    ghcr.io/drewr/agent-gemini@sha256:c4a35e26c982a462dce695cd28b984d633a7f7ad672ffff95b2dc837f3d67887
 opencode  ghcr.io/drewr/agent-opencode@sha256:08e6feea1cb82bff6645b39bc1e2209a616b9bb360ff245f870d6702addad78c
 pi        ghcr.io/drewr/agent-pi@sha256:9d91ab6db2e79cb731266519b8da440e277de2b6f881b099b81b06d10fa61bc7
-jump      ghcr.io/drewr/agent-jump@sha256:c98c5d394ce4d20af43764269cd32c9102844d07854530883bd3135c3636cc4f
+jump      ghcr.io/drewr/agent-jump@sha256:b6f5cd878e574d027aff8ccdf6280ff8b32b4f469ba5506f52ab0fc438996c38

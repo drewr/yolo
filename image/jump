@@ -70,9 +70,11 @@ valid_datum_name() {
 # box's account can't read its organization, and `ctx use` would need it. The
 # project goes to the env file as YOLO_DATUM_PROJECT for yolo to pass on. The
 # config goes in the login user's HOME, which must be in memory: a shared home
-# (JuiceFS) would keep the credentials. Quiet on success, never fatal, and
-# datumctl's output is dropped since it may hold tokens. CREDENTIALS is the file
-# setup wrote.
+# (JuiceFS) would keep the credentials. After the login, the compute plugin the
+# image installs is trusted (`yolo logs` on this box runs `datumctl compute
+# logs`, and datumctl blocks a plugin it didn't install until it is trusted).
+# Quiet on success, never fatal, and datumctl's output is dropped since it may
+# hold tokens. CREDENTIALS is the file setup wrote.
 datum_login() { # CREDENTIALS
   h=$(awk -F: -v u="$U" '$1 == u { print $6; exit }' /etc/passwd)
   project=${YOLO_CONFIG_URL#datum://}
@@ -94,6 +96,10 @@ datum_login() { # CREDENTIALS
   esac
   if ! as_user "HOME=$h datumctl login --credentials $1 >/dev/null 2>&1"; then
     echo "[jump] datum: datumctl login failed for $U; yolo new on this box won't reach Datum" >&2
+    return 0
+  fi
+  if ! as_user "HOME=$h datumctl plugin trust compute >/dev/null 2>&1"; then
+    echo "[jump] datum: can't trust the compute plugin for $U; yolo logs on this box won't work" >&2
   fi
   return 0
 }
